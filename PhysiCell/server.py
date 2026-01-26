@@ -1973,6 +1973,11 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
         result = f"**Compiling project:** {project_name}\n"
         result += f"**Working directory:** {PHYSICELL_ROOT}\n\n"
 
+        # Pass through environment (includes PHYSICELL_CPP if set)
+        compile_env = os.environ.copy()
+        compiler = compile_env.get("PHYSICELL_CPP", "g++")
+        result += f"**Compiler:** {compiler}\n\n"
+
         # Load the project
         load_cmd = f"make load PROJ={project_name}"
         load_process = subprocess.run(
@@ -1980,7 +1985,8 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
             shell=True,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            env=compile_env
         )
 
         if load_process.returncode != 0:
@@ -1995,7 +2001,8 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=compile_env
             )
             result += f"**Cleaned build artifacts**\n\n"
 
@@ -2006,7 +2013,8 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
             shell=True,
             capture_output=True,
             text=True,
-            timeout=300  # 5 minutes timeout
+            timeout=300,  # 5 minutes timeout
+            env=compile_env
         )
 
         if compile_process.returncode == 0:
