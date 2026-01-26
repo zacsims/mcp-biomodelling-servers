@@ -1950,6 +1950,95 @@ def create_physicell_project(project_name: str, copy_generated_config: bool = Tr
         return f"Error creating project: {str(e)}"
 
 @mcp.tool()
+def compile_physicell_project(project_name: str, clean_first: bool = False) -> str:
+    """
+    Compile a PhysiCell project using make.
+
+    Args:
+        project_name: Name of the project in user_projects/
+        clean_first: Whether to run 'make clean' before compiling (default: False)
+
+    Returns:
+        str: Compilation status and results
+    """
+    # Check if project exists
+    project_dir = USER_PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        return f"Error: Project '{project_name}' not found at {project_dir}"
+
+    try:
+        # Change to PhysiCell root directory
+        os.chdir(PHYSICELL_ROOT)
+
+        result = f"**Compiling project:** {project_name}\n"
+        result += f"**Working directory:** {PHYSICELL_ROOT}\n\n"
+
+        # Load the project
+        load_cmd = f"make load PROJ={project_name}"
+        load_process = subprocess.run(
+            load_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if load_process.returncode != 0:
+            return f"Error loading project:\n{load_process.stderr}"
+
+        result += f"**Project loaded successfully**\n\n"
+
+        # Clean if requested
+        if clean_first:
+            clean_process = subprocess.run(
+                "make clean",
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            result += f"**Cleaned build artifacts**\n\n"
+
+        # Compile the project
+        result += f"**Compiling...**\n"
+        compile_process = subprocess.run(
+            "make",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minutes timeout
+        )
+
+        if compile_process.returncode == 0:
+            result += f"**Compilation successful!**\n\n"
+
+            # Find the executable name from Makefile
+            try:
+                makefile_path = PHYSICELL_ROOT / "Makefile"
+                with open(makefile_path, 'r') as f:
+                    for line in f:
+                        if line.startswith("PROGRAM_NAME"):
+                            exec_name = line.split("=")[1].strip()
+                            executable = PHYSICELL_ROOT / exec_name
+                            if executable.exists():
+                                result += f"**Executable:** {executable}\n"
+                            break
+            except:
+                result += f"**Executable:** ./project (default)\n"
+
+            result += f"\n**Next step:** Use `run_simulation('{project_name}')` to run the simulation."
+        else:
+            result += f"**Compilation failed!**\n\n"
+            result += f"**Error output:**\n```\n{compile_process.stderr[:1000]}\n```"
+
+        return result
+
+    except subprocess.TimeoutExpired:
+        return "Error: Compilation timed out after 5 minutes"
+    except Exception as e:
+        return f"Error compiling project: {str(e)}"
+
+@mcp.tool()
 def get_help() -> str:
     """
     When the user asks for help, available commands, or how to use the server,
