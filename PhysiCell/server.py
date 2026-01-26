@@ -14,8 +14,14 @@ import sys
 import os
 import glob
 import time
+import subprocess
+import signal
+import uuid
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
+from dataclasses import dataclass, field
+from threading import Lock
 #from hatch_mcp_server import HatchMCP
 
 # Add the physicell_config package to Python path  
@@ -47,6 +53,34 @@ from session_manager import (
 )
 
 from mcp.server.fastmcp import Context, FastMCP
+
+# ============================================================================
+# PHYSICELL PROJECT EXECUTION INFRASTRUCTURE
+# ============================================================================
+
+PHYSICELL_ROOT = Path("/Users/simsz/PhysiCell")
+USER_PROJECTS_DIR = PHYSICELL_ROOT / "user_projects"
+TEMPLATE_DIR = PHYSICELL_ROOT / "sample_projects" / "template"
+MCP_OUTPUT_DIR = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+
+@dataclass
+class SimulationRun:
+    """Tracks a running or completed PhysiCell simulation."""
+    simulation_id: str
+    project_name: str
+    process: Optional[subprocess.Popen] = None
+    pid: Optional[int] = None
+    status: str = "pending"  # pending, running, completed, failed, stopped
+    output_folder: str = ""
+    config_file: str = ""
+    started_at: float = 0.0
+    completed_at: Optional[float] = None
+    return_code: Optional[int] = None
+    error_message: str = ""
+
+# Global simulation tracking
+running_simulations: Dict[str, SimulationRun] = {}
+simulations_lock = Lock()
 
 mcp = FastMCP()
 
@@ -1646,13 +1680,21 @@ str: Markdown-formatted export status with file details
         
         # Export XML configuration
         xml_content = session.config.generate_xml()
-        with open(filename, 'w') as f:
+
+        # Ensure we write to a writable location
+        output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use the filename from the parameter
+        output_path = output_dir / filename
+
+        with open(output_path, 'w') as f:
             f.write(xml_content)
         
         xml_size = len(xml_content) // 1024
-        
+
         result = f"## XML Configuration Exported\n\n"
-        result += f"**File:** {filename} ({xml_size}KB)\n"
+        result += f"**File:** {output_path} ({xml_size}KB)\n"
         
         # Show XML modification info if loaded from XML
         if session.loaded_from_xml and session.original_xml_path:
@@ -1719,10 +1761,18 @@ str: Markdown-formatted export status with file details
         
         # For now, export using the legacy CSV API (since that's what PhysiCell expects)
         # TODO: If new API rules exist, we might need to convert them to legacy format
-        rules.generate_csv(filename)
-        
+
+        # Ensure we write to a writable location
+        output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use the filename from the parameter
+        output_path = output_dir / filename
+
+        rules.generate_csv(str(output_path))
+
         result = f"## Cell Rules CSV Exported\n\n"
-        result += f"**File:** {filename}\n"
+        result += f"**File:** {output_path}\n"
         result += f"**Rules:** {rule_count}\n"
         result += f"**Progress:** {session.get_progress_percentage():.0f}%\n\n"
         result += f"**Next step:** Copy to PhysiCell project directory alongside XML configuration"
