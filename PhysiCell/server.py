@@ -1685,8 +1685,8 @@ str: Markdown-formatted export status with file details
         output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use the filename from the parameter
-        output_path = output_dir / filename
+        # Always save as PhysiCell_settings.xml for consistency with create_physicell_project
+        output_path = output_dir / "PhysiCell_settings.xml"
 
         with open(output_path, 'w') as f:
             f.write(xml_content)
@@ -1766,8 +1766,8 @@ str: Markdown-formatted export status with file details
         output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use the filename from the parameter
-        output_path = output_dir / filename
+        # Always save as cell_rules.csv for consistency with create_physicell_project
+        output_path = output_dir / "cell_rules.csv"
 
         rules.generate_csv(str(output_path))
 
