@@ -96,23 +96,28 @@ async def main():
         print(f"list_simulations output: {result}")
 
         # Note: Running simulation is a long operation, uncomment to test
-        # result = await client.call_tool("run_simulation", {'project_name': 'test_breast_cancer_sim'})
-        # print(f"run_simulation output: {result}")
+        result = await client.call_tool("run_simulation", {'project_name': 'test_breast_cancer_sim'})
+        print(f"run_simulation output: {result}")
 
-        # Extract simulation_id from result if running
-        # simulation_id = ...  # extract from result
+        # Extract simulation_id from result
+        import re
+        text = result.content[0].text
+        match = re.search(r'\*\*Simulation ID:\*\* ([a-f0-9]+)', text)
+        simulation_id = match.group(1) if match else None
+        print(f"Extracted simulation_id: {simulation_id}")
 
         # Check simulation status
-        # result = await client.call_tool("get_simulation_status", {'simulation_id': simulation_id})
-        # print(f"get_simulation_status output: {result}")
+        if simulation_id:
+            result = await client.call_tool("get_simulation_status", {'simulation_id': simulation_id})
+            print(f"get_simulation_status output: {result}")
 
         # Test output file listing on existing PhysiCell output folder
         result = await client.call_tool("get_simulation_output_files", {'output_folder': '/Users/simsz/PhysiCell/output'})
         print(f"get_simulation_output_files output: {result}")
 
         # Test GIF generation on existing output (if available)
-        # result = await client.call_tool("generate_simulation_gif", {'output_folder': '/Users/simsz/PhysiCell/output', 'max_frames': 10})
-        # print(f"generate_simulation_gif output: {result}")
+        result = await client.call_tool("generate_simulation_gif", {'output_folder': '/Users/simsz/PhysiCell/output', 'max_frames': 10})
+        print(f"generate_simulation_gif output: {result}")
 
 
 if __name__ == "__main__":
