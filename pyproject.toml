@@ -1,0 +1,12 @@
+[project]
+name = "mcp-biomodelling-servers"
+version = "0.1.0"
+description = "MCP servers for biomodelling (PhysiCell, MaBoSS, NeKo)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.14.3",
+    "physicell-settings>=0.4.5",
+    "cairosvg>=2.7.0",
+    "pillow>=10.0.0",
+]
