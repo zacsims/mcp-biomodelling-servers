@@ -106,16 +106,43 @@ async def main():
         simulation_id = match.group(1) if match else None
         print(f"Extracted simulation_id: {simulation_id}")
 
-        # Check simulation status
+        # Poll simulation status until completed or timeout
         if simulation_id:
-            result = await client.call_tool("get_simulation_status", {'simulation_id': simulation_id})
-            print(f"get_simulation_status output: {result}")
+            max_wait = 300  # 5 minutes max
+            poll_interval = 10  # check every 10 seconds
+            elapsed = 0
 
-        # Test output file listing on existing PhysiCell output folder
+            while elapsed < max_wait:
+                result = await client.call_tool("get_simulation_status", {'simulation_id': simulation_id})
+                status_text = result.content[0].text
+
+                # Extract status from response
+                if "**Status:** completed" in status_text:
+                    print(f"Simulation completed after {elapsed}s!")
+                    print(f"get_simulation_status output: {result}")
+                    break
+                elif "**Status:** failed" in status_text or "**Status:** stopped" in status_text:
+                    print(f"Simulation ended with non-success status after {elapsed}s")
+                    print(f"get_simulation_status output: {result}")
+                    break
+
+                # Extract file counts for progress indication
+                svg_match = re.search(r'SVG snapshots: (\d+)', status_text)
+                svg_count = svg_match.group(1) if svg_match else "?"
+                print(f"Still running... ({elapsed}s elapsed, {svg_count} SVG files)")
+
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+            else:
+                print(f"Timeout after {max_wait}s - simulation still running")
+                result = await client.call_tool("get_simulation_status", {'simulation_id': simulation_id})
+                print(f"Final status: {result}")
+
+        # Test output file listing
         result = await client.call_tool("get_simulation_output_files", {'output_folder': '/Users/simsz/PhysiCell/output'})
         print(f"get_simulation_output_files output: {result}")
 
-        # Test GIF generation on existing output (if available)
+        # Test GIF generation
         result = await client.call_tool("generate_simulation_gif", {'output_folder': '/Users/simsz/PhysiCell/output', 'max_frames': 10})
         print(f"generate_simulation_gif output: {result}")
 
