@@ -1975,6 +1975,24 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
 
         # Pass through environment (includes PHYSICELL_CPP if set)
         compile_env = os.environ.copy()
+
+        # Auto-detect compiler if PHYSICELL_CPP not set
+        if "PHYSICELL_CPP" not in compile_env:
+            # Try common g++ versions with OpenMP support on macOS
+            for compiler_candidate in ["g++-15", "g++-14", "g++-13", "g++-12"]:
+                try:
+                    check = subprocess.run(
+                        f"which {compiler_candidate}",
+                        shell=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    if check.returncode == 0:
+                        compile_env["PHYSICELL_CPP"] = compiler_candidate
+                        break
+                except:
+                    pass
+
         compiler = compile_env.get("PHYSICELL_CPP", "g++")
         result += f"**Compiler:** {compiler}\n\n"
 
