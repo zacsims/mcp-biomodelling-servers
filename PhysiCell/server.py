@@ -1876,12 +1876,85 @@ def docs_tools_index() -> str:
 ... (add links to all tool docs)
 """
 
+# ============================================================================
+# PHYSICELL PROJECT CREATION AND EXECUTION TOOLS
+# ============================================================================
+
+@mcp.tool()
+def create_physicell_project(project_name: str, copy_generated_config: bool = True) -> str:
+    """
+    Create a complete PhysiCell project directory from template.
+
+    Args:
+        project_name: Name for the project (alphanumeric and underscores only)
+        copy_generated_config: Whether to copy XML and CSV from current session (default: True)
+
+    Returns:
+        str: Project creation status and next steps
+    """
+    # Validate project name
+    if not project_name or not re.match(r'^[a-zA-Z0-9_]+$', project_name):
+        return "Error: Project name must contain only letters, numbers, and underscores"
+
+    # Check if project already exists
+    project_dir = USER_PROJECTS_DIR / project_name
+    if project_dir.exists():
+        return f"Error: Project '{project_name}' already exists at {project_dir}"
+
+    # Check if template exists
+    if not TEMPLATE_DIR.exists():
+        return f"Error: Template directory not found at {TEMPLATE_DIR}"
+
+    try:
+        # Create user_projects directory if it doesn't exist
+        USER_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Copy template to new project directory
+        import shutil
+        shutil.copytree(TEMPLATE_DIR, project_dir)
+
+        result = f"**Project created:** {project_name}\n"
+        result += f"**Location:** {project_dir}\n\n"
+
+        # Copy generated config files if requested
+        if copy_generated_config:
+            session = get_current_session()
+            if not session or not session.config:
+                result += "**Warning:** No active session found. Config files not copied.\n"
+                result += "Use export_xml_configuration() and export_cell_rules_csv() first.\n"
+            else:
+                # Check for exported files
+                xml_file = MCP_OUTPUT_DIR / "PhysiCell_settings.xml"
+                csv_file = MCP_OUTPUT_DIR / "cell_rules.csv"
+
+                config_dir = project_dir / "config"
+                config_dir.mkdir(exist_ok=True)
+
+                if xml_file.exists():
+                    shutil.copy(xml_file, config_dir / "PhysiCell_settings.xml")
+                    result += "**Copied:** PhysiCell_settings.xml to config/\n"
+                else:
+                    result += "**Warning:** PhysiCell_settings.xml not found. Export it first.\n"
+
+                if csv_file.exists():
+                    shutil.copy(csv_file, config_dir / "cell_rules.csv")
+                    result += "**Copied:** cell_rules.csv to config/\n"
+                else:
+                    result += "**Note:** cell_rules.csv not found (optional).\n"
+
+        result += f"\n**Next step:** Use `compile_physicell_project('{project_name}')` to compile the project."
+
+        return result
+
+    except Exception as e:
+        return f"Error creating project: {str(e)}"
+
 @mcp.tool()
 def get_help() -> str:
     """
     When the user asks for help, available commands, or how to use the server,
     this function returns a guide to the available tools and their usage.
-    
+
     Returns:
         str: Markdown-formatted help guide
     """
