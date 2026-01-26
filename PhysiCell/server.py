@@ -2310,6 +2310,219 @@ def stop_simulation(simulation_id: str) -> str:
     return f"No process found for simulation '{simulation_id}'"
 
 @mcp.tool()
+def generate_simulation_gif(simulation_id: Optional[str] = None,
+                           output_folder: Optional[str] = None,
+                           frame_delay: int = 100,
+                           max_frames: Optional[int] = None) -> str:
+    """
+    Create an animated GIF from simulation SVG snapshots.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly (e.g., /Users/simsz/PhysiCell/output)
+        frame_delay: Delay between frames in milliseconds (default: 100)
+        max_frames: Maximum number of frames to include (default: all)
+
+    Returns:
+        str: Path to generated GIF file
+    """
+    # Determine output folder
+    if simulation_id:
+        with simulations_lock:
+            if simulation_id not in running_simulations:
+                return f"Error: Simulation '{simulation_id}' not found."
+            sim = running_simulations[simulation_id]
+            folder = Path(sim.output_folder)
+    elif output_folder:
+        folder = Path(output_folder)
+    else:
+        # Default to PhysiCell output folder
+        folder = PHYSICELL_ROOT / "output"
+
+    if not folder.exists():
+        return f"Error: Output folder not found: {folder}"
+
+    # Find SVG files
+    svg_files = sorted(folder.glob("snapshot*.svg"), key=lambda x: x.name)
+
+    if not svg_files:
+        return f"Error: No snapshot SVG files found in {folder}"
+
+    # Limit frames if specified
+    if max_frames and len(svg_files) > max_frames:
+        # Sample evenly across the simulation
+        step = len(svg_files) // max_frames
+        svg_files = svg_files[::step][:max_frames]
+
+    result = f"**Generating GIF from {len(svg_files)} frames...**\n\n"
+
+    # Try using ImageMagick (magick convert)
+    gif_path = folder / "simulation.gif"
+
+    try:
+        # Build the convert command
+        svg_pattern = str(folder / "snapshot*.svg")
+        cmd = f"magick convert -delay {frame_delay // 10} {svg_pattern} {gif_path}"
+
+        process = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minutes
+        )
+
+        if process.returncode == 0 and gif_path.exists():
+            file_size = gif_path.stat().st_size / (1024 * 1024)  # MB
+            result += f"**GIF created successfully!**\n\n"
+            result += f"**File:** {gif_path}\n"
+            result += f"**Size:** {file_size:.2f} MB\n"
+            result += f"**Frames:** {len(svg_files)}\n"
+            return result
+        else:
+            result += f"**ImageMagick failed.** Trying alternative method...\n"
+            result += f"Error: {process.stderr[:200]}\n\n"
+
+    except subprocess.TimeoutExpired:
+        result += "ImageMagick timed out.\n\n"
+    except FileNotFoundError:
+        result += "ImageMagick not found. Trying alternative method...\n\n"
+    except Exception as e:
+        result += f"ImageMagick error: {str(e)}\n\n"
+
+    # Try using Python libraries as fallback
+    try:
+        from PIL import Image
+        import cairosvg
+        import io
+
+        images = []
+        for i, svg_file in enumerate(svg_files):
+            # Convert SVG to PNG in memory
+            png_data = cairosvg.svg2png(url=str(svg_file))
+            img = Image.open(io.BytesIO(png_data))
+            images.append(img)
+
+            if (i + 1) % 10 == 0:
+                result += f"Processed {i + 1}/{len(svg_files)} frames...\n"
+
+        # Save as GIF
+        if images:
+            images[0].save(
+                gif_path,
+                save_all=True,
+                append_images=images[1:],
+                duration=frame_delay,
+                loop=0
+            )
+
+            file_size = gif_path.stat().st_size / (1024 * 1024)
+            result += f"\n**GIF created successfully!**\n\n"
+            result += f"**File:** {gif_path}\n"
+            result += f"**Size:** {file_size:.2f} MB\n"
+            result += f"**Frames:** {len(images)}\n"
+            return result
+
+    except ImportError as e:
+        result += f"**Error:** Required libraries not installed.\n"
+        result += f"Install with: `pip install cairosvg pillow`\n"
+        result += f"Or install ImageMagick: `brew install imagemagick`\n"
+        return result
+    except Exception as e:
+        result += f"**Error creating GIF:** {str(e)}\n"
+        return result
+
+    return result
+
+@mcp.tool()
+def get_simulation_output_files(simulation_id: Optional[str] = None,
+                                output_folder: Optional[str] = None,
+                                file_type: str = "all") -> str:
+    """
+    List available output files from a simulation.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly
+        file_type: Filter by type - "all", "svg", "mat", "xml" (default: "all")
+
+    Returns:
+        str: List of output files with details
+    """
+    # Determine output folder
+    if simulation_id:
+        with simulations_lock:
+            if simulation_id not in running_simulations:
+                return f"Error: Simulation '{simulation_id}' not found."
+            sim = running_simulations[simulation_id]
+            folder = Path(sim.output_folder)
+    elif output_folder:
+        folder = Path(output_folder)
+    else:
+        folder = PHYSICELL_ROOT / "output"
+
+    if not folder.exists():
+        return f"Error: Output folder not found: {folder}"
+
+    # Collect files by type
+    files_by_type = {
+        "svg": list(folder.glob("*.svg")),
+        "xml": list(folder.glob("*.xml")),
+        "mat": list(folder.glob("*.mat")),
+        "gif": list(folder.glob("*.gif")),
+        "other": []
+    }
+
+    # Collect other files
+    all_typed = set()
+    for typed_files in files_by_type.values():
+        all_typed.update(f.name for f in typed_files)
+
+    for f in folder.iterdir():
+        if f.is_file() and f.name not in all_typed:
+            files_by_type["other"].append(f)
+
+    result = f"## Output Files\n\n"
+    result += f"**Folder:** {folder}\n\n"
+
+    # Filter and display
+    types_to_show = [file_type] if file_type != "all" else ["svg", "xml", "mat", "gif", "other"]
+
+    total_files = 0
+    total_size = 0
+
+    for ftype in types_to_show:
+        if ftype in files_by_type and files_by_type[ftype]:
+            files = sorted(files_by_type[ftype], key=lambda x: x.name)
+            result += f"### {ftype.upper()} Files ({len(files)})\n"
+
+            # Show first few and last few if many files
+            if len(files) > 10:
+                show_files = files[:5] + files[-3:]
+                result += f"*(showing 8 of {len(files)} files)*\n"
+            else:
+                show_files = files
+
+            for f in show_files:
+                size_kb = f.stat().st_size / 1024
+                total_size += f.stat().st_size
+                total_files += 1
+                if size_kb > 1024:
+                    size_str = f"{size_kb/1024:.1f} MB"
+                else:
+                    size_str = f"{size_kb:.1f} KB"
+                result += f"- {f.name} ({size_str})\n"
+
+                if len(files) > 10 and f == files[4]:
+                    result += f"- ... ({len(files) - 8} more files) ...\n"
+
+            result += "\n"
+
+    result += f"**Total:** {total_files} files, {total_size / (1024*1024):.2f} MB\n"
+
+    return result
+
+@mcp.tool()
 def get_help() -> str:
     """
     When the user asks for help, available commands, or how to use the server,
