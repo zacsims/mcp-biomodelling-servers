@@ -2039,6 +2039,277 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
         return f"Error compiling project: {str(e)}"
 
 @mcp.tool()
+def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
+    """
+    Run a PhysiCell simulation as a background process.
+
+    Args:
+        project_name: Name of the project to run
+        config_file: Custom config file path relative to project (default: config/PhysiCell_settings.xml)
+
+    Returns:
+        str: Simulation ID and status information
+    """
+    global running_simulations
+
+    # Check if project exists
+    project_dir = USER_PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        return f"Error: Project '{project_name}' not found at {project_dir}"
+
+    # Determine config file path
+    if config_file:
+        config_path = config_file
+    else:
+        config_path = "config/PhysiCell_settings.xml"
+
+    # Generate simulation ID
+    simulation_id = str(uuid.uuid4())[:8]
+
+    try:
+        # Change to PhysiCell root directory
+        os.chdir(PHYSICELL_ROOT)
+
+        # First load the project
+        load_cmd = f"make load PROJ={project_name}"
+        load_process = subprocess.run(
+            load_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if load_process.returncode != 0:
+            return f"Error loading project:\n{load_process.stderr}"
+
+        # Find executable name
+        exec_name = "project"
+        try:
+            makefile_path = PHYSICELL_ROOT / "Makefile"
+            with open(makefile_path, 'r') as f:
+                for line in f:
+                    if line.startswith("PROGRAM_NAME"):
+                        exec_name = line.split("=")[1].strip()
+                        break
+        except:
+            pass
+
+        executable = PHYSICELL_ROOT / exec_name
+        if not executable.exists():
+            return f"Error: Executable '{exec_name}' not found. Run compile_physicell_project() first."
+
+        # Set up output folder
+        output_folder = PHYSICELL_ROOT / "output"
+        output_folder.mkdir(exist_ok=True)
+
+        # Clear previous output
+        for f in output_folder.glob("*"):
+            try:
+                f.unlink()
+            except:
+                pass
+
+        # Start the simulation process
+        cmd = f"./{exec_name} {config_path}"
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(PHYSICELL_ROOT)
+        )
+
+        # Track the simulation
+        sim_run = SimulationRun(
+            simulation_id=simulation_id,
+            project_name=project_name,
+            process=process,
+            pid=process.pid,
+            status="running",
+            output_folder=str(output_folder),
+            config_file=config_path,
+            started_at=time.time()
+        )
+
+        with simulations_lock:
+            running_simulations[simulation_id] = sim_run
+
+        result = f"**Simulation started!**\n\n"
+        result += f"**Simulation ID:** {simulation_id}\n"
+        result += f"**Project:** {project_name}\n"
+        result += f"**Config:** {config_path}\n"
+        result += f"**PID:** {process.pid}\n"
+        result += f"**Output folder:** {output_folder}\n\n"
+        result += f"**Next steps:**\n"
+        result += f"- Use `get_simulation_status('{simulation_id}')` to check progress\n"
+        result += f"- Use `list_simulations()` to see all running simulations\n"
+        result += f"- Use `stop_simulation('{simulation_id}')` to stop if needed"
+
+        return result
+
+    except Exception as e:
+        return f"Error starting simulation: {str(e)}"
+
+@mcp.tool()
+def get_simulation_status(simulation_id: str) -> str:
+    """
+    Check the status of a running or completed simulation.
+
+    Args:
+        simulation_id: The simulation ID returned by run_simulation()
+
+    Returns:
+        str: Current status, progress, and output file information
+    """
+    global running_simulations
+
+    with simulations_lock:
+        if simulation_id not in running_simulations:
+            return f"Error: Simulation '{simulation_id}' not found. Use list_simulations() to see available simulations."
+
+        sim = running_simulations[simulation_id]
+
+    # Check if process is still running
+    if sim.process:
+        return_code = sim.process.poll()
+        if return_code is None:
+            sim.status = "running"
+        elif return_code == 0:
+            sim.status = "completed"
+            sim.completed_at = time.time()
+            sim.return_code = return_code
+        else:
+            sim.status = "failed"
+            sim.completed_at = time.time()
+            sim.return_code = return_code
+
+    # Count output files
+    output_folder = Path(sim.output_folder)
+    svg_count = len(list(output_folder.glob("snapshot*.svg")))
+    xml_count = len(list(output_folder.glob("output*.xml")))
+    mat_count = len(list(output_folder.glob("*.mat")))
+
+    # Calculate elapsed time
+    if sim.completed_at:
+        elapsed = sim.completed_at - sim.started_at
+    else:
+        elapsed = time.time() - sim.started_at
+
+    elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+
+    result = f"**Simulation Status**\n\n"
+    result += f"**ID:** {sim.simulation_id}\n"
+    result += f"**Project:** {sim.project_name}\n"
+    result += f"**Status:** {sim.status}\n"
+    result += f"**Elapsed:** {elapsed_str}\n\n"
+    result += f"**Output files:**\n"
+    result += f"- SVG snapshots: {svg_count}\n"
+    result += f"- XML data: {xml_count}\n"
+    result += f"- MAT files: {mat_count}\n"
+
+    if sim.status == "completed":
+        result += f"\n**Simulation completed successfully!**\n"
+        result += f"**Next step:** Use `generate_simulation_gif('{simulation_id}')` to create visualization."
+    elif sim.status == "failed":
+        result += f"\n**Simulation failed** (exit code: {sim.return_code})\n"
+        if sim.process:
+            stderr = sim.process.stderr.read().decode() if sim.process.stderr else ""
+            if stderr:
+                result += f"**Error:** {stderr[:500]}"
+    elif sim.status == "running":
+        result += f"\n**Simulation is running...**"
+
+    return result
+
+@mcp.tool()
+def list_simulations() -> str:
+    """
+    List all tracked simulations with their current status.
+
+    Returns:
+        str: Table of all simulations
+    """
+    global running_simulations
+
+    with simulations_lock:
+        if not running_simulations:
+            return "No simulations tracked. Use `run_simulation()` to start one."
+
+        result = "## Tracked Simulations\n\n"
+        result += "| ID | Project | Status | Started | Elapsed |\n"
+        result += "|---|---|---|---|---|\n"
+
+        for sim_id, sim in running_simulations.items():
+            # Update status if process exists
+            if sim.process:
+                return_code = sim.process.poll()
+                if return_code is None:
+                    sim.status = "running"
+                elif return_code == 0:
+                    sim.status = "completed"
+                else:
+                    sim.status = "failed"
+
+            # Calculate elapsed time
+            if sim.completed_at:
+                elapsed = sim.completed_at - sim.started_at
+            else:
+                elapsed = time.time() - sim.started_at
+
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+            started_str = time.strftime("%H:%M:%S", time.localtime(sim.started_at))
+
+            result += f"| {sim_id} | {sim.project_name} | {sim.status} | {started_str} | {elapsed_str} |\n"
+
+        result += f"\nUse `get_simulation_status(id)` for details on a specific simulation."
+
+        return result
+
+@mcp.tool()
+def stop_simulation(simulation_id: str) -> str:
+    """
+    Stop a running simulation.
+
+    Args:
+        simulation_id: The simulation ID to stop
+
+    Returns:
+        str: Confirmation of termination
+    """
+    global running_simulations
+
+    with simulations_lock:
+        if simulation_id not in running_simulations:
+            return f"Error: Simulation '{simulation_id}' not found."
+
+        sim = running_simulations[simulation_id]
+
+    if sim.status != "running":
+        return f"Simulation '{simulation_id}' is not running (status: {sim.status})"
+
+    if sim.process:
+        try:
+            # Try graceful termination first
+            sim.process.terminate()
+            try:
+                sim.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill if it doesn't stop
+                sim.process.kill()
+                sim.process.wait()
+
+            sim.status = "stopped"
+            sim.completed_at = time.time()
+
+            return f"**Simulation stopped**\n\n**ID:** {simulation_id}\n**Project:** {sim.project_name}"
+
+        except Exception as e:
+            return f"Error stopping simulation: {str(e)}"
+
+    return f"No process found for simulation '{simulation_id}'"
+
+@mcp.tool()
 def get_help() -> str:
     """
     When the user asks for help, available commands, or how to use the server,
