@@ -128,16 +128,28 @@ def create_session(set_as_default: bool = True, session_name: Optional[str] = No
         str: Session ID and instructions
     """
     session_id = session_manager.create_session(set_as_default, session_name)
-    
+
     result = f"**Session created:** {session_id[:8]}..."
     if session_name:
         result += f" ({session_name})"
-    result += "\n"
-    result += f"**Next steps:**\n"
-    result += f"1. `analyze_biological_scenario()` - Set your biological context\n"
-    result += f"2. `create_simulation_domain()` - Define spatial framework\n"
-    result += f"3. Use `get_workflow_status()` to track progress"
-    
+    result += "\n\n"
+    result += f"**IMPORTANT: Follow this workflow in order:**\n\n"
+    result += f"**Phase 1 - Configure Simulation:**\n"
+    result += f"1. `analyze_biological_scenario()` - Describe your biological scenario\n"
+    result += f"2. `create_simulation_domain()` - Set domain size and simulation time\n"
+    result += f"3. `add_single_substrate()` - Add substrates (oxygen, glucose, etc.)\n"
+    result += f"4. `add_single_cell_type()` - Add cell types\n"
+    result += f"5. `add_single_cell_rule()` - Define cell behaviors\n\n"
+    result += f"**Phase 2 - Export Configuration:**\n"
+    result += f"6. `export_xml_configuration()` - Export XML config\n"
+    result += f"7. `export_cell_rules_csv()` - Export cell rules\n\n"
+    result += f"**Phase 3 - Run Simulation:**\n"
+    result += f"8. `create_physicell_project()` - Create project directory\n"
+    result += f"9. `compile_physicell_project()` - Compile the project\n"
+    result += f"10. `run_simulation()` - Start simulation\n"
+    result += f"11. `get_simulation_status()` - Monitor progress\n"
+    result += f"12. `generate_simulation_gif()` - Create visualization\n"
+
     return result
 
 @mcp.tool()
@@ -1885,6 +1897,17 @@ def create_physicell_project(project_name: str, copy_generated_config: bool = Tr
     """
     Create a complete PhysiCell project directory from template.
 
+    IMPORTANT: Before calling this tool, you MUST complete these steps in order:
+    1. create_session() - Initialize a simulation session
+    2. create_simulation_domain() - Set up spatial domain and time
+    3. add_single_substrate() - Add substrates (oxygen, glucose, etc.)
+    4. add_single_cell_type() - Add cell types (cancer cells, immune cells, etc.)
+    5. add_single_cell_rule() - Define cell behaviors and responses
+    6. export_xml_configuration() - Export the XML config file
+    7. export_cell_rules_csv() - Export the cell rules CSV file
+
+    Only AFTER completing all above steps, call this tool to create the project.
+
     Args:
         project_name: Name for the project (alphanumeric and underscores only)
         copy_generated_config: Whether to copy XML and CSV from current session (default: True)
@@ -1895,6 +1918,26 @@ def create_physicell_project(project_name: str, copy_generated_config: bool = Tr
     # Validate project name
     if not project_name or not re.match(r'^[a-zA-Z0-9_]+$', project_name):
         return "Error: Project name must contain only letters, numbers, and underscores"
+
+    # Check if config files exist (validate workflow was followed)
+    if copy_generated_config:
+        xml_file = MCP_OUTPUT_DIR / "PhysiCell_settings.xml"
+        csv_file = MCP_OUTPUT_DIR / "cell_rules.csv"
+
+        if not xml_file.exists():
+            return """**Error: Configuration files not found!**
+
+You must complete the simulation setup workflow BEFORE creating a project:
+
+1. `create_session()` - Initialize a simulation session
+2. `create_simulation_domain()` - Set up spatial domain and time
+3. `add_single_substrate()` - Add substrates (oxygen, glucose, etc.)
+4. `add_single_cell_type()` - Add cell types (cancer, immune, etc.)
+5. `add_single_cell_rule()` - Define cell behaviors
+6. `export_xml_configuration()` - **Export the XML config file**
+7. `export_cell_rules_csv()` - Export the cell rules CSV
+
+Please complete these steps first, then call create_physicell_project() again."""
 
     # Check if project already exists
     project_dir = USER_PROJECTS_DIR / project_name
@@ -1953,6 +1996,9 @@ def create_physicell_project(project_name: str, copy_generated_config: bool = Tr
 def compile_physicell_project(project_name: str, clean_first: bool = False) -> str:
     """
     Compile a PhysiCell project using make.
+
+    PREREQUISITE: Call create_physicell_project() first to create the project.
+    NEXT STEP: After successful compilation, call run_simulation() to start the simulation.
 
     Args:
         project_name: Name of the project in user_projects/
@@ -2068,6 +2114,11 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
 def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
     """
     Run a PhysiCell simulation as a background process.
+
+    PREREQUISITE: Call compile_physicell_project() first to compile the project.
+    NEXT STEPS:
+    - Use get_simulation_status() to monitor progress
+    - When completed, use generate_simulation_gif() to create visualization
 
     Args:
         project_name: Name of the project to run
@@ -2559,31 +2610,42 @@ def get_help() -> str:
     """
     return """# PhysiCell MCP Server Help
 
-## Basic Workflow
-1. **analyze_biological_scenario()** - Store your biological context
-2. **create_simulation_domain()** - Set up spatial/temporal framework
-3. **add_single_substrate()** - Add oxygen, nutrients, drugs, etc.
-4. **add_single_cell_type()** - Add cancer cells, immune cells, etc.
-5. **add_single_cell_rule()** - Create realistic cell responses
-6. **export_xml_configuration()** - Generate PhysiCell XML
-7. **export_cell_rules_csv()** - Generate rules CSV
+## Complete Workflow (MUST follow this order!)
 
-## Key Functions
+### Phase 1: Configure Simulation
+1. **create_session()** - Initialize a simulation session (REQUIRED FIRST)
+2. **analyze_biological_scenario()** - Store your biological context
+3. **create_simulation_domain()** - Set up spatial/temporal framework
+4. **add_single_substrate()** - Add oxygen, nutrients, drugs, etc.
+5. **add_single_cell_type()** - Add cancer cells, immune cells, etc.
+6. **configure_cell_parameters()** - Set cell volumes, motility, death rates
+7. **add_single_cell_rule()** - Create realistic cell responses
+
+### Phase 2: Export Configuration
+8. **export_xml_configuration()** - Generate PhysiCell XML (saves as PhysiCell_settings.xml)
+9. **export_cell_rules_csv()** - Generate rules CSV (saves as cell_rules.csv)
+
+### Phase 3: Create, Compile, and Run Project
+10. **create_physicell_project()** - Create project directory with config files
+11. **compile_physicell_project()** - Compile the simulation executable
+12. **run_simulation()** - Start the simulation (runs in background)
+
+### Phase 4: Monitor and Visualize
+13. **get_simulation_status()** - Check simulation progress
+14. **generate_simulation_gif()** - Create GIF visualization when complete
+
+## Helper Functions
 - **list_all_available_signals()** - See what signals cells can sense
 - **list_all_available_behaviors()** - See what cells can do
 - **get_simulation_summary()** - Check current setup
-- **list_generated_files()** - See exported files
-- **clean_generated_files()** - Remove old files
+- **list_simulations()** - See all running/completed simulations
+- **stop_simulation()** - Stop a running simulation
+- **get_simulation_output_files()** - List output files
 
-## Example Usage
-```
-analyze_biological_scenario("hypoxic tumor with immune infiltration")
-create_simulation_domain(domain_x=2000, max_time=7200)
-add_single_substrate("oxygen", 100000, 0.01, 38.0)
-add_single_cell_type("cancer_cell")
-add_single_cell_rule("cancer_cell", "oxygen", "decreases", "necrosis", 0.0001, 5.0)
-export_xml_configuration("tumor_sim.xml")
-```
+## IMPORTANT
+- You MUST call tools in the order shown above
+- Do NOT try to create XML files manually - use the tools
+- Do NOT skip steps - each tool depends on previous steps being completed
 
 Most parameters are optional with sensible defaults!"""
 
