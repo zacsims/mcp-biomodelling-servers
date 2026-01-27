@@ -1,3 +1,12 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "fastmcp>=2.0.0",
+#   "physicell-settings>=0.4.5",
+#   "cairosvg>=2.7.0",
+#   "pillow>=10.0.0",
+# ]
+# ///
 """
 PhysiCell MCP Server with Session Management
 
@@ -53,6 +62,8 @@ from session_manager import (
 )
 
 from mcp.server.fastmcp import Context, FastMCP
+from fastmcp.utilities.types import Image
+from mcp.types import Icon
 
 # ============================================================================
 # PHYSICELL PROJECT EXECUTION INFRASTRUCTURE
@@ -82,7 +93,10 @@ class SimulationRun:
 running_simulations: Dict[str, SimulationRun] = {}
 simulations_lock = Lock()
 
-mcp = FastMCP()
+logo_path = current_dir / "PhysiCell-Logo-64.png"
+img = Image(path=str(logo_path))
+icon = Icon(src=img.to_data_uri(), mimeType="image/png", sizes=["64x64"])
+mcp = FastMCP(name="PhysiCell", icons=[icon])
 
 # Initialize MCP server
 """ hatch_mcp = HatchMCP("PhysiCell-Config-Builder",
