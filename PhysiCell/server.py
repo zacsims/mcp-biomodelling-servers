@@ -1249,14 +1249,19 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
     # Update session counters
     session.rules_count += 1
     session.mark_step_complete(WorkflowStep.RULES_CONFIGURED)
-    
+
+    # Ensure the ruleset is registered as enabled in XML config
+    session.config.cell_rules.add_ruleset(
+        "cell_rules", folder="./config", filename="cell_rules.csv", enabled=True
+    )
+
     # Update legacy global for backward compatibility
     _set_legacy_config(session.config)
-    
+
     # Track modification if loaded from XML
     if session.loaded_from_xml:
         session.mark_xml_modification()
-    
+
     # Format result
     result = f"**Cell rule added:**\n"
     result += f"- Rule: {cell_type} | {signal} {direction} → {behavior}\n"
@@ -1714,6 +1719,12 @@ str: Markdown-formatted export status with file details
             session.config.initial_conditions.add_csv_file("cells.csv", "./config", enabled=True)
             session.config.set_number_of_cells(0)
 
+        # If rules have been added, ensure the ruleset is enabled in XML
+        if session.rules_count > 0:
+            session.config.cell_rules.add_ruleset(
+                "cell_rules", folder="./config", filename="cell_rules.csv", enabled=True
+            )
+
         # Export XML configuration
         xml_content = session.config.generate_xml()
 
@@ -1815,6 +1826,11 @@ str: Markdown-formatted export status with file details
         output_path = output_dir / "cell_rules.csv"
 
         rules.generate_csv(str(output_path))
+
+        # Ensure the ruleset is registered as enabled in XML config
+        session.config.cell_rules.add_ruleset(
+            "cell_rules", folder="./config", filename="cell_rules.csv", enabled=True
+        )
 
         result = f"## Cell Rules CSV Exported\n\n"
         result += f"**File:** {output_path}\n"
