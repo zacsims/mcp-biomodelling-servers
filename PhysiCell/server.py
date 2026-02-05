@@ -1640,6 +1640,8 @@ def get_simulation_summary() -> str:
     result += f"- **Substrates ({len(substrates)}):** {', '.join(substrates[:3])}{'...' if len(substrates) > 3 else 'None' if not substrates else ''}\n"
     result += f"- **Cell Types ({len(cell_types)}):** {', '.join(cell_types[:3])}{'...' if len(cell_types) > 3 else 'None' if not cell_types else ''}\n"
     result += f"- **Rules:** {rules_count}\n"
+    if session.initial_cells_count > 0:
+        result += f"- **Initial Cell Positions:** {session.initial_cells_count}\n"
     result += f"- **PhysiBoSS Models:** {session.physiboss_models_count}\n\n"
     
     # Workflow status
@@ -1737,7 +1739,16 @@ str: Markdown-formatted export status with file details
         
         result += f"**Substrates:** {len(substrates)} ({', '.join(substrates[:3]) if substrates else 'None'}{'...' if len(substrates) > 3 else ''})\n"
         result += f"**Cell Types:** {len(cell_types)} ({', '.join(cell_types[:3]) if cell_types else 'None'}{'...' if len(cell_types) > 3 else ''})\n"
+        if session.initial_cells_count > 0:
+            result += f"**Initial Cells:** {session.initial_cells_count} (from cells.csv)\n"
         result += f"**Progress:** {session.get_progress_percentage():.0f}%\n\n"
+
+        # Warn if cells placed but CSV not yet exported
+        if session.initial_cells_count > 0:
+            cells_csv_path = MCP_OUTPUT_DIR / "cells.csv"
+            if not cells_csv_path.exists():
+                result += f"**Warning:** {session.initial_cells_count} initial cells placed but cells.csv not exported yet. Call `export_cells_csv()` before creating the project.\n\n"
+
         result += f"**Next step:** Copy to PhysiCell project directory and run:\n"
         result += f"```bash\n./myproject {filename}\n```"
         
@@ -2346,6 +2357,12 @@ Please complete these steps first, then call create_physicell_project() again.""
                     result += "**Copied:** cell_rules.csv to config/\n"
                 else:
                     result += "**Note:** cell_rules.csv not found (optional).\n"
+
+                # Copy cells.csv if it exists (initial cell positions)
+                cells_csv_file = MCP_OUTPUT_DIR / "cells.csv"
+                if cells_csv_file.exists():
+                    shutil.copy(cells_csv_file, config_dir / "cells.csv")
+                    result += "**Copied:** cells.csv to config/\n"
 
         result += f"\n**Next step:** Use `compile_physicell_project('{project_name}')` to compile the project."
 
@@ -2982,10 +2999,12 @@ def get_help() -> str:
 5. **add_single_cell_type()** - Add cancer cells, immune cells, etc.
 6. **configure_cell_parameters()** - Set cell volumes, motility, death rates
 7. **add_single_cell_rule()** - Create realistic cell responses
+7b. **place_initial_cells()** - (Optional) Place cells spatially for initial conditions
 
 ### Phase 2: Export Configuration
 8. **export_xml_configuration()** - Generate PhysiCell XML (saves as PhysiCell_settings.xml)
 9. **export_cell_rules_csv()** - Generate rules CSV (saves as cell_rules.csv)
+9b. **export_cells_csv()** - (Optional) Export initial cell positions CSV (saves as cells.csv)
 
 ### Phase 3: Create, Compile, and Run Project
 10. **create_physicell_project()** - Create project directory with config files
@@ -3000,6 +3019,8 @@ def get_help() -> str:
 - **list_all_available_signals()** - See what signals cells can sense
 - **list_all_available_behaviors()** - See what cells can do
 - **get_simulation_summary()** - Check current setup
+- **get_initial_conditions_summary()** - Review placed cell positions
+- **remove_initial_cells()** - Remove placed cells
 - **list_simulations()** - See all running/completed simulations
 - **stop_simulation()** - Stop a running simulation
 - **get_simulation_output_files()** - List output files
