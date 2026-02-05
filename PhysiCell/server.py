@@ -27,8 +27,11 @@ import subprocess
 import signal
 import uuid
 import re
+import math
+import random
+import csv
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from threading import Lock
 #from hatch_mcp_server import HatchMCP
@@ -1810,6 +1813,184 @@ str: Markdown-formatted export status with file details
         
     except Exception as e:
         return f"Error exporting cell rules CSV: {str(e)}"
+
+# ============================================================================
+# INITIAL CELL PLACEMENT TOOLS
+# ============================================================================
+
+@mcp.tool()
+def place_initial_cells(
+    cell_type: str,
+    pattern: str = "random_disc",
+    num_cells: int = 100,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    radius: float = 100.0,
+    inner_radius: float = 0.0,
+    x_min: float = -100.0,
+    x_max: float = 100.0,
+    y_min: float = -100.0,
+    y_max: float = 100.0,
+    spacing: float = 20.0,
+    z: float = 0.0
+) -> str:
+    """
+    Place a batch of cells with specific spatial positions for initial conditions.
+    Generates x,y,z coordinates that will be written to cells.csv.
+    Call multiple times with different cell types or patterns to build up the initial layout.
+
+    PREREQUISITE: add_single_cell_type() - Cell types must exist before placing cells.
+    NEXT STEP: After all placements, call export_cells_csv() to write the cells.csv file,
+    then export_xml_configuration() to generate the XML (initial conditions will be enabled automatically).
+
+    Supported patterns:
+    - 'random_disc': Uniformly distributed cells in a circular area (use center_x, center_y, radius, num_cells)
+    - 'random_rectangle': Uniformly distributed cells in a rectangular area (use x_min, x_max, y_min, y_max, num_cells)
+    - 'single': Place one cell at a specific position (use center_x, center_y; num_cells is ignored)
+    - 'grid': Evenly spaced grid of cells (use x_min, x_max, y_min, y_max, spacing; num_cells is ignored)
+    - 'annular': Uniformly distributed cells in a ring (use center_x, center_y, radius, inner_radius, num_cells)
+
+    Args:
+        cell_type: Name of an existing cell type (must match a type added via add_single_cell_type)
+        pattern: Spatial pattern - 'random_disc', 'random_rectangle', 'single', 'grid', or 'annular'
+        num_cells: Number of cells to place (used by random_disc, random_rectangle, annular)
+        center_x: Center X coordinate for disc/annular/single patterns (default: 0.0)
+        center_y: Center Y coordinate for disc/annular/single patterns (default: 0.0)
+        radius: Outer radius for disc/annular patterns in microns (default: 100.0)
+        inner_radius: Inner radius for annular pattern in microns (default: 0.0)
+        x_min: Left bound for rectangle/grid patterns (default: -100.0)
+        x_max: Right bound for rectangle/grid patterns (default: 100.0)
+        y_min: Bottom bound for rectangle/grid patterns (default: -100.0)
+        y_max: Top bound for rectangle/grid patterns (default: 100.0)
+        spacing: Cell spacing for grid pattern in microns (default: 20.0)
+        z: Z coordinate for all placed cells (default: 0.0, use 0 for 2D simulations)
+
+    Returns:
+        str: Summary of placed cells with count and spatial bounds
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No simulation configured. Use `create_simulation_domain()` and `add_single_cell_type()` first."
+
+    # Validate cell type exists
+    try:
+        available_types = list(session.config.cell_types.get_cell_types().keys())
+    except:
+        available_types = []
+
+    if not available_types:
+        return "**Error:** No cell types defined. Use `add_single_cell_type()` first."
+
+    if cell_type not in available_types:
+        return f"**Error:** Cell type '{cell_type}' not found. Available types: {', '.join(available_types)}"
+
+    # Validate pattern
+    valid_patterns = ['random_disc', 'random_rectangle', 'single', 'grid', 'annular']
+    if pattern not in valid_patterns:
+        return f"**Error:** Invalid pattern '{pattern}'. Must be one of: {', '.join(valid_patterns)}"
+
+    # Generate cell coordinates based on pattern
+    new_cells = []
+
+    if pattern == "single":
+        new_cells.append({"x": center_x, "y": center_y, "z": z, "type": cell_type})
+
+    elif pattern == "random_disc":
+        if radius <= 0:
+            return "**Error:** Radius must be positive for random_disc pattern."
+        if num_cells <= 0:
+            return "**Error:** num_cells must be positive."
+        for _ in range(num_cells):
+            theta = random.uniform(0, 2 * math.pi)
+            r = radius * math.sqrt(random.uniform(0, 1))
+            x = center_x + r * math.cos(theta)
+            y = center_y + r * math.sin(theta)
+            new_cells.append({"x": x, "y": y, "z": z, "type": cell_type})
+
+    elif pattern == "random_rectangle":
+        if x_min >= x_max or y_min >= y_max:
+            return "**Error:** x_min must be < x_max and y_min must be < y_max."
+        if num_cells <= 0:
+            return "**Error:** num_cells must be positive."
+        for _ in range(num_cells):
+            x = random.uniform(x_min, x_max)
+            y = random.uniform(y_min, y_max)
+            new_cells.append({"x": x, "y": y, "z": z, "type": cell_type})
+
+    elif pattern == "grid":
+        if x_min >= x_max or y_min >= y_max:
+            return "**Error:** x_min must be < x_max and y_min must be < y_max."
+        if spacing <= 0:
+            return "**Error:** Spacing must be positive."
+        x_pos = x_min
+        while x_pos <= x_max:
+            y_pos = y_min
+            while y_pos <= y_max:
+                new_cells.append({"x": x_pos, "y": y_pos, "z": z, "type": cell_type})
+                y_pos += spacing
+            x_pos += spacing
+
+    elif pattern == "annular":
+        if radius <= 0:
+            return "**Error:** Radius must be positive for annular pattern."
+        if inner_radius < 0:
+            return "**Error:** inner_radius must be non-negative."
+        if inner_radius >= radius:
+            return "**Error:** inner_radius must be less than radius."
+        if num_cells <= 0:
+            return "**Error:** num_cells must be positive."
+        for _ in range(num_cells):
+            theta = random.uniform(0, 2 * math.pi)
+            r = math.sqrt(random.uniform(inner_radius**2, radius**2))
+            x = center_x + r * math.cos(theta)
+            y = center_y + r * math.sin(theta)
+            new_cells.append({"x": x, "y": y, "z": z, "type": cell_type})
+
+    if not new_cells:
+        return "**Warning:** No cells were generated. Check your parameters."
+
+    # Store in session
+    session.initial_cells.extend(new_cells)
+    session.initial_cells_count = len(session.initial_cells)
+    session.mark_step_complete(WorkflowStep.INITIAL_CONDITIONS_SET)
+
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    _set_legacy_config(session.config)
+
+    # Compute bounds of newly placed cells
+    xs = [c["x"] for c in new_cells]
+    ys = [c["y"] for c in new_cells]
+    placed_count = len(new_cells)
+
+    result = f"**Placed {placed_count} {cell_type} cells** ({pattern})\n"
+    result += f"- X range: [{min(xs):.1f}, {max(xs):.1f}] \u03bcm\n"
+    result += f"- Y range: [{min(ys):.1f}, {max(ys):.1f}] \u03bcm\n"
+    result += f"- Z: {z}\n"
+    result += f"- **Total cells in session:** {session.initial_cells_count}\n"
+
+    # Warn if cells are outside domain bounds
+    try:
+        domain_info = session.config.domain.get_info()
+        dx_min, dx_max = domain_info['x_min'], domain_info['x_max']
+        dy_min, dy_max = domain_info['y_min'], domain_info['y_max']
+        outside = sum(1 for c in new_cells
+                      if c["x"] < dx_min or c["x"] > dx_max
+                      or c["y"] < dy_min or c["y"] > dy_max)
+        if outside > 0:
+            result += f"\n**Warning:** {outside} cells are outside the simulation domain "
+            result += f"([{dx_min}, {dx_max}] x [{dy_min}, {dy_max}])\n"
+    except:
+        pass
+
+    if num_cells > 10000:
+        result += "\n**Note:** Large cell counts may slow simulation startup.\n"
+
+    result += f"\n**Next step:** Place more cells or call `export_cells_csv()` to write the file."
+    result += f"\n**Progress:** {session.get_progress_percentage():.0f}%"
+
+    return result
 
 # ============================================================================
 # HELPER FUNCTIONS (inspired by NeKo)
