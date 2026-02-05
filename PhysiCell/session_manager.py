@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 import logging
 
 # Configure logging
@@ -30,6 +30,7 @@ class WorkflowStep(Enum):
     PHYSIBOSS_INPUTS_LINKED = "physiboss_inputs_linked"
     PHYSIBOSS_OUTPUTS_LINKED = "physiboss_outputs_linked"
     PHYSIBOSS_MUTATIONS_APPLIED = "physiboss_mutations_applied"
+    INITIAL_CONDITIONS_SET = "initial_conditions_set"
     READY_FOR_EXPORT = "ready_for_export"
     XML_LOADED = "xml_loaded"
     XML_ANALYZED = "xml_analyzed"
@@ -65,7 +66,11 @@ class SessionState:
     physiboss_input_links_count: int = 0
     physiboss_output_links_count: int = 0
     physiboss_mutations_count: int = 0
-    
+
+    # Initial cell placement fields
+    initial_cells: List[Dict[str, Any]] = field(default_factory=list)
+    initial_cells_count: int = 0
+
     # XML-related fields
     loaded_from_xml: bool = False
     original_xml_path: Optional[str] = None
@@ -106,7 +111,11 @@ class SessionState:
             
             if len(self.loaded_physiboss_models) > 0:
                 recommendations.append("configure_physiboss_settings - Adjust intracellular models")
-            
+
+            if (len(self.loaded_cell_types) > 0 and
+                    WorkflowStep.INITIAL_CONDITIONS_SET not in self.completed_steps):
+                recommendations.append("place_initial_cells - Define initial cell positions (optional)")
+
             recommendations.append("export_xml_configuration - Save modified configuration")
             return recommendations
         
@@ -139,6 +148,10 @@ class SessionState:
             recommendations.append("add_physiboss_output_link - Connect boolean nodes to cell behaviors")
         elif WorkflowStep.RULES_CONFIGURED not in self.completed_steps:
             recommendations.append("add_single_cell_rule - Create additional cell behavior rules")
+        elif (self.cell_types_count > 0 and
+              WorkflowStep.INITIAL_CONDITIONS_SET not in self.completed_steps):
+            recommendations.append("place_initial_cells - Place cells spatially for initial conditions (optional)")
+            recommendations.append("export_xml_configuration - Or skip to export if using number_of_cells")
         elif WorkflowStep.READY_FOR_EXPORT not in self.completed_steps:
             recommendations.append("export_xml_configuration - Generate PhysiCell files")
         else:
@@ -176,7 +189,10 @@ class SessionState:
         
         if self.rules_count > 0 or not self.maboss_context:
             optional_steps.add(WorkflowStep.RULES_CONFIGURED)
-        
+
+        if self.initial_cells_count > 0:
+            optional_steps.add(WorkflowStep.INITIAL_CONDITIONS_SET)
+
         relevant_steps = core_steps | optional_steps
         total_steps = len(relevant_steps)
         completed = len(self.completed_steps & relevant_steps)
@@ -199,7 +215,8 @@ class SessionState:
             'physiboss_settings_count': self.physiboss_settings_count,
             'physiboss_input_links_count': self.physiboss_input_links_count,
             'physiboss_output_links_count': self.physiboss_output_links_count,
-            'physiboss_mutations_count': self.physiboss_mutations_count
+            'physiboss_mutations_count': self.physiboss_mutations_count,
+            'initial_cells_count': self.initial_cells_count
         }
         
         if self.maboss_context:
