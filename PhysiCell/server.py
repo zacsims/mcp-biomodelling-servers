@@ -2173,7 +2173,7 @@ def export_cells_csv(filename: str = "cells.csv") -> str:
         output_path = output_dir / "cells.csv"
 
         with open(output_path, 'w', newline='') as f:
-            writer = csv.writer(f)
+            writer = csv.writer(f, lineterminator='\n')
             writer.writerow(["x", "y", "z", "type"])
             for cell in session.initial_cells:
                 writer.writerow([cell["x"], cell["y"], cell["z"], cell["type"]])
