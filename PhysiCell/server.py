@@ -2096,6 +2096,69 @@ def get_initial_conditions_summary() -> str:
 
     return result
 
+@mcp.tool()
+def export_cells_csv(filename: str = "cells.csv") -> str:
+    """
+    When the user asks to export initial cell positions, save cell layout, or generate cells CSV,
+    this function writes the cells.csv file with all placed cell positions for PhysiCell.
+
+    PREREQUISITE: place_initial_cells() - Must have placed cells first.
+    NEXT STEP: export_xml_configuration() - Export XML (initial conditions will be enabled automatically).
+    Then create_physicell_project() - cells.csv will be copied to the project automatically.
+
+    Input parameters:
+    filename (str): Name for CSV file (default: 'cells.csv')
+
+    Returns:
+    str: Markdown-formatted export status with file details
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No simulation configured. Create domain and add components first."
+
+    if not session.initial_cells:
+        return "**No initial cells to export.**\n\nUse `place_initial_cells()` to add cells with spatial patterns first."
+
+    try:
+        # Write CSV file
+        output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Always save as cells.csv for consistency with create_physicell_project
+        output_path = output_dir / "cells.csv"
+
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["x", "y", "z", "type"])
+            for cell in session.initial_cells:
+                writer.writerow([cell["x"], cell["y"], cell["z"], cell["type"]])
+
+        # Update XML config to reference and enable cells.csv
+        session.config.initial_conditions.add_csv_file("cells.csv", "./config", enabled=True)
+        session.config.set_number_of_cells(0)
+
+        session.mark_step_complete(WorkflowStep.INITIAL_CONDITIONS_SET)
+        _set_legacy_config(session.config)
+
+        # Build result summary
+        type_counts: Dict[str, int] = {}
+        for c in session.initial_cells:
+            type_counts[c["type"]] = type_counts.get(c["type"], 0) + 1
+
+        result = f"## Cells CSV Exported\n\n"
+        result += f"**File:** {output_path}\n"
+        result += f"**Total cells:** {session.initial_cells_count}\n"
+        for t, count in sorted(type_counts.items()):
+            result += f"- {t}: {count}\n"
+        result += f"\n**XML config updated:** initial_conditions enabled, number_of_cells set to 0\n"
+        result += f"**Progress:** {session.get_progress_percentage():.0f}%\n\n"
+        result += f"**Next step:** Call `export_xml_configuration()` then `create_physicell_project()` (cells.csv will be copied automatically)."
+
+        return result
+
+    except Exception as e:
+        return f"Error exporting cells CSV: {str(e)}"
+
 # ============================================================================
 # HELPER FUNCTIONS (inspired by NeKo)
 # ============================================================================
