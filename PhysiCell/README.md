@@ -67,6 +67,12 @@ PhysiCell:  add_physiboss_model() → link genes to behaviors → simulate
 - `list_all_available_signals()` and `list_all_available_behaviors()` - Discovery tools
 - Context-aware signal/behavior expansion based on simulation components
 
+#### Initial Cell Placement
+- `place_initial_cells()` - Place cells spatially using patterns (disc, rectangle, grid, annular, single)
+- `get_initial_conditions_summary()` - Review current cell placements
+- `remove_initial_cells()` - Clear placed cells
+- `export_cells_csv()` - Export cells.csv for PhysiCell to load at simulation start
+
 #### PhysiBoSS Multiscale Integration
 - `add_physiboss_model()` - Integrate Boolean networks into cell behavior
 - `add_physiboss_input_link()` - Connect environment to gene regulation
@@ -92,6 +98,78 @@ PhysiCell:  add_physiboss_model() → link genes to behaviors → simulate
 "Add drug treatment effects to my existing simulation"
 → LLM extends: add_drug_substrate → modify_behavioral_rules → update_cell_interactions
 ```
+
+#### Pattern 4: Initial Cell Placement with Spatial Patterns
+```
+"Place 500 tumor cells in a disc at the center and 100 immune cells in a ring around them"
+→ LLM chains: place_initial_cells(tumor, random_disc) → place_initial_cells(immune, annular) → export_cells_csv
+```
+
+### Initial Cell Placement Guide
+
+PhysiCell can load initial cell positions from a `cells.csv` file instead of using random placement. This is useful for:
+- Recreating specific tissue architectures (tumor core + immune infiltrate)
+- Setting up co-culture experiments with defined spatial arrangements
+- Modeling layered tissues (epithelium, stroma, etc.)
+- Reproducing experimental conditions from imaging data
+
+#### How It Works
+
+The `place_initial_cells()` tool generates x,y,z coordinates for cells and stores them in the session. Call it multiple times to build up complex layouts with different cell types and spatial patterns. Then `export_cells_csv()` writes the positions to a CSV file and configures the XML to load it.
+
+#### Supported Spatial Patterns
+
+| Pattern | Description | Key Parameters |
+|---------|------------|----------------|
+| `random_disc` | Uniformly distributed cells in a circular area | `center_x`, `center_y`, `radius`, `num_cells` |
+| `random_rectangle` | Uniformly distributed cells in a rectangular area | `x_min`, `x_max`, `y_min`, `y_max`, `num_cells` |
+| `single` | Place exactly one cell at a specific position | `center_x`, `center_y` |
+| `grid` | Evenly spaced grid of cells | `x_min`, `x_max`, `y_min`, `y_max`, `spacing` |
+| `annular` | Uniformly distributed cells in a ring | `center_x`, `center_y`, `radius`, `inner_radius`, `num_cells` |
+
+#### Example Prompts
+
+**Tumor with immune infiltration:**
+> "Create a simulation with 500 breast cancer cells in a 200 micron disc at the center, surrounded by 100 cytotoxic T cells in a ring from 250 to 400 microns"
+
+**LLM Tool Chain:**
+```
+1. create_simulation_domain(1000, 1000, 20)
+2. add_single_substrate("oxygen", 100000, 0.01, 38)
+3. add_single_cell_type("breast_cancer", "Ki67_basic")
+4. add_single_cell_type("cytotoxic_T_cell", "live_cell")
+5. place_initial_cells("breast_cancer", "random_disc", num_cells=500, radius=200)
+6. place_initial_cells("cytotoxic_T_cell", "annular", num_cells=100, radius=400, inner_radius=250)
+7. export_cells_csv()
+8. export_xml_configuration()
+9. create_physicell_project("tumor_immune")
+```
+
+**Tissue layers:**
+> "Set up a simulation with an epithelial layer at the top and stromal cells below"
+
+**LLM Tool Chain:**
+```
+1. place_initial_cells("epithelial", "grid", x_min=-400, x_max=400, y_min=100, y_max=200, spacing=15)
+2. place_initial_cells("stromal", "random_rectangle", num_cells=300, x_min=-400, x_max=400, y_min=-200, y_max=80)
+3. export_cells_csv()
+```
+
+**Scattered immune cells across the domain:**
+> "Place 200 macrophages randomly across the entire simulation domain"
+
+**LLM Tool Chain:**
+```
+1. place_initial_cells("macrophage", "random_rectangle", num_cells=200, x_min=-500, x_max=500, y_min=-500, y_max=500)
+2. export_cells_csv()
+```
+
+#### Important Notes
+- Cell types must be defined (via `add_single_cell_type()`) before placing cells
+- Multiple `place_initial_cells()` calls accumulate — each call adds to the existing placements
+- Use `remove_initial_cells()` to clear and start over
+- `export_cells_csv()` automatically sets `number_of_cells=0` in the XML so PhysiCell uses the CSV instead of random placement
+- Use `get_initial_conditions_summary()` to review placements before exporting
 
 ### Advanced PhysiBoSS Integration
 
