@@ -821,7 +821,16 @@ def add_single_substrate(substrate_name: str, diffusion_coefficient: float, deca
         dirichlet_value=dirichlet_value,
         units=units
     )
-    
+
+    # When Dirichlet is enabled, also enable per-boundary conditions for x/y
+    # (z boundaries left disabled for 2D simulations)
+    if dirichlet_enabled:
+        name = substrate_name.strip()
+        for boundary in ['xmin', 'xmax', 'ymin', 'ymax']:
+            session.config.substrates.set_dirichlet_boundary(
+                name, boundary, enabled=True, value=dirichlet_value
+            )
+
     # Update session counters
     session.substrates_count += 1
     session.mark_step_complete(WorkflowStep.SUBSTRATES_ADDED)
