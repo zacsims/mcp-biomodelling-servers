@@ -1992,6 +1992,110 @@ def place_initial_cells(
 
     return result
 
+@mcp.tool()
+def remove_initial_cells(cell_type: Optional[str] = None) -> str:
+    """
+    Remove placed initial cells from the current session.
+    Use this to clear and redo cell placements before exporting.
+
+    Args:
+        cell_type: If provided, remove only cells of this type. If omitted, remove all cells.
+
+    Returns:
+        str: Summary of removed cells and remaining count
+    """
+    session = get_current_session()
+    if not session:
+        return "**Error:** No active session."
+
+    if not session.initial_cells:
+        return "**No initial cells to remove.** Use `place_initial_cells()` to add cells first."
+
+    previous_count = len(session.initial_cells)
+
+    if cell_type is None:
+        session.initial_cells.clear()
+        removed = previous_count
+    else:
+        session.initial_cells = [c for c in session.initial_cells if c["type"] != cell_type]
+        removed = previous_count - len(session.initial_cells)
+
+    session.initial_cells_count = len(session.initial_cells)
+
+    if session.initial_cells_count == 0:
+        session.completed_steps.discard(WorkflowStep.INITIAL_CONDITIONS_SET)
+
+    result = f"**Removed {removed} cells**"
+    if cell_type:
+        result += f" of type '{cell_type}'"
+    result += f"\n- **Remaining:** {session.initial_cells_count} cells"
+
+    if session.initial_cells_count > 0:
+        # Show remaining type breakdown
+        type_counts: Dict[str, int] = {}
+        for c in session.initial_cells:
+            type_counts[c["type"]] = type_counts.get(c["type"], 0) + 1
+        for t, count in type_counts.items():
+            result += f"\n  - {t}: {count}"
+
+    return result
+
+@mcp.tool()
+def get_initial_conditions_summary() -> str:
+    """
+    Get a summary of current initial cell placements.
+    Shows count by cell type, spatial bounds, and total cells.
+    Use this to review placements before exporting cells.csv.
+
+    Returns:
+        str: Markdown-formatted summary of initial cell positions
+    """
+    session = get_current_session()
+    if not session:
+        return "**Error:** No active session."
+
+    if not session.initial_cells:
+        return "**No initial cells placed.**\n\nUse `place_initial_cells()` to add cells with spatial patterns like random_disc, grid, annular, etc."
+
+    # Group by type
+    type_counts: Dict[str, int] = {}
+    for c in session.initial_cells:
+        type_counts[c["type"]] = type_counts.get(c["type"], 0) + 1
+
+    # Compute overall bounds
+    all_x = [c["x"] for c in session.initial_cells]
+    all_y = [c["y"] for c in session.initial_cells]
+
+    result = f"## Initial Cell Placement Summary\n\n"
+    result += f"**Total cells:** {session.initial_cells_count}\n\n"
+    result += f"**By cell type:**\n"
+    for t, count in sorted(type_counts.items()):
+        result += f"- {t}: {count}\n"
+
+    result += f"\n**Spatial bounds:**\n"
+    result += f"- X: [{min(all_x):.1f}, {max(all_x):.1f}] \u03bcm\n"
+    result += f"- Y: [{min(all_y):.1f}, {max(all_y):.1f}] \u03bcm\n"
+
+    # Check against domain
+    try:
+        domain_info = session.config.domain.get_info()
+        dx_min, dx_max = domain_info['x_min'], domain_info['x_max']
+        dy_min, dy_max = domain_info['y_min'], domain_info['y_max']
+        outside = sum(1 for c in session.initial_cells
+                      if c["x"] < dx_min or c["x"] > dx_max
+                      or c["y"] < dy_min or c["y"] > dy_max)
+        result += f"\n**Domain:** [{dx_min}, {dx_max}] x [{dy_min}, {dy_max}] \u03bcm\n"
+        if outside > 0:
+            result += f"**Warning:** {outside} cells are outside the domain bounds.\n"
+        else:
+            result += f"All cells are within the domain bounds.\n"
+    except:
+        pass
+
+    result += f"\n**Next step:** Call `export_cells_csv()` to write cells.csv, then `export_xml_configuration()`."
+
+    return result
+
 # ============================================================================
 # HELPER FUNCTIONS (inspired by NeKo)
 # ============================================================================
