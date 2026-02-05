@@ -1709,6 +1709,11 @@ str: Markdown-formatted export status with file details
         if not cell_types and session.cell_types_count > 0:
             cell_types = [f"cell_type_{i+1}" for i in range(session.cell_types_count)]
         
+        # If initial cells have been placed, ensure XML config enables cells.csv
+        if session.initial_cells_count > 0:
+            session.config.initial_conditions.add_csv_file("cells.csv", "./config", enabled=True)
+            session.config.set_number_of_cells(0)
+
         # Export XML configuration
         xml_content = session.config.generate_xml()
 
@@ -1964,6 +1969,10 @@ def place_initial_cells(
     session.initial_cells.extend(new_cells)
     session.initial_cells_count = len(session.initial_cells)
     session.mark_step_complete(WorkflowStep.INITIAL_CONDITIONS_SET)
+
+    # Immediately update config so XML generation always reflects cell placements
+    session.config.initial_conditions.add_csv_file("cells.csv", "./config", enabled=True)
+    session.config.set_number_of_cells(0)
 
     if session.loaded_from_xml:
         session.mark_xml_modification()
