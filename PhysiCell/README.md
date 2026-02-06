@@ -421,30 +421,125 @@ LLMs can monitor and guide users through simulation construction:
 - **UQ-PhysiCell Integration**: Sensitivity analysis, Bayesian optimization, ABC-SMC calibration
 - **Cross-Server Coordination**: Seamless file handoff from NeKo/MaBoSS workflows
 
-### Getting Started
+### Installation & Setup
 
-1. **Install MCP client** in your LLM environment
-2. **Connect to PhysiCell MCP server** endpoint
-3. **Use natural language** to describe biological scenarios
-4. **Chain with NeKo/MaBoSS** for complete gene→tissue modeling
-5. **Calibrate models** against experimental data using UQ tools
+#### Prerequisites
 
-### Dependencies
+1. **Python 3.10+** - Required for the MCP server
+2. **[uv](https://docs.astral.sh/uv/)** - Python package manager (used to run the server and manage dependencies)
+   ```bash
+   # Install uv (macOS/Linux)
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+3. **PhysiCell** - The C++ simulation framework must be compiled separately
+   ```bash
+   # Clone and compile PhysiCell
+   git clone https://github.com/MathCancer/PhysiCell.git
+   cd PhysiCell
+   make                    # Compile the default project
+   make save PROJ=template # Save the template project
+   ```
+   The MCP server will reference your PhysiCell installation when creating and compiling simulation projects.
 
+#### Install the MCP Server
+
+Clone this repository:
 ```bash
-# Core (required)
-pip install fastmcp physicell-settings cairosvg pillow
-
-# UQ-PhysiCell (for calibration and sensitivity analysis)
-pip install uq-physicell
-
-# Optional UQ backends
-pip install torch botorch gpytorch  # Bayesian optimization
-pip install pyabc                    # ABC-SMC calibration
+git clone https://github.com/your-org/mcp-biomodelling-servers.git
+cd mcp-biomodelling-servers/PhysiCell
 ```
 
-**Learn More About PhysiCell**: [PhysiCell Official Documentation](http://physicell.org/)
-**Learn More About PhysiBoSS**: [PhysiBoSS Publication](https://doi.org/10.1093/bioinformatics/btz279)
-**Learn More About UQ-PhysiCell**: [UQ-PhysiCell Documentation](https://uq-physicell.readthedocs.io/)
+All Python dependencies (including `fastmcp`, `physicell-settings`, `cairosvg`, `pillow`, and `uq-physicell`) are declared in `pyproject.toml` and are **automatically installed** when the server is launched via `uv run`.
+
+#### Optional UQ Dependencies
+
+The core UQ features (sensitivity analysis) work out of the box. For advanced calibration methods, install the optional extras:
+
+```bash
+# Bayesian Optimization calibration (torch + botorch)
+uv pip install --project /path/to/mcp-biomodelling-servers/PhysiCell torch botorch gpytorch
+
+# ABC-SMC calibration (pyabc)
+uv pip install --project /path/to/mcp-biomodelling-servers/PhysiCell pyabc
+
+# Or install everything at once
+uv pip install --project /path/to/mcp-biomodelling-servers/PhysiCell "physicell[all]"
+```
+
+The server gracefully degrades if these are not installed - core simulation and sensitivity analysis tools will still work, and calibration tools will return a message indicating which packages need to be installed.
+
+#### Setup for Claude Desktop
+
+Add the PhysiCell MCP server to your Claude Desktop configuration file:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "PhysiCell": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/absolute/path/to/mcp-biomodelling-servers/PhysiCell",
+        "python",
+        "/absolute/path/to/mcp-biomodelling-servers/PhysiCell/server.py"
+      ]
+    }
+  }
+}
+```
+
+Replace `/absolute/path/to/mcp-biomodelling-servers` with the actual path where you cloned the repository. Restart Claude Desktop after saving.
+
+#### Setup for Claude Code
+
+Use the `claude mcp add` command to register the server:
+
+```bash
+claude mcp add PhysiCell \
+  -s user \
+  -- uv run \
+  --project /absolute/path/to/mcp-biomodelling-servers/PhysiCell \
+  python /absolute/path/to/mcp-biomodelling-servers/PhysiCell/server.py
+```
+
+This registers the MCP server at the user level (`-s user`), making it available across all projects. You can also use `-s project` to register it only for the current project.
+
+To verify the server is registered:
+```bash
+claude mcp list
+```
+
+#### Verifying the Installation
+
+Once configured, start Claude Desktop or Claude Code. The PhysiCell tools should be available. You can verify by asking:
+
+> "What PhysiCell tools are available?"
+
+or calling the `get_help()` tool. If the UQ tools show as unavailable, check that `uq-physicell` is installed in the server's virtual environment.
+
+### Dependencies Summary
+
+| Package | Purpose | Required? |
+|---------|---------|-----------|
+| `fastmcp` | MCP server framework | Yes (auto-installed) |
+| `physicell-settings` | PhysiCell XML config manipulation | Yes (auto-installed) |
+| `cairosvg` | SVG rendering for visualization | Yes (auto-installed) |
+| `pillow` | Image processing for GIF generation | Yes (auto-installed) |
+| `uq-physicell` | Sensitivity analysis & calibration | Yes (auto-installed) |
+| `torch`, `botorch`, `gpytorch` | Bayesian Optimization calibration | Optional |
+| `pyabc` | ABC-SMC calibration | Optional |
+
+All required dependencies are automatically installed by `uv run` from `pyproject.toml`. Only the optional calibration backends need manual installation.
+
+### Learn More
+
+- **PhysiCell**: [Official Documentation](http://physicell.org/)
+- **PhysiBoSS**: [Publication](https://doi.org/10.1093/bioinformatics/btz279)
+- **UQ-PhysiCell**: [Documentation](https://uq-physicell.readthedocs.io/)
+- **Model Context Protocol**: [MCP Specification](https://modelcontextprotocol.io/)
 
 This MCP server transforms PhysiCell from a complex simulation framework into an **LLM-accessible multiscale modeling platform**, enabling natural language-driven construction, calibration, and validation of sophisticated gene-to-tissue simulations.
