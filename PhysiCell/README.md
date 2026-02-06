@@ -513,6 +513,16 @@ To verify the server is registered:
 claude mcp list
 ```
 
+#### Recommended: Add CLAUDE.md
+
+Copy the included `CLAUDE.md` to `~/.claude/CLAUDE.md` to ensure Claude Code always uses the PhysiCell MCP tools directly rather than attempting manual workarounds:
+
+```bash
+cp /path/to/mcp-biomodelling-servers/PhysiCell/CLAUDE.md ~/.claude/CLAUDE.md
+```
+
+This file is loaded automatically at the start of every Claude Code conversation and instructs Claude to use the MCP tools as direct tool calls. Without it, Claude may try to call the tools via subprocess or write PhysiCell configuration files manually.
+
 #### Verifying the Installation
 
 Once configured, start Claude Desktop or Claude Code. The PhysiCell tools should be available. You can verify by asking:
