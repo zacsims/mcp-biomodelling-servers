@@ -103,10 +103,10 @@ from mcp.types import Icon
 # PHYSICELL PROJECT EXECUTION INFRASTRUCTURE
 # ============================================================================
 
-PHYSICELL_ROOT = Path("/Users/simsz/PhysiCell")
+PHYSICELL_ROOT = Path(os.environ.get("PHYSICELL_ROOT", Path.home() / "PhysiCell"))
 USER_PROJECTS_DIR = PHYSICELL_ROOT / "user_projects"
 TEMPLATE_DIR = PHYSICELL_ROOT / "sample_projects" / "template"
-MCP_OUTPUT_DIR = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+MCP_OUTPUT_DIR = Path(os.environ.get("MCP_OUTPUT_DIR", Path.home() / "PhysiCell_MCP_Output"))
 
 @dataclass
 class SimulationRun:
