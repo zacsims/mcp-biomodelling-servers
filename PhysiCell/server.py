@@ -5,6 +5,7 @@
 #   "physicell-settings>=0.4.5",
 #   "cairosvg>=2.7.0",
 #   "pillow>=10.0.0",
+#   "uq-physicell>=1.2.4",
 # ]
 # ///
 """
@@ -30,9 +31,11 @@ import re
 import math
 import random
 import csv
+import configparser
 from pathlib import Path
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
+import threading
 from threading import Lock
 #from hatch_mcp_server import HatchMCP
 
@@ -61,8 +64,36 @@ except ImportError:
 # Import session management
 from session_manager import (
     session_manager, SessionState, WorkflowStep, MaBoSSContext,
+    UQContext, UQParameterDef,
     get_current_session, ensure_session, analyze_and_update_session_from_config
 )
+
+# Try to import UQ-PhysiCell modules
+try:
+    from uq_physicell import PhysiCell_Model
+    from uq_physicell.model_analysis import ModelAnalysisContext, run_simulations as uq_run_simulations
+    UQ_AVAILABLE = True
+except ImportError:
+    UQ_AVAILABLE = False
+
+try:
+    from uq_physicell.bo import (
+        CalibrationContext as BOCalibrationContext,
+        run_bayesian_optimization as uq_run_bo,
+        SumSquaredDifferences, Manhattan, Chebyshev
+    )
+    UQ_BO_AVAILABLE = True
+except ImportError:
+    UQ_BO_AVAILABLE = False
+
+try:
+    from uq_physicell.abc import (
+        CalibrationContext as ABCCalibrationContext,
+        run_abc_calibration as uq_run_abc
+    )
+    UQ_ABC_AVAILABLE = True
+except ImportError:
+    UQ_ABC_AVAILABLE = False
 
 from mcp.server.fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
@@ -3012,6 +3043,1512 @@ def get_simulation_output_files(simulation_id: Optional[str] = None,
 
     return result
 
+# ============================================================================
+# UNCERTAINTY QUANTIFICATION (UQ) TOOLS
+# ============================================================================
+
+# Global UQ run tracking
+uq_runs: Dict[str, Dict] = {}
+uq_runs_lock = Lock()
+
+def _generate_uq_ini(session: SessionState, uq_ctx: UQContext) -> str:
+    """Generate a UQ_PhysiCell INI config file from session state."""
+    config = configparser.ConfigParser()
+    section = "uq_model"
+    config.add_section(section)
+
+    config.set(section, "executable", uq_ctx.executable_path or "./project")
+    config.set(section, "configfile_ref", uq_ctx.xml_config_path or "config/PhysiCell_settings.xml")
+    config.set(section, "numreplicates", str(uq_ctx.num_replicates))
+    config.set(section, "omp_num_threads", str(uq_ctx.num_workers))
+
+    # Build parameters dict: fixed overrides + variable params
+    params_dict = {
+        ".//save/SVG/enable": "'false'",
+    }
+
+    # Build rules params dict
+    rules_dict = {}
+
+    for p in uq_ctx.parameters:
+        if p.param_type == "xml" and p.xpath:
+            params_dict[p.xpath] = f"[None, '{p.name}']"
+        elif p.param_type == "rules" and p.rule_key:
+            rules_dict[p.rule_key] = f"[None, '{p.name}']"
+
+    config.set(section, "parameters", str(params_dict).replace('"[', '[').replace(']"', ']').replace("'[", '[').replace("]'", ']'))
+
+    if uq_ctx.rules_csv_path:
+        config.set(section, "rulesfile_ref", uq_ctx.rules_csv_path)
+        if rules_dict:
+            config.set(section, "parameters_rules", str(rules_dict).replace('"[', '[').replace(']"', ']').replace("'[", '[').replace("]'", ']'))
+
+    # Write INI to the UQ output directory
+    ini_path = Path(uq_ctx.uq_output_dir) / "uq_config.ini"
+
+    # Write manually to avoid configparser quoting issues
+    with open(ini_path, 'w') as f:
+        f.write(f"[{section}]\n")
+        f.write(f"executable = {uq_ctx.executable_path or './project'}\n")
+        f.write(f"configfile_ref = {uq_ctx.xml_config_path or 'config/PhysiCell_settings.xml'}\n")
+        f.write(f"numreplicates = {uq_ctx.num_replicates}\n")
+        f.write(f"omp_num_threads = {uq_ctx.num_workers}\n")
+
+        # Build proper parameters dict string
+        xml_params = {}
+        for p in uq_ctx.parameters:
+            if p.param_type == "xml" and p.xpath:
+                xml_params[p.xpath] = [None, p.name]
+        # Add fixed overrides
+        xml_params[".//save/SVG/enable"] = "false"
+
+        f.write(f"parameters = {repr(xml_params)}\n")
+
+        if uq_ctx.rules_csv_path:
+            f.write(f"rulesfile_ref = {uq_ctx.rules_csv_path}\n")
+            rules_params = {}
+            for p in uq_ctx.parameters:
+                if p.param_type == "rules" and p.rule_key:
+                    rules_params[p.rule_key] = [None, p.name]
+            if rules_params:
+                f.write(f"parameters_rules = {repr(rules_params)}\n")
+
+    return str(ini_path)
+
+
+def _build_xpath_for_cell_param(cell_type: str, param_path: str) -> str:
+    """Build XPath expression for a cell type parameter."""
+    # Common parameter path mappings
+    mappings = {
+        "cycle entry rate": "phenotype/cycle/phase_transition_rates/rate[1]",
+        "cycle entry": "phenotype/cycle/phase_transition_rates/rate[1]",
+        "apoptosis rate": "phenotype/death/*[@name='apoptosis']/death_rate",
+        "necrosis rate": "phenotype/death/*[@name='necrosis']/death_rate",
+        "migration speed": "phenotype/motility/speed",
+        "migration bias": "phenotype/motility/migration_bias",
+        "persistence time": "phenotype/motility/persistence_time",
+    }
+    resolved = mappings.get(param_path, param_path)
+    return f".//cell_definitions/cell_definition[@name='{cell_type}']/{resolved}"
+
+
+def _build_rule_key(cell_type: str, signal: str, direction: str, behavior: str, field: str) -> str:
+    """Build a rule parameter key string for UQ_PhysiCell."""
+    return f"{cell_type},{signal},{direction},{behavior},{field}"
+
+
+@mcp.tool()
+def setup_uq_analysis(project_name: Optional[str] = None,
+                      num_replicates: int = 3,
+                      num_workers: int = 4) -> str:
+    """
+    Initialize uncertainty quantification analysis for the current PhysiCell model.
+    This auto-detects the compiled project, XML config, and rules CSV from the session,
+    and prepares the UQ working directory.
+
+    PREREQUISITES: You must have already:
+    1. Created and configured a simulation (domain, substrates, cell types, rules)
+    2. Exported XML and rules CSV
+    3. Created and compiled a PhysiCell project
+
+    Args:
+        project_name: Name of the compiled PhysiCell project (auto-detected if omitted)
+        num_replicates: Number of simulation replicates per parameter set (default: 3)
+        num_workers: Number of parallel workers for simulations (default: 4)
+
+    Returns:
+        str: Setup status and next steps
+    """
+    if not UQ_AVAILABLE:
+        return "**Error:** uq-physicell package not installed. Run: `pip install uq-physicell`"
+
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No active session. Create and configure a simulation first."
+
+    # Auto-detect project
+    if not project_name:
+        # Check for recent simulations
+        with simulations_lock:
+            if running_simulations:
+                latest = max(running_simulations.values(), key=lambda s: s.started_at)
+                project_name = latest.project_name
+
+    if not project_name:
+        return "**Error:** No project found. Specify project_name or create/compile a project first."
+
+    project_dir = USER_PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        return f"**Error:** Project directory not found: {project_dir}"
+
+    # Find executable
+    executable = project_dir / "project"
+    if not executable.exists():
+        return f"**Error:** Executable not found at {executable}. Compile the project first with `compile_physicell_project('{project_name}')`."
+
+    # Find config files
+    config_dir = project_dir / "config"
+    xml_path = config_dir / "PhysiCell_settings.xml"
+    rules_path = config_dir / "cell_rules.csv"
+
+    if not xml_path.exists():
+        return f"**Error:** XML config not found at {xml_path}. Export configuration first."
+
+    # Create UQ working directory
+    uq_output_dir = project_dir / "uq_analysis"
+    uq_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize UQ context
+    uq_ctx = UQContext(
+        project_name=project_name,
+        executable_path=str(executable),
+        xml_config_path=str(xml_path),
+        rules_csv_path=str(rules_path) if rules_path.exists() else None,
+        num_replicates=num_replicates,
+        num_workers=num_workers,
+        uq_output_dir=str(uq_output_dir),
+    )
+    session.uq_context = uq_ctx
+    session.mark_step_complete(WorkflowStep.UQ_SETUP)
+
+    result = "## UQ Analysis Initialized\n\n"
+    result += f"**Project:** {project_name}\n"
+    result += f"**Executable:** {executable}\n"
+    result += f"**XML Config:** {xml_path}\n"
+    result += f"**Rules CSV:** {rules_path if rules_path.exists() else 'None'}\n"
+    result += f"**Replicates:** {num_replicates}\n"
+    result += f"**Workers:** {num_workers}\n"
+    result += f"**UQ Directory:** {uq_output_dir}\n\n"
+    result += "**Next step:** Use `get_uq_parameter_suggestions()` to see calibratable parameters, "
+    result += "then `define_uq_parameters()` to select which ones to vary."
+    return result
+
+
+@mcp.tool()
+def get_uq_parameter_suggestions() -> str:
+    """
+    Analyze the current model configuration and suggest parameters that can be
+    calibrated or analyzed with uncertainty quantification. Returns both XML-based
+    parameters (cell properties) and rules-based parameters (Hill function coefficients).
+
+    Returns:
+        str: Markdown-formatted list of suggested parameters with reference values
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No active session with configuration."
+
+    if not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    import xml.etree.ElementTree as ET
+
+    result = "## Suggested UQ Parameters\n\n"
+
+    # === XML-based parameters ===
+    result += "### XML Parameters (Cell Properties)\n\n"
+    result += "| # | Cell Type | Parameter | XPath | Ref Value |\n"
+    result += "|---|-----------|-----------|-------|-----------|\n"
+
+    xml_suggestions = []
+    config = session.config
+    cell_types = list(config.cell_types.get_cell_types().keys())
+
+    # Parse XML to get actual values
+    xml_path = session.uq_context.xml_config_path
+    try:
+        tree = ET.parse(xml_path)
+        xml_root = tree.getroot()
+    except Exception:
+        xml_root = None
+
+    param_idx = 1
+    for ct in cell_types:
+        param_paths = [
+            ("cycle entry rate", f".//cell_definitions/cell_definition[@name='{ct}']/phenotype/cycle/phase_transition_rates/rate[1]"),
+            ("apoptosis rate", f".//cell_definitions/cell_definition[@name='{ct}']/phenotype/death/model[@name='apoptosis']/death_rate"),
+            ("necrosis rate", f".//cell_definitions/cell_definition[@name='{ct}']/phenotype/death/model[@name='necrosis']/death_rate"),
+            ("migration speed", f".//cell_definitions/cell_definition[@name='{ct}']/phenotype/motility/speed"),
+            ("migration bias", f".//cell_definitions/cell_definition[@name='{ct}']/phenotype/motility/migration_bias"),
+            ("persistence time", f".//cell_definitions/cell_definition[@name='{ct}']/phenotype/motility/persistence_time"),
+        ]
+        for param_name, xpath in param_paths:
+            ref_val = "N/A"
+            if xml_root is not None:
+                elem = xml_root.find(xpath)
+                if elem is not None and elem.text:
+                    ref_val = elem.text.strip()
+                else:
+                    continue  # Skip if not found in XML
+            xml_suggestions.append((ct, param_name, xpath, ref_val))
+            result += f"| {param_idx} | {ct} | {param_name} | `{xpath}` | {ref_val} |\n"
+            param_idx += 1
+
+    # === Rules-based parameters ===
+    result += "\n### Rules Parameters (Hill Function Coefficients)\n\n"
+    result += "| # | Rule | Field | Key | Ref Value |\n"
+    result += "|---|------|-------|-----|-----------|\n"
+
+    rules_suggestions = []
+    rules_csv_path = session.uq_context.rules_csv_path
+
+    if rules_csv_path and Path(rules_csv_path).exists():
+        with open(rules_csv_path, 'r') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 8:
+                    continue
+                cell_type, signal, direction, behavior = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
+                base_val, half_max, hill_power, apply_to_dead = row[4].strip(), row[5].strip(), row[6].strip(), row[7].strip()
+
+                rule_desc = f"{cell_type}: {signal} {direction} {behavior}"
+
+                for field_name, field_val in [("saturation", base_val), ("half_max", half_max), ("hill_power", hill_power)]:
+                    rule_key = f"{cell_type},{signal},{direction},{behavior},{field_name}"
+                    rules_suggestions.append((rule_desc, field_name, rule_key, field_val))
+                    result += f"| {param_idx} | {rule_desc} | {field_name} | `{rule_key}` | {field_val} |\n"
+                    param_idx += 1
+    else:
+        result += "*(No cell_rules.csv found)*\n"
+
+    result += f"\n**Total suggestions:** {param_idx - 1} parameters\n\n"
+    result += "**Next step:** Use `define_uq_parameters()` to select which parameters to include in your analysis.\n"
+    result += "Pass parameters as a list of dicts with 'name', 'type' ('xml'/'rules'), 'xpath' or 'rule_key', "
+    result += "'ref_value', 'lower_bound', 'upper_bound'."
+
+    return result
+
+
+@mcp.tool()
+def define_uq_parameters(parameters: List[Dict[str, Any]]) -> str:
+    """
+    Define which parameters to vary in the UQ analysis. Each parameter needs a name,
+    type (xml or rules), the xpath or rule_key, reference value, and bounds.
+
+    Args:
+        parameters: List of parameter definitions, each a dict with:
+            - name (str): Human-readable parameter name (e.g., 'tumor_cycle_hfm')
+            - type (str): 'xml' or 'rules'
+            - xpath (str, for xml): XPath to the XML element
+            - rule_key (str, for rules): Rule key like 'tumor,oxygen,increases,cycle entry,half_max'
+            - ref_value (float): Reference/default value
+            - lower_bound (float): Lower bound for sampling
+            - upper_bound (float): Upper bound for sampling
+
+    Returns:
+        str: Summary of defined parameters
+    """
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    uq_ctx = session.uq_context
+    uq_ctx.parameters = []
+
+    errors = []
+    for i, p in enumerate(parameters):
+        name = p.get("name")
+        ptype = p.get("type")
+        if not name:
+            errors.append(f"Parameter {i+1}: missing 'name'")
+            continue
+        if ptype not in ("xml", "rules"):
+            errors.append(f"Parameter '{name}': type must be 'xml' or 'rules', got '{ptype}'")
+            continue
+
+        param_def = UQParameterDef(
+            name=name,
+            param_type=ptype,
+            xpath=p.get("xpath"),
+            rule_key=p.get("rule_key"),
+            ref_value=p.get("ref_value"),
+            lower_bound=p.get("lower_bound"),
+            upper_bound=p.get("upper_bound"),
+            perturbation=p.get("perturbation"),
+        )
+
+        if ptype == "xml" and not param_def.xpath:
+            errors.append(f"Parameter '{name}': XML type requires 'xpath'")
+            continue
+        if ptype == "rules" and not param_def.rule_key:
+            errors.append(f"Parameter '{name}': rules type requires 'rule_key'")
+            continue
+
+        # Auto-compute bounds if not provided (±50% of ref_value)
+        if param_def.ref_value is not None:
+            if param_def.lower_bound is None:
+                param_def.lower_bound = param_def.ref_value * 0.5
+            if param_def.upper_bound is None:
+                param_def.upper_bound = param_def.ref_value * 1.5
+
+        uq_ctx.parameters.append(param_def)
+
+    session.mark_step_complete(WorkflowStep.UQ_PARAMETERS_DEFINED)
+
+    result = "## UQ Parameters Defined\n\n"
+    if errors:
+        result += "### Warnings\n"
+        for e in errors:
+            result += f"- {e}\n"
+        result += "\n"
+
+    result += f"**Total parameters:** {len(uq_ctx.parameters)}\n\n"
+    result += "| Name | Type | Key/XPath | Ref | Bounds |\n"
+    result += "|------|------|-----------|-----|--------|\n"
+    for p in uq_ctx.parameters:
+        key = p.xpath if p.param_type == "xml" else p.rule_key
+        # Truncate long keys for display
+        key_display = key if len(key) < 50 else "..." + key[-47:]
+        bounds = f"[{p.lower_bound}, {p.upper_bound}]" if p.lower_bound is not None else "auto"
+        result += f"| {p.name} | {p.param_type} | `{key_display}` | {p.ref_value} | {bounds} |\n"
+
+    result += "\n**Next step:** Use `define_quantities_of_interest()` to specify what to measure from simulations."
+    return result
+
+
+@mcp.tool()
+def define_quantities_of_interest(qois: List[Dict[str, str]],
+                                  time_column: str = "time") -> str:
+    """
+    Define what quantities to measure from simulation outputs. QoIs are computed
+    from PhysiCell output DataFrames using lambda expressions or predefined functions.
+
+    Args:
+        qois: List of QoI definitions, each a dict with:
+            - name (str): QoI identifier (e.g., 'live_tumor_cells')
+            - function (str): Lambda expression on cell DataFrame, OR one of:
+                'live_cells' - total live cells
+                'dead_cells' - total dead cells
+                'cell_count:<type>' - count of specific cell type (e.g., 'cell_count:tumor')
+            - obs_column (str, optional): Column name in experimental data CSV mapping to this QoI
+        time_column: Column name for time in experimental data (default: 'time')
+
+    Returns:
+        str: Summary of defined QoIs
+    """
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    uq_ctx = session.uq_context
+    uq_ctx.qoi_definitions = {}
+    uq_ctx.experimental_data_columns = {"time": time_column}
+
+    # Predefined QoI templates
+    predefined = {
+        "live_cells": "lambda df: len(df[df['dead'] == False])",
+        "dead_cells": "lambda df: len(df[df['dead'] == True])",
+    }
+
+    result_qois = []
+    for q in qois:
+        name = q.get("name")
+        func = q.get("function", "")
+        obs_col = q.get("obs_column")
+
+        if not name:
+            continue
+
+        # Handle predefined functions
+        if func in predefined:
+            func = predefined[func]
+        elif func.startswith("cell_count:"):
+            cell_type = func.split(":", 1)[1]
+            func = f"lambda df: len(df[df['cell_type'] == '{cell_type}'])"
+
+        uq_ctx.qoi_definitions[name] = func
+        if obs_col:
+            uq_ctx.experimental_data_columns[name] = obs_col
+        result_qois.append((name, func, obs_col))
+
+    session.mark_step_complete(WorkflowStep.UQ_QOIS_DEFINED)
+
+    result = "## Quantities of Interest Defined\n\n"
+    result += f"**Total QoIs:** {len(result_qois)}\n\n"
+    result += "| Name | Function | Obs. Column |\n"
+    result += "|------|----------|-------------|\n"
+    for name, func, obs_col in result_qois:
+        func_display = func if len(func) < 60 else func[:57] + "..."
+        result += f"| {name} | `{func_display}` | {obs_col or '-'} |\n"
+
+    result += "\n**Next steps:**\n"
+    result += "- `run_sensitivity_analysis()` - Analyze parameter sensitivity\n"
+    result += "- `provide_experimental_data()` - Load reference data for calibration\n"
+    return result
+
+
+# ============================================================================
+# UQ PHASE 2: SENSITIVITY ANALYSIS
+# ============================================================================
+
+@mcp.tool()
+def run_sensitivity_analysis(method: str = "Sobol",
+                             num_samples: int = 64,
+                             num_workers: int = 4,
+                             parallel_method: str = "inter-process") -> str:
+    """
+    Run sensitivity analysis on the current model to identify which parameters
+    most influence the simulation outputs (QoIs).
+
+    PREREQUISITES: setup_uq_analysis(), define_uq_parameters(), define_quantities_of_interest()
+
+    Args:
+        method: Sampling/SA method - 'Sobol', 'LHS' (Latin Hypercube), 'OAT' (One-at-a-Time),
+                'Fast', 'Fractional Factorial' (default: 'Sobol')
+        num_samples: Number of parameter samples (default: 64, higher = more accurate but slower)
+        num_workers: Number of parallel simulation workers (default: 4)
+        parallel_method: 'serial', 'inter-process', or 'inter-node' (default: 'inter-process')
+
+    Returns:
+        str: Sensitivity analysis status and run ID
+    """
+    if not UQ_AVAILABLE:
+        return "**Error:** uq-physicell not installed. Run: `pip install uq-physicell`"
+
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    uq_ctx = session.uq_context
+    if not uq_ctx.parameters:
+        return "**Error:** No parameters defined. Run `define_uq_parameters()` first."
+
+    # Generate INI config
+    ini_path = _generate_uq_ini(session, uq_ctx)
+    uq_ctx.ini_path = ini_path
+
+    # Set up SA database path
+    sa_db_name = f"sa_{method.lower().replace(' ', '_')}_{int(time.time())}.db"
+    sa_db_path = str(Path(uq_ctx.uq_output_dir) / sa_db_name)
+    uq_ctx.sa_db_path = sa_db_path
+    uq_ctx.sa_method = method
+    uq_ctx.sa_num_samples = num_samples
+
+    # Build params_info for ModelAnalysisContext
+    is_local = method.upper() == "OAT"
+    params_info = {}
+    for p in uq_ctx.parameters:
+        if is_local:
+            params_info[p.name] = {
+                "ref_value": p.ref_value or 1.0,
+                "perturbation": p.perturbation or [1.0, 5.0, 10.0],
+            }
+        else:
+            params_info[p.name] = {
+                "ref_value": p.ref_value or 1.0,
+                "lower_bound": p.lower_bound or (p.ref_value * 0.5 if p.ref_value else 0.1),
+                "upper_bound": p.upper_bound or (p.ref_value * 1.5 if p.ref_value else 10.0),
+                "perturbation": 50.0,
+            }
+
+    model_config = {
+        "ini_path": ini_path,
+        "struc_name": "uq_model",
+    }
+
+    run_id = f"sa_{uuid.uuid4().hex[:8]}"
+
+    # Run SA in a background thread
+    def _run_sa():
+        try:
+            with uq_runs_lock:
+                uq_runs[run_id] = {
+                    "type": "sensitivity_analysis",
+                    "status": "running",
+                    "method": method,
+                    "num_samples": num_samples,
+                    "db_path": sa_db_path,
+                    "started_at": time.time(),
+                    "error": None,
+                }
+
+            context = ModelAnalysisContext(
+                db_path=sa_db_path,
+                model_config=model_config,
+                sampler=method,
+                params_info=params_info,
+                qois_info=uq_ctx.qoi_definitions,
+                parallel_method=parallel_method,
+                num_workers=num_workers,
+            )
+
+            if is_local:
+                from uq_physicell.model_analysis import run_local_sampler
+                context.dic_samples = run_local_sampler(context.params_dict, method)
+            else:
+                from uq_physicell.model_analysis import run_global_sampler
+                context.dic_samples = run_global_sampler(context.params_dict, method, N=num_samples)
+
+            uq_run_simulations(context)
+
+            with uq_runs_lock:
+                uq_runs[run_id]["status"] = "completed"
+                uq_runs[run_id]["completed_at"] = time.time()
+                uq_runs[run_id]["num_simulations"] = len(context.dic_samples)
+
+            uq_ctx.sa_results = {"run_id": run_id, "db_path": sa_db_path}
+            session.mark_step_complete(WorkflowStep.SENSITIVITY_ANALYSIS_COMPLETE)
+
+        except Exception as e:
+            with uq_runs_lock:
+                uq_runs[run_id]["status"] = "failed"
+                uq_runs[run_id]["error"] = str(e)
+
+    thread = threading.Thread(target=_run_sa, daemon=True)
+    thread.start()
+
+    total_sims = num_samples * uq_ctx.num_replicates * (len(uq_ctx.parameters) + 1) if is_local else num_samples * uq_ctx.num_replicates
+    result = "## Sensitivity Analysis Started\n\n"
+    result += f"**Run ID:** `{run_id}`\n"
+    result += f"**Method:** {method}\n"
+    result += f"**Samples:** {num_samples}\n"
+    result += f"**Est. simulations:** ~{total_sims}\n"
+    result += f"**Workers:** {num_workers}\n"
+    result += f"**Database:** {sa_db_path}\n\n"
+    result += "The analysis is running in the background. Use `get_sensitivity_results(run_id)` to check progress and results."
+    return result
+
+
+@mcp.tool()
+def get_sensitivity_results(run_id: Optional[str] = None) -> str:
+    """
+    Get results from a sensitivity analysis run. If the run is still in progress,
+    returns the current status. If complete, returns sensitivity indices and rankings.
+
+    Args:
+        run_id: SA run ID (from run_sensitivity_analysis). Uses latest if omitted.
+
+    Returns:
+        str: Sensitivity analysis results or status
+    """
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** No UQ context. Run `setup_uq_analysis()` first."
+
+    # Find the run
+    if not run_id:
+        # Find latest SA run
+        with uq_runs_lock:
+            sa_runs = {k: v for k, v in uq_runs.items() if v["type"] == "sensitivity_analysis"}
+            if not sa_runs:
+                return "**Error:** No sensitivity analysis runs found. Run `run_sensitivity_analysis()` first."
+            run_id = max(sa_runs.keys(), key=lambda k: sa_runs[k].get("started_at", 0))
+
+    with uq_runs_lock:
+        run_info = uq_runs.get(run_id)
+
+    if not run_info:
+        return f"**Error:** Run '{run_id}' not found."
+
+    result = f"## Sensitivity Analysis: `{run_id}`\n\n"
+    result += f"**Method:** {run_info.get('method', 'Unknown')}\n"
+    result += f"**Status:** {run_info['status']}\n"
+
+    if run_info["status"] == "running":
+        elapsed = time.time() - run_info.get("started_at", time.time())
+        result += f"**Elapsed:** {elapsed/60:.1f} minutes\n\n"
+        result += "Analysis is still running. Check back later."
+        return result
+
+    if run_info["status"] == "failed":
+        result += f"**Error:** {run_info.get('error', 'Unknown error')}\n"
+        return result
+
+    if run_info["status"] == "completed":
+        elapsed = run_info.get("completed_at", time.time()) - run_info.get("started_at", time.time())
+        result += f"**Completed in:** {elapsed/60:.1f} minutes\n"
+        result += f"**Simulations run:** {run_info.get('num_simulations', 'N/A')}\n"
+        result += f"**Database:** {run_info.get('db_path', 'N/A')}\n\n"
+
+        # Try to load and display SA results from the database
+        try:
+            import sqlite3
+            db_path = run_info.get("db_path")
+            if db_path and Path(db_path).exists():
+                conn = sqlite3.connect(db_path)
+                # Check what tables exist
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [row[0] for row in cursor.fetchall()]
+                result += f"**Database tables:** {', '.join(tables)}\n\n"
+
+                # Try to read simulation results
+                if "simulations" in tables:
+                    cursor = conn.execute("SELECT COUNT(*) FROM simulations")
+                    count = cursor.fetchone()[0]
+                    result += f"**Completed simulations:** {count}\n\n"
+
+                conn.close()
+
+            result += "**Analysis complete!** The results database contains all simulation outputs.\n\n"
+            result += "**Next steps:**\n"
+            result += "- `provide_experimental_data()` - Load reference data for calibration\n"
+            result += "- `run_bayesian_calibration()` - Calibrate model parameters\n"
+
+        except Exception as e:
+            result += f"**Note:** Could not read database details: {e}\n"
+
+    return result
+
+
+# ============================================================================
+# UQ PHASE 3: MODEL CALIBRATION
+# ============================================================================
+
+@mcp.tool()
+def provide_experimental_data(csv_path: str,
+                              column_mapping: Dict[str, str],
+                              time_column: str = "time") -> str:
+    """
+    Load experimental/reference data for model calibration. The CSV should contain
+    time-series data with columns matching the Quantities of Interest.
+
+    Args:
+        csv_path: Path to CSV file with experimental observations
+        column_mapping: Dict mapping QoI names to CSV column names,
+            e.g., {"live_tumor_cells": "Tumor Count", "dead_cells": "Dead Count"}
+        time_column: Name of the time column in the CSV (default: 'time')
+
+    Returns:
+        str: Summary of loaded experimental data
+    """
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        return f"**Error:** File not found: {csv_path}"
+
+    uq_ctx = session.uq_context
+    uq_ctx.experimental_data_path = str(csv_file)
+    uq_ctx.experimental_data_columns = {"time": time_column}
+    uq_ctx.experimental_data_columns.update(column_mapping)
+
+    # Read and validate the CSV
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        rows = len(df)
+        cols = list(df.columns)
+
+        # Validate columns exist
+        missing = []
+        if time_column not in cols:
+            missing.append(f"time column '{time_column}'")
+        for qoi_name, col_name in column_mapping.items():
+            if col_name not in cols:
+                missing.append(f"'{col_name}' (for QoI '{qoi_name}')")
+
+        session.mark_step_complete(WorkflowStep.EXPERIMENTAL_DATA_LOADED)
+
+        result = "## Experimental Data Loaded\n\n"
+        result += f"**File:** {csv_path}\n"
+        result += f"**Rows:** {rows}\n"
+        result += f"**Columns:** {', '.join(cols)}\n\n"
+
+        if missing:
+            result += "### Warnings - Missing Columns\n"
+            for m in missing:
+                result += f"- {m}\n"
+            result += "\n"
+
+        result += "### Column Mapping\n"
+        result += "| QoI | CSV Column |\n|-----|------------|\n"
+        result += f"| time | {time_column} |\n"
+        for qoi_name, col_name in column_mapping.items():
+            result += f"| {qoi_name} | {col_name} |\n"
+
+        # Show data preview
+        result += f"\n### Data Preview (first 5 rows)\n```\n{df.head().to_string()}\n```\n\n"
+
+        time_range = df[time_column]
+        result += f"**Time range:** {time_range.min()} to {time_range.max()}\n\n"
+
+        result += "**Next step:** Use `run_bayesian_calibration()` or `run_abc_calibration()` to fit model parameters."
+        return result
+
+    except Exception as e:
+        return f"**Error reading CSV:** {str(e)}"
+
+
+@mcp.tool()
+def run_bayesian_calibration(
+    num_initial_samples: int = 10,
+    num_iterations: int = 50,
+    max_workers: int = 4,
+    distance_metric: str = "sum_squared_differences",
+    use_exponential_fitness: bool = True,
+    search_space_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+) -> str:
+    """
+    Run Bayesian Optimization calibration to find parameters that best match
+    experimental data. Uses multi-objective optimization with Pareto front analysis.
+
+    PREREQUISITES: setup_uq_analysis(), define_uq_parameters(),
+    define_quantities_of_interest(), provide_experimental_data()
+
+    Args:
+        num_initial_samples: Initial random samples before optimization (default: 10)
+        num_iterations: Number of BO iterations (default: 50)
+        max_workers: Parallel simulation workers (default: 4)
+        distance_metric: 'sum_squared_differences', 'manhattan', or 'chebyshev' (default: 'sum_squared_differences')
+        use_exponential_fitness: Use exponential fitness scaling (default: True)
+        search_space_overrides: Optional per-parameter bound overrides,
+            e.g., {"param_name": {"lower_bound": 0.1, "upper_bound": 2.0}}
+
+    Returns:
+        str: Calibration status and run ID
+    """
+    if not UQ_BO_AVAILABLE:
+        return "**Error:** Bayesian optimization requires: `pip install torch botorch gpytorch`"
+
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    uq_ctx = session.uq_context
+    if not uq_ctx.parameters:
+        return "**Error:** No parameters defined. Run `define_uq_parameters()` first."
+    if not uq_ctx.experimental_data_path:
+        return "**Error:** No experimental data. Run `provide_experimental_data()` first."
+    if not uq_ctx.qoi_definitions:
+        return "**Error:** No QoIs defined. Run `define_quantities_of_interest()` first."
+
+    # Generate INI config
+    ini_path = _generate_uq_ini(session, uq_ctx)
+    uq_ctx.ini_path = ini_path
+
+    # Set up calibration database
+    cal_db_name = f"calibration_bo_{int(time.time())}.db"
+    cal_db_path = str(Path(uq_ctx.uq_output_dir) / cal_db_name)
+    uq_ctx.calibration_db_path = cal_db_path
+    uq_ctx.calibration_method = "bayesian_optimization"
+
+    # Select distance function
+    dist_func_map = {
+        "sum_squared_differences": SumSquaredDifferences,
+        "manhattan": Manhattan,
+        "chebyshev": Chebyshev,
+    }
+    dist_func = dist_func_map.get(distance_metric, SumSquaredDifferences)
+
+    # Build search space
+    search_space = {}
+    for p in uq_ctx.parameters:
+        overrides = (search_space_overrides or {}).get(p.name, {})
+        search_space[p.name] = {
+            "type": "real",
+            "lower_bound": overrides.get("lower_bound", p.lower_bound or 0.01),
+            "upper_bound": overrides.get("upper_bound", p.upper_bound or 10.0),
+        }
+
+    # Build distance functions dict (one per QoI with equal weights)
+    distance_functions = {}
+    for qoi_name in uq_ctx.qoi_definitions:
+        distance_functions[qoi_name] = {
+            "function": dist_func,
+            "weight": 1e-5,
+        }
+
+    model_config = {
+        "ini_path": ini_path,
+        "struc_name": "uq_model",
+        "numReplicates": uq_ctx.num_replicates,
+    }
+
+    bo_options = {
+        "num_initial_samples": num_initial_samples,
+        "num_iterations": num_iterations,
+        "max_workers": max_workers,
+        "use_exponential_fitness": use_exponential_fitness,
+    }
+
+    run_id = f"bo_{uuid.uuid4().hex[:8]}"
+
+    # Run calibration in background thread
+    def _run_bo():
+        try:
+            with uq_runs_lock:
+                uq_runs[run_id] = {
+                    "type": "bayesian_optimization",
+                    "status": "running",
+                    "db_path": cal_db_path,
+                    "started_at": time.time(),
+                    "num_iterations": num_iterations,
+                    "num_initial_samples": num_initial_samples,
+                    "error": None,
+                }
+
+            calib_context = BOCalibrationContext(
+                db_path=cal_db_path,
+                obsData=uq_ctx.experimental_data_path,
+                obsData_columns=uq_ctx.experimental_data_columns,
+                model_config=model_config,
+                qoi_functions=uq_ctx.qoi_definitions,
+                distance_functions=distance_functions,
+                search_space=search_space,
+                bo_options=bo_options,
+            )
+
+            uq_run_bo(calib_context)
+
+            with uq_runs_lock:
+                uq_runs[run_id]["status"] = "completed"
+                uq_runs[run_id]["completed_at"] = time.time()
+
+            uq_ctx.calibration_results = {"run_id": run_id, "db_path": cal_db_path}
+            session.mark_step_complete(WorkflowStep.CALIBRATION_COMPLETE)
+
+        except Exception as e:
+            with uq_runs_lock:
+                uq_runs[run_id]["status"] = "failed"
+                uq_runs[run_id]["error"] = str(e)
+
+    thread = threading.Thread(target=_run_bo, daemon=True)
+    thread.start()
+
+    total_sims = (num_initial_samples + num_iterations) * uq_ctx.num_replicates
+    result = "## Bayesian Optimization Calibration Started\n\n"
+    result += f"**Run ID:** `{run_id}`\n"
+    result += f"**Initial samples:** {num_initial_samples}\n"
+    result += f"**Iterations:** {num_iterations}\n"
+    result += f"**Est. total simulations:** ~{total_sims}\n"
+    result += f"**Distance metric:** {distance_metric}\n"
+    result += f"**Workers:** {max_workers}\n"
+    result += f"**Database:** {cal_db_path}\n\n"
+
+    result += "### Search Space\n"
+    result += "| Parameter | Lower | Upper |\n|-----------|-------|-------|\n"
+    for name, space in search_space.items():
+        result += f"| {name} | {space['lower_bound']} | {space['upper_bound']} |\n"
+
+    result += "\nCalibration is running in the background. Use `get_calibration_status()` to monitor progress "
+    result += "and `get_calibration_results()` when complete."
+    return result
+
+
+@mcp.tool()
+def run_abc_calibration(
+    prior_bounds: Optional[Dict[str, Dict[str, float]]] = None,
+    max_populations: int = 8,
+    max_simulations: int = 500,
+    min_population_size: int = 30,
+    max_population_size: int = 100,
+    num_workers: int = 4,
+    fixed_params: Optional[Dict[str, float]] = None,
+) -> str:
+    """
+    Run Approximate Bayesian Computation (ABC-SMC) calibration to infer posterior
+    parameter distributions given experimental data. Returns full uncertainty estimates.
+
+    PREREQUISITES: setup_uq_analysis(), define_uq_parameters(),
+    define_quantities_of_interest(), provide_experimental_data()
+
+    Args:
+        prior_bounds: Per-parameter prior bounds as uniform distributions,
+            e.g., {"param": {"lower": 0.1, "upper": 2.0}}. Uses parameter bounds if omitted.
+        max_populations: Maximum ABC-SMC populations/generations (default: 8)
+        max_simulations: Maximum total simulations (default: 500)
+        min_population_size: Minimum particles per population (default: 30)
+        max_population_size: Maximum particles per population (default: 100)
+        num_workers: Parallel workers (default: 4)
+        fixed_params: Parameters to fix at specific values (not sampled),
+            e.g., {"param_name": 0.5}
+
+    Returns:
+        str: Calibration status and run ID
+    """
+    if not UQ_ABC_AVAILABLE:
+        return "**Error:** ABC calibration requires: `pip install pyabc`"
+
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** Run `setup_uq_analysis()` first."
+
+    uq_ctx = session.uq_context
+    if not uq_ctx.parameters:
+        return "**Error:** No parameters defined. Run `define_uq_parameters()` first."
+    if not uq_ctx.experimental_data_path:
+        return "**Error:** No experimental data. Run `provide_experimental_data()` first."
+
+    # Generate INI config
+    ini_path = _generate_uq_ini(session, uq_ctx)
+    uq_ctx.ini_path = ini_path
+
+    # Set up calibration database
+    cal_db_name = f"calibration_abc_{int(time.time())}.db"
+    cal_db_path = str(Path(uq_ctx.uq_output_dir) / cal_db_name)
+    uq_ctx.calibration_db_path = cal_db_path
+    uq_ctx.calibration_method = "abc"
+
+    # Build prior distributions
+    try:
+        from pyabc import RV, Distribution
+    except ImportError:
+        return "**Error:** pyabc not installed. Run: `pip install pyabc`"
+
+    prior_dict = {}
+    params_to_sample = [p for p in uq_ctx.parameters if p.name not in (fixed_params or {})]
+
+    for p in params_to_sample:
+        overrides = (prior_bounds or {}).get(p.name, {})
+        lower = overrides.get("lower", p.lower_bound or 0.01)
+        upper = overrides.get("upper", p.upper_bound or 10.0)
+        prior_dict[p.name] = RV("uniform", lower, upper - lower)
+
+    prior = Distribution(**prior_dict)
+
+    model_config = {
+        "ini_path": ini_path,
+        "struc_name": "uq_model",
+    }
+
+    # Build distance functions
+    import numpy as np
+
+    distance_functions = {}
+    for qoi_name in uq_ctx.qoi_definitions:
+        def make_dist_func(qname):
+            def dist_func(data1, data2):
+                try:
+                    obs_vals = np.array(data1[qname])
+                    sim_vals = np.array(data2[qname])
+                    return float(np.sum((obs_vals - sim_vals) ** 2))
+                except Exception:
+                    return float("inf")
+            return dist_func
+        distance_functions[qoi_name] = {
+            "function": make_dist_func(qoi_name),
+            "weight": 1.0,
+        }
+
+    abc_options = {
+        "max_populations": max_populations,
+        "max_simulations": max_simulations,
+        "population_strategy": "adaptive",
+        "min_population_size": min_population_size,
+        "max_population_size": max_population_size,
+        "epsilon_strategy": "quantile",
+        "epsilon_alpha": 0.5,
+        "transition_strategy": "multivariate",
+        "sampler": "multicore",
+        "num_workers": num_workers,
+        "mode": "local",
+    }
+
+    if fixed_params:
+        abc_options["fixed_params"] = fixed_params
+
+    run_id = f"abc_{uuid.uuid4().hex[:8]}"
+
+    # Run in background
+    def _run_abc():
+        try:
+            with uq_runs_lock:
+                uq_runs[run_id] = {
+                    "type": "abc",
+                    "status": "running",
+                    "db_path": cal_db_path,
+                    "started_at": time.time(),
+                    "max_populations": max_populations,
+                    "max_simulations": max_simulations,
+                    "error": None,
+                }
+
+            calib_context = ABCCalibrationContext(
+                db_path=cal_db_path,
+                obsData=uq_ctx.experimental_data_path,
+                obsData_columns=uq_ctx.experimental_data_columns,
+                model_config=model_config,
+                qoi_functions=uq_ctx.qoi_definitions,
+                distance_functions=distance_functions,
+                prior=prior,
+                abc_options=abc_options,
+            )
+
+            history = uq_run_abc(calib_context)
+
+            with uq_runs_lock:
+                uq_runs[run_id]["status"] = "completed"
+                uq_runs[run_id]["completed_at"] = time.time()
+                uq_runs[run_id]["n_populations"] = history.n_populations
+                uq_runs[run_id]["total_simulations"] = history.total_nr_simulations
+
+            uq_ctx.calibration_results = {"run_id": run_id, "db_path": cal_db_path}
+            session.mark_step_complete(WorkflowStep.CALIBRATION_COMPLETE)
+
+        except Exception as e:
+            with uq_runs_lock:
+                uq_runs[run_id]["status"] = "failed"
+                uq_runs[run_id]["error"] = str(e)
+
+    thread = threading.Thread(target=_run_abc, daemon=True)
+    thread.start()
+
+    result = "## ABC-SMC Calibration Started\n\n"
+    result += f"**Run ID:** `{run_id}`\n"
+    result += f"**Max populations:** {max_populations}\n"
+    result += f"**Max simulations:** {max_simulations}\n"
+    result += f"**Population size:** {min_population_size}-{max_population_size}\n"
+    result += f"**Workers:** {num_workers}\n"
+    result += f"**Database:** {cal_db_path}\n\n"
+
+    result += "### Prior Distributions\n"
+    result += "| Parameter | Distribution |\n|-----------|-------------|\n"
+    for p in params_to_sample:
+        overrides = (prior_bounds or {}).get(p.name, {})
+        lower = overrides.get("lower", p.lower_bound or 0.01)
+        upper = overrides.get("upper", p.upper_bound or 10.0)
+        result += f"| {p.name} | Uniform({lower}, {upper}) |\n"
+
+    if fixed_params:
+        result += "\n### Fixed Parameters\n"
+        for name, val in fixed_params.items():
+            result += f"- {name} = {val}\n"
+
+    result += "\nCalibration is running in the background. Use `get_calibration_status()` to monitor."
+    return result
+
+
+@mcp.tool()
+def get_calibration_status(run_id: Optional[str] = None) -> str:
+    """
+    Check the status of a running or completed calibration job.
+
+    Args:
+        run_id: Calibration run ID. Uses latest if omitted.
+
+    Returns:
+        str: Current status of the calibration run
+    """
+    if not run_id:
+        with uq_runs_lock:
+            cal_runs = {k: v for k, v in uq_runs.items()
+                        if v["type"] in ("bayesian_optimization", "abc")}
+            if not cal_runs:
+                return "**Error:** No calibration runs found."
+            run_id = max(cal_runs.keys(), key=lambda k: cal_runs[k].get("started_at", 0))
+
+    with uq_runs_lock:
+        run_info = uq_runs.get(run_id)
+
+    if not run_info:
+        return f"**Error:** Run '{run_id}' not found."
+
+    result = f"## Calibration Status: `{run_id}`\n\n"
+    result += f"**Type:** {run_info['type'].replace('_', ' ').title()}\n"
+    result += f"**Status:** {run_info['status']}\n"
+
+    elapsed = time.time() - run_info.get("started_at", time.time())
+    if run_info["status"] == "running":
+        result += f"**Elapsed:** {elapsed/60:.1f} minutes\n"
+        if run_info["type"] == "bayesian_optimization":
+            result += f"**Target iterations:** {run_info.get('num_iterations', 'N/A')}\n"
+        elif run_info["type"] == "abc":
+            result += f"**Max populations:** {run_info.get('max_populations', 'N/A')}\n"
+            result += f"**Max simulations:** {run_info.get('max_simulations', 'N/A')}\n"
+    elif run_info["status"] == "completed":
+        total_time = run_info.get("completed_at", time.time()) - run_info.get("started_at", time.time())
+        result += f"**Completed in:** {total_time/60:.1f} minutes\n"
+        if "n_populations" in run_info:
+            result += f"**Populations completed:** {run_info['n_populations']}\n"
+        if "total_simulations" in run_info:
+            result += f"**Total simulations:** {run_info['total_simulations']}\n"
+        result += "\nUse `get_calibration_results()` to view the results."
+    elif run_info["status"] == "failed":
+        result += f"**Error:** {run_info.get('error', 'Unknown')}\n"
+
+    return result
+
+
+@mcp.tool()
+def get_calibration_results(run_id: Optional[str] = None) -> str:
+    """
+    Retrieve results from a completed calibration run, including best-fit parameters,
+    Pareto front analysis (for BO), or posterior distributions (for ABC).
+
+    Args:
+        run_id: Calibration run ID. Uses latest completed if omitted.
+
+    Returns:
+        str: Calibration results with best-fit parameters
+    """
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** No UQ context."
+
+    if not run_id:
+        with uq_runs_lock:
+            cal_runs = {k: v for k, v in uq_runs.items()
+                        if v["type"] in ("bayesian_optimization", "abc") and v["status"] == "completed"}
+            if not cal_runs:
+                return "**Error:** No completed calibration runs. Check status with `get_calibration_status()`."
+            run_id = max(cal_runs.keys(), key=lambda k: cal_runs[k].get("completed_at", 0))
+
+    with uq_runs_lock:
+        run_info = uq_runs.get(run_id)
+
+    if not run_info:
+        return f"**Error:** Run '{run_id}' not found."
+    if run_info["status"] != "completed":
+        return f"**Error:** Run '{run_id}' is {run_info['status']}, not completed."
+
+    db_path = run_info.get("db_path")
+    result = f"## Calibration Results: `{run_id}`\n\n"
+    result += f"**Type:** {run_info['type'].replace('_', ' ').title()}\n"
+    total_time = run_info.get("completed_at", 0) - run_info.get("started_at", 0)
+    result += f"**Total time:** {total_time/60:.1f} minutes\n"
+    result += f"**Database:** {db_path}\n\n"
+
+    try:
+        if run_info["type"] == "bayesian_optimization":
+            from uq_physicell.database.bo_db import load_structure
+            df_metadata, df_param_space, df_qois, df_gp_models, df_samples, df_output = load_structure(db_path)
+
+            result += "### Parameter Space\n"
+            result += "| Parameter | Lower | Upper |\n|-----------|-------|-------|\n"
+            for _, row in df_param_space.iterrows():
+                result += f"| {row['ParamName']} | {row['LowerBound']} | {row['UpperBound']} |\n"
+
+            result += f"\n### Samples Evaluated: {len(df_samples)}\n\n"
+
+            # Pareto analysis
+            try:
+                from uq_physicell.bo import analyze_pareto_results
+                pareto_data = analyze_pareto_results(df_qois, df_samples, df_output)
+
+                if pareto_data and "pareto_front" in pareto_data:
+                    pareto_params = pareto_data["pareto_front"].get("parameters", [])
+                    pareto_ids = pareto_data["pareto_front"].get("sample_ids", [])
+
+                    result += f"### Pareto Front: {len(pareto_params)} optimal solutions\n\n"
+
+                    if pareto_params:
+                        # Display best parameters
+                        param_names = list(df_param_space["ParamName"])
+                        result += "| Solution |"
+                        for pn in param_names:
+                            result += f" {pn} |"
+                        result += "\n|----------|"
+                        for _ in param_names:
+                            result += "--------|"
+                        result += "\n"
+
+                        for i, params in enumerate(pareto_params[:5]):  # Show top 5
+                            result += f"| {i+1} |"
+                            if isinstance(params, dict):
+                                for pn in param_names:
+                                    result += f" {params.get(pn, 'N/A'):.4g} |"
+                            else:
+                                for val in (params if hasattr(params, '__iter__') else [params]):
+                                    result += f" {float(val):.4g} |"
+                            result += "\n"
+
+                        # Store best-fit in session
+                        if pareto_params:
+                            best = pareto_params[0]
+                            if isinstance(best, dict):
+                                session.uq_context.best_fit_parameters = best
+                            else:
+                                session.uq_context.best_fit_parameters = dict(zip(param_names, best))
+            except Exception as e:
+                result += f"*(Pareto analysis error: {e})*\n"
+
+        elif run_info["type"] == "abc":
+            if "n_populations" in run_info:
+                result += f"### ABC-SMC Summary\n"
+                result += f"**Populations:** {run_info['n_populations']}\n"
+                result += f"**Total simulations:** {run_info.get('total_simulations', 'N/A')}\n\n"
+
+            # Try to read posterior from pyabc database
+            try:
+                import pyabc
+                history = pyabc.History(f"sqlite:///{db_path}")
+                df_posterior, weights = history.get_distribution(m=0, t=history.max_t)
+
+                result += "### Posterior Parameter Estimates\n\n"
+                result += "| Parameter | Mean | Std | Median | 95% CI |\n"
+                result += "|-----------|------|-----|--------|--------|\n"
+
+                best_fit = {}
+                for col in df_posterior.columns:
+                    mean_val = df_posterior[col].mean()
+                    std_val = df_posterior[col].std()
+                    median_val = df_posterior[col].median()
+                    ci_low = df_posterior[col].quantile(0.025)
+                    ci_high = df_posterior[col].quantile(0.975)
+                    best_fit[col] = mean_val
+                    result += f"| {col} | {mean_val:.4g} | {std_val:.4g} | {median_val:.4g} | [{ci_low:.4g}, {ci_high:.4g}] |\n"
+
+                session.uq_context.best_fit_parameters = best_fit
+
+            except Exception as e:
+                result += f"*(Could not read ABC posterior: {e})*\n"
+
+    except Exception as e:
+        result += f"**Error reading results:** {str(e)}\n"
+
+    result += "\n**Next step:** Use `apply_calibrated_parameters()` to update the model with best-fit parameters."
+    return result
+
+
+# ============================================================================
+# UQ PHASE 4: VALIDATION & APPLICATION
+# ============================================================================
+
+@mcp.tool()
+def apply_calibrated_parameters(parameter_overrides: Optional[Dict[str, float]] = None) -> str:
+    """
+    Apply the best-fit calibrated parameters back to the PhysiCell model configuration.
+    Updates both XML and rules parameters in the session, ready for a validation run.
+
+    Args:
+        parameter_overrides: Optional manual parameter values to apply instead of
+            auto-detected best-fit values. Dict of {param_name: value}.
+
+    Returns:
+        str: Summary of applied parameters and next steps
+    """
+    session = get_current_session()
+    if not session or not session.uq_context:
+        return "**Error:** No UQ context. Run calibration first."
+
+    uq_ctx = session.uq_context
+    params_to_apply = parameter_overrides or uq_ctx.best_fit_parameters
+
+    if not params_to_apply:
+        return "**Error:** No calibrated parameters available. Run calibration first or provide parameter_overrides."
+
+    import xml.etree.ElementTree as ET
+
+    xml_path = uq_ctx.xml_config_path
+    if not xml_path or not Path(xml_path).exists():
+        return f"**Error:** XML config not found at {xml_path}"
+
+    # Parse XML
+    tree = ET.parse(xml_path)
+    xml_root = tree.getroot()
+
+    applied_xml = []
+    applied_rules = []
+    errors = []
+
+    for param_def in uq_ctx.parameters:
+        if param_def.name not in params_to_apply:
+            continue
+
+        new_value = params_to_apply[param_def.name]
+
+        if param_def.param_type == "xml" and param_def.xpath:
+            elem = xml_root.find(param_def.xpath)
+            if elem is not None:
+                old_val = elem.text
+                elem.text = str(new_value)
+                applied_xml.append((param_def.name, old_val, new_value))
+            else:
+                errors.append(f"XML element not found: {param_def.xpath}")
+
+        elif param_def.param_type == "rules" and param_def.rule_key:
+            # Update rules CSV
+            rules_path = uq_ctx.rules_csv_path
+            if rules_path and Path(rules_path).exists():
+                parts = param_def.rule_key.split(",")
+                if len(parts) == 5:
+                    cell_type, sig, direction, behavior, field = [p.strip() for p in parts]
+                    field_map = {"saturation": 4, "half_max": 5, "hill_power": 6}
+                    col_idx = field_map.get(field)
+
+                    if col_idx is not None:
+                        # Read, modify, write rules CSV
+                        rows = []
+                        with open(rules_path, 'r') as f:
+                            reader = csv.reader(f)
+                            for row in reader:
+                                if (len(row) >= 7 and
+                                    row[0].strip() == cell_type and
+                                    row[1].strip() == sig and
+                                    row[2].strip() == direction and
+                                    row[3].strip() == behavior):
+                                    old_val = row[col_idx]
+                                    row[col_idx] = str(new_value)
+                                    applied_rules.append((param_def.name, old_val, new_value))
+                                rows.append(row)
+
+                        with open(rules_path, 'w', newline='') as f:
+                            writer = csv.writer(f, lineterminator='\n')
+                            writer.writerows(rows)
+                    else:
+                        errors.append(f"Unknown rules field: {field}")
+                else:
+                    errors.append(f"Invalid rule key format: {param_def.rule_key}")
+            else:
+                errors.append(f"Rules CSV not found: {rules_path}")
+
+    # Write updated XML
+    tree.write(xml_path, xml_declaration=True, encoding="unicode")
+
+    result = "## Calibrated Parameters Applied\n\n"
+
+    if applied_xml:
+        result += "### XML Parameters Updated\n"
+        result += "| Parameter | Old Value | New Value |\n|-----------|-----------|----------|\n"
+        for name, old, new in applied_xml:
+            result += f"| {name} | {old} | {new:.6g} |\n"
+
+    if applied_rules:
+        result += "\n### Rules Parameters Updated\n"
+        result += "| Parameter | Old Value | New Value |\n|-----------|-----------|----------|\n"
+        for name, old, new in applied_rules:
+            result += f"| {name} | {old} | {new:.6g} |\n"
+
+    if errors:
+        result += "\n### Errors\n"
+        for e in errors:
+            result += f"- {e}\n"
+
+    total_applied = len(applied_xml) + len(applied_rules)
+    result += f"\n**Total parameters applied:** {total_applied}\n"
+    result += f"\n**Next step:** Run a validation simulation with `run_simulation('{uq_ctx.project_name}')` "
+    result += "to verify the calibrated model matches experimental data."
+    return result
+
+
+@mcp.tool()
+def get_uq_summary() -> str:
+    """
+    Get a complete summary of all UQ analysis work done in the current session,
+    including setup status, defined parameters, SA results, and calibration results.
+
+    Returns:
+        str: Comprehensive UQ analysis summary
+    """
+    session = get_current_session()
+    if not session:
+        return "**Error:** No active session."
+
+    uq_ctx = session.uq_context
+    if not uq_ctx:
+        return "**No UQ analysis configured.** Use `setup_uq_analysis()` to get started."
+
+    result = "## UQ Analysis Summary\n\n"
+
+    # Setup info
+    result += "### Setup\n"
+    result += f"- **Project:** {uq_ctx.project_name or 'Not set'}\n"
+    result += f"- **Executable:** {uq_ctx.executable_path or 'Not set'}\n"
+    result += f"- **XML Config:** {uq_ctx.xml_config_path or 'Not set'}\n"
+    result += f"- **Rules CSV:** {uq_ctx.rules_csv_path or 'None'}\n"
+    result += f"- **Replicates:** {uq_ctx.num_replicates}\n"
+    result += f"- **Workers:** {uq_ctx.num_workers}\n\n"
+
+    # Parameters
+    result += f"### Parameters ({len(uq_ctx.parameters)})\n"
+    if uq_ctx.parameters:
+        result += "| Name | Type | Bounds |\n|------|------|--------|\n"
+        for p in uq_ctx.parameters:
+            bounds = f"[{p.lower_bound}, {p.upper_bound}]" if p.lower_bound is not None else "auto"
+            result += f"| {p.name} | {p.param_type} | {bounds} |\n"
+    else:
+        result += "*(None defined)*\n"
+
+    # QoIs
+    result += f"\n### Quantities of Interest ({len(uq_ctx.qoi_definitions)})\n"
+    if uq_ctx.qoi_definitions:
+        for name, func in uq_ctx.qoi_definitions.items():
+            result += f"- **{name}**: `{func[:60]}{'...' if len(func) > 60 else ''}`\n"
+    else:
+        result += "*(None defined)*\n"
+
+    # Experimental data
+    result += f"\n### Experimental Data\n"
+    if uq_ctx.experimental_data_path:
+        result += f"- **File:** {uq_ctx.experimental_data_path}\n"
+        result += f"- **Column mapping:** {uq_ctx.experimental_data_columns}\n"
+    else:
+        result += "*(Not loaded)*\n"
+
+    # SA results
+    result += f"\n### Sensitivity Analysis\n"
+    if uq_ctx.sa_results:
+        run_id = uq_ctx.sa_results.get("run_id")
+        with uq_runs_lock:
+            run_info = uq_runs.get(run_id, {})
+        result += f"- **Run ID:** {run_id}\n"
+        result += f"- **Method:** {run_info.get('method', uq_ctx.sa_method)}\n"
+        result += f"- **Status:** {run_info.get('status', 'unknown')}\n"
+    else:
+        result += "*(Not run)*\n"
+
+    # Calibration results
+    result += f"\n### Calibration\n"
+    if uq_ctx.calibration_results:
+        run_id = uq_ctx.calibration_results.get("run_id")
+        with uq_runs_lock:
+            run_info = uq_runs.get(run_id, {})
+        result += f"- **Run ID:** {run_id}\n"
+        result += f"- **Method:** {uq_ctx.calibration_method}\n"
+        result += f"- **Status:** {run_info.get('status', 'unknown')}\n"
+    else:
+        result += "*(Not run)*\n"
+
+    # Best-fit parameters
+    if uq_ctx.best_fit_parameters:
+        result += f"\n### Best-Fit Parameters\n"
+        result += "| Parameter | Value |\n|-----------|-------|\n"
+        for name, val in uq_ctx.best_fit_parameters.items():
+            result += f"| {name} | {val:.6g} |\n"
+
+    # Workflow status
+    result += "\n### Workflow Progress\n"
+    uq_steps = [
+        (WorkflowStep.UQ_SETUP, "UQ Setup"),
+        (WorkflowStep.UQ_PARAMETERS_DEFINED, "Parameters Defined"),
+        (WorkflowStep.UQ_QOIS_DEFINED, "QoIs Defined"),
+        (WorkflowStep.EXPERIMENTAL_DATA_LOADED, "Experimental Data Loaded"),
+        (WorkflowStep.SENSITIVITY_ANALYSIS_COMPLETE, "Sensitivity Analysis"),
+        (WorkflowStep.CALIBRATION_COMPLETE, "Calibration"),
+    ]
+    for step, label in uq_steps:
+        status = "Done" if step in session.completed_steps else "Pending"
+        marker = "[x]" if status == "Done" else "[ ]"
+        result += f"- {marker} {label}\n"
+
+    return result
+
+
+@mcp.tool()
+def list_uq_runs() -> str:
+    """
+    List all UQ analysis runs (sensitivity analysis and calibrations) with their status.
+
+    Returns:
+        str: Summary of all UQ runs
+    """
+    with uq_runs_lock:
+        if not uq_runs:
+            return "**No UQ runs found.** Start with `run_sensitivity_analysis()` or `run_bayesian_calibration()`."
+
+        result = "## UQ Analysis Runs\n\n"
+        result += "| Run ID | Type | Status | Started | Duration |\n"
+        result += "|--------|------|--------|---------|----------|\n"
+
+        for run_id, info in sorted(uq_runs.items(), key=lambda x: x[1].get("started_at", 0)):
+            rtype = info["type"].replace("_", " ").title()
+            status = info["status"]
+            started = time.strftime("%H:%M:%S", time.localtime(info.get("started_at", 0)))
+
+            if info.get("completed_at"):
+                duration = f"{(info['completed_at'] - info['started_at'])/60:.1f} min"
+            elif info["status"] == "running":
+                duration = f"{(time.time() - info['started_at'])/60:.1f} min (running)"
+            else:
+                duration = "-"
+
+            result += f"| `{run_id}` | {rtype} | {status} | {started} | {duration} |\n"
+
+        return result
+
+
 @mcp.tool()
 def get_help() -> str:
     """
@@ -3049,6 +4586,21 @@ def get_help() -> str:
 13. **get_simulation_status()** - Check simulation progress
 14. **generate_simulation_gif()** - Create GIF visualization when complete
 
+### Phase 5: Uncertainty Quantification & Calibration (Optional)
+15. **setup_uq_analysis()** - Initialize UQ for a compiled project
+16. **get_uq_parameter_suggestions()** - See calibratable parameters
+17. **define_uq_parameters()** - Select parameters to vary with bounds
+18. **define_quantities_of_interest()** - Define what to measure
+19. **run_sensitivity_analysis()** - Sobol/LHS/OAT sensitivity analysis
+20. **get_sensitivity_results()** - View SA results
+21. **provide_experimental_data()** - Load reference data CSV
+22. **run_bayesian_calibration()** - Multi-objective Bayesian optimization
+23. **run_abc_calibration()** - ABC-SMC posterior inference
+24. **get_calibration_status()** - Check calibration progress
+25. **get_calibration_results()** - View best-fit parameters
+26. **apply_calibrated_parameters()** - Update model with calibrated values
+27. **get_uq_summary()** - Overview of all UQ analysis work
+
 ## Helper Functions
 - **list_all_available_signals()** - See what signals cells can sense
 - **list_all_available_behaviors()** - See what cells can do
@@ -3058,6 +4610,7 @@ def get_help() -> str:
 - **list_simulations()** - See all running/completed simulations
 - **stop_simulation()** - Stop a running simulation
 - **get_simulation_output_files()** - List output files
+- **list_uq_runs()** - See all UQ analysis runs
 
 ## IMPORTANT
 - You MUST call tools in the order shown above

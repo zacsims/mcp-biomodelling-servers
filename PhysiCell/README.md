@@ -1,7 +1,7 @@
 # PhysiCell MCP Server
 ## Model Context Protocol Integration for Multiscale Biological Simulation
 
-This is a **Model Context Protocol (MCP) server** that exposes PhysiCell multicellular simulation capabilities to Large Language Models (LLMs). It enables LLMs to construct sophisticated physics-based tissue simulations with integrated Boolean gene networks through natural language interactions.
+This is a **Model Context Protocol (MCP) server** that exposes PhysiCell multicellular simulation capabilities to Large Language Models (LLMs). It enables LLMs to construct sophisticated physics-based tissue simulations with integrated Boolean gene networks through natural language interactions, and to **calibrate and validate models** against experimental data using uncertainty quantification.
 
 ### What is an MCP Server?
 
@@ -10,6 +10,7 @@ Model Context Protocol (MCP) is a standardized way to connect LLMs with external
 - **Exposes PhysiCell functionality** as callable tools for LLMs
 - **Enables natural language simulation construction** from biological scenarios
 - **Provides PhysiBoSS integration** for multiscale gene-to-tissue modeling
+- **Integrates UQ-PhysiCell** for sensitivity analysis, Bayesian calibration, and model validation
 - **Supports complex workflow orchestration** across multiple biological scales
 
 ### LLM Integration Patterns
@@ -105,6 +106,12 @@ PhysiCell:  add_physiboss_model() → link genes to behaviors → simulate
 → LLM chains: place_initial_cells(tumor, random_disc) → place_initial_cells(immune, annular) → export_cells_csv
 ```
 
+#### Pattern 5: Model Calibration Against Experimental Data
+```
+"Calibrate the tumor model's growth parameters against my experimental cell count data"
+→ LLM chains: setup_uq → define_parameters → sensitivity_analysis → provide_data → calibrate → apply_parameters → validate
+```
+
 ### Initial Cell Placement Guide
 
 PhysiCell can load initial cell positions from a `cells.csv` file instead of using random placement. This is useful for:
@@ -171,6 +178,182 @@ The `place_initial_cells()` tool generates x,y,z coordinates for cells and store
 - `export_cells_csv()` automatically sets `number_of_cells=0` in the XML so PhysiCell uses the CSV instead of random placement
 - Use `get_initial_conditions_summary()` to review placements before exporting
 
+### Uncertainty Quantification & Model Calibration
+
+The server integrates [UQ-PhysiCell](https://github.com/heberlr/UQ_PhysiCell) to provide end-to-end uncertainty quantification, sensitivity analysis, and model calibration capabilities. This enables LLMs to autonomously create models from natural language descriptions and then calibrate them against experimental data.
+
+#### UQ Dependencies
+
+```bash
+# Core UQ (required)
+pip install uq-physicell
+
+# Bayesian Optimization (optional)
+pip install torch botorch gpytorch
+
+# ABC-SMC calibration (optional)
+pip install pyabc
+```
+
+#### UQ Tool Categories
+
+##### Setup & Parameter Definition
+- `setup_uq_analysis()` - Initialize UQ for a compiled PhysiCell project (auto-detects config)
+- `get_uq_parameter_suggestions()` - Analyze model and suggest calibratable parameters
+- `define_uq_parameters()` - Select which parameters to vary with bounds and reference values
+- `define_quantities_of_interest()` - Define what to measure from simulations (cell counts, etc.)
+
+##### Sensitivity Analysis
+- `run_sensitivity_analysis()` - Global (Sobol, LHS, Fast) or local (OAT) sensitivity analysis
+- `get_sensitivity_results()` - View sensitivity indices and parameter rankings
+
+##### Model Calibration
+- `provide_experimental_data()` - Load reference/observed data CSV for calibration
+- `run_bayesian_calibration()` - Multi-objective Bayesian optimization with Pareto front
+- `run_abc_calibration()` - ABC-SMC posterior inference for full uncertainty estimates
+- `get_calibration_status()` - Monitor long-running calibration jobs
+- `get_calibration_results()` - View best-fit parameters, Pareto front, or posteriors
+
+##### Validation & Application
+- `apply_calibrated_parameters()` - Update model XML/rules with calibrated values
+- `get_uq_summary()` - Overview of all UQ work in the session
+- `list_uq_runs()` - List all SA and calibration runs with status
+
+#### UQ Workflow
+
+```
+Natural Language Description
+        ↓
+Model Creation (existing tools)
+        ↓
+Compile & Run baseline simulation
+        ↓
+┌─── setup_uq_analysis() ───────────────────────────┐
+│                                                     │
+│  get_uq_parameter_suggestions()                     │
+│         ↓                                           │
+│  define_uq_parameters()                             │
+│         ↓                                           │
+│  define_quantities_of_interest()                    │
+│         ↓                                           │
+│  run_sensitivity_analysis()  ←── identify key params│
+│         ↓                                           │
+│  provide_experimental_data()                        │
+│         ↓                                           │
+│  run_bayesian_calibration()  ──or──  run_abc_calibration()
+│         ↓                                           │
+│  get_calibration_results()                          │
+│         ↓                                           │
+│  apply_calibrated_parameters()                      │
+│         ↓                                           │
+│  run_simulation()  ←── validation run               │
+└─────────────────────────────────────────────────────┘
+```
+
+#### Parameter Types
+
+The UQ system supports two types of calibratable parameters:
+
+**XML Parameters** - Cell properties defined in PhysiCell_settings.xml, referenced by XPath:
+```
+.//cell_definitions/cell_definition[@name='tumor']/phenotype/cycle/phase_transition_rates/rate[1]
+```
+
+**Rules Parameters** - Hill function coefficients in cell_rules.csv, referenced by rule key:
+```
+tumor,oxygen,increases,cycle entry,half_max
+tumor,oxygen,increases,cycle entry,hill_power
+tumor,pressure,decreases,cycle entry,saturation
+```
+
+Each rule parameter targets a specific field (saturation/half_max/hill_power) of a specific signal-behavior rule.
+
+#### Example: End-to-End Calibration
+
+**User Prompt**: *"Create a tumor model with oxygen-dependent growth and pressure feedback, then calibrate it against my experimental cell count data"*
+
+**LLM Tool Chain**:
+```
+# Phase 1: Model Creation
+1. create_session()
+2. create_simulation_domain(1500, 1500, 20, max_time=7200)
+3. add_single_substrate("oxygen", 100000, 0.1, 38)
+4. add_single_cell_type("tumor", "Ki67_basic")
+5. add_single_cell_rule("tumor", "oxygen", "increases", "cycle entry",
+     min_signal=0.00072, max_signal=0.0072, half_max=21.5, hill_power=4)
+6. add_single_cell_rule("tumor", "pressure", "decreases", "cycle entry",
+     min_signal=0, max_signal=0.00072, half_max=0.25, hill_power=3)
+7. export_xml_configuration()
+8. export_cell_rules_csv()
+9. create_physicell_project("tumor_calibration")
+10. compile_physicell_project("tumor_calibration")
+
+# Phase 2: UQ Setup
+11. setup_uq_analysis("tumor_calibration", num_replicates=3, num_workers=8)
+12. get_uq_parameter_suggestions()
+13. define_uq_parameters([
+      {"name": "cycle_hfm", "type": "rules",
+       "rule_key": "tumor,oxygen,increases,cycle entry,half_max",
+       "ref_value": 21.5, "lower_bound": 10, "upper_bound": 35},
+      {"name": "cycle_hp", "type": "rules",
+       "rule_key": "tumor,oxygen,increases,cycle entry,hill_power",
+       "ref_value": 4, "lower_bound": 1, "upper_bound": 10},
+      {"name": "pressure_hfm", "type": "rules",
+       "rule_key": "tumor,pressure,decreases,cycle entry,half_max",
+       "ref_value": 0.25, "lower_bound": 0.05, "upper_bound": 1.0}
+    ])
+14. define_quantities_of_interest([
+      {"name": "live_tumor", "function": "cell_count:tumor",
+       "obs_column": "Tumor Count"}
+    ])
+
+# Phase 3: Sensitivity Analysis
+15. run_sensitivity_analysis(method="Sobol", num_samples=64, num_workers=8)
+16. get_sensitivity_results()  # Identify which params matter most
+
+# Phase 4: Calibration
+17. provide_experimental_data("obs_data.csv",
+      column_mapping={"live_tumor": "Tumor Count"}, time_column="Time")
+18. run_bayesian_calibration(num_initial_samples=10, num_iterations=50)
+19. get_calibration_results()
+
+# Phase 5: Validation
+20. apply_calibrated_parameters()
+21. run_simulation("tumor_calibration")
+22. generate_simulation_gif()
+```
+
+#### Sensitivity Analysis Methods
+
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| `Sobol` | Global variance-based SA | Full parameter space exploration, interaction effects |
+| `LHS` | Latin Hypercube Sampling | Efficient global space coverage |
+| `OAT` | One-at-a-Time perturbation | Quick local sensitivity around reference values |
+| `Fast` | Fourier Amplitude SA | Computationally efficient global SA |
+| `Fractional Factorial` | Fractional factorial design | Screening many parameters |
+
+#### Calibration Methods
+
+| Method | Function | Output | Best For |
+|--------|----------|--------|----------|
+| **Bayesian Optimization** | `run_bayesian_calibration()` | Pareto-optimal parameter sets | Multi-objective fitting, expensive simulations |
+| **ABC-SMC** | `run_abc_calibration()` | Posterior parameter distributions | Full uncertainty quantification, model selection |
+
+#### Experimental Data Format
+
+The calibration CSV should contain time-series observations:
+
+```csv
+Time,Tumor Count,Dead Cells
+0,500,0
+60,523,12
+120,601,25
+...
+```
+
+Column names are mapped to QoIs via `provide_experimental_data()`.
+
 ### Advanced PhysiBoSS Integration
 
 #### Multiscale Architecture through MCP
@@ -235,16 +418,33 @@ LLMs can monitor and guide users through simulation construction:
 - **Interface**: JSON-RPC tool calling with complex object handling
 - **State Management**: Session-based simulation building with persistence
 - **PhysiBoSS Integration**: Direct Boolean network coupling to cellular physics
+- **UQ-PhysiCell Integration**: Sensitivity analysis, Bayesian optimization, ABC-SMC calibration
 - **Cross-Server Coordination**: Seamless file handoff from NeKo/MaBoSS workflows
 
 ### Getting Started
 
 1. **Install MCP client** in your LLM environment
-2. **Connect to PhysiCell MCP server** endpoint  
+2. **Connect to PhysiCell MCP server** endpoint
 3. **Use natural language** to describe biological scenarios
 4. **Chain with NeKo/MaBoSS** for complete gene→tissue modeling
+5. **Calibrate models** against experimental data using UQ tools
 
-**Learn More About PhysiCell**: [PhysiCell Official Documentation](http://physicell.org/)  
+### Dependencies
+
+```bash
+# Core (required)
+pip install fastmcp physicell-settings cairosvg pillow
+
+# UQ-PhysiCell (for calibration and sensitivity analysis)
+pip install uq-physicell
+
+# Optional UQ backends
+pip install torch botorch gpytorch  # Bayesian optimization
+pip install pyabc                    # ABC-SMC calibration
+```
+
+**Learn More About PhysiCell**: [PhysiCell Official Documentation](http://physicell.org/)
 **Learn More About PhysiBoSS**: [PhysiBoSS Publication](https://doi.org/10.1093/bioinformatics/btz279)
+**Learn More About UQ-PhysiCell**: [UQ-PhysiCell Documentation](https://uq-physicell.readthedocs.io/)
 
-This MCP server transforms PhysiCell from a complex simulation framework into an **LLM-accessible multiscale modeling platform**, enabling natural language-driven construction of sophisticated gene-to-tissue simulations.
+This MCP server transforms PhysiCell from a complex simulation framework into an **LLM-accessible multiscale modeling platform**, enabling natural language-driven construction, calibration, and validation of sophisticated gene-to-tissue simulations.

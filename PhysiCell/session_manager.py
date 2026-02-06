@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class WorkflowStep(Enum):
     """Enumeration of workflow steps for progress tracking."""
     SCENARIO_ANALYSIS = "scenario_analysis"
-    DOMAIN_SETUP = "domain_setup" 
+    DOMAIN_SETUP = "domain_setup"
     SUBSTRATES_ADDED = "substrates_added"
     CELL_TYPES_ADDED = "cell_types_added"
     CELL_PARAMETERS_CONFIGURED = "cell_parameters_configured"
@@ -34,6 +34,59 @@ class WorkflowStep(Enum):
     READY_FOR_EXPORT = "ready_for_export"
     XML_LOADED = "xml_loaded"
     XML_ANALYZED = "xml_analyzed"
+    # UQ workflow steps
+    UQ_SETUP = "uq_setup"
+    UQ_PARAMETERS_DEFINED = "uq_parameters_defined"
+    UQ_QOIS_DEFINED = "uq_qois_defined"
+    EXPERIMENTAL_DATA_LOADED = "experimental_data_loaded"
+    SENSITIVITY_ANALYSIS_COMPLETE = "sensitivity_analysis_complete"
+    CALIBRATION_COMPLETE = "calibration_complete"
+
+@dataclass
+class UQParameterDef:
+    """Definition of a parameter for uncertainty quantification."""
+    name: str  # Human-readable name
+    param_type: str  # 'xml' or 'rules'
+    # For XML params: XPath expression
+    xpath: Optional[str] = None
+    # For rules params: rule key components
+    rule_key: Optional[str] = None  # "cell_type,signal,direction,behavior,field"
+    # Bounds and reference
+    ref_value: Optional[float] = None
+    lower_bound: Optional[float] = None
+    upper_bound: Optional[float] = None
+    # For sensitivity analysis
+    perturbation: Optional[List[float]] = None  # e.g. [1.0, 5.0, 10.0] percent
+
+@dataclass
+class UQContext:
+    """Context for uncertainty quantification analysis."""
+    ini_path: Optional[str] = None  # Path to generated INI config
+    project_name: Optional[str] = None  # PhysiCell project being analyzed
+    executable_path: Optional[str] = None  # Path to compiled executable
+    xml_config_path: Optional[str] = None  # Path to XML config
+    rules_csv_path: Optional[str] = None  # Path to cell_rules.csv
+    # Parameter definitions
+    parameters: List[UQParameterDef] = field(default_factory=list)
+    # Quantities of interest
+    qoi_definitions: Dict[str, str] = field(default_factory=dict)  # name -> lambda string
+    # Experimental data
+    experimental_data_path: Optional[str] = None
+    experimental_data_columns: Dict[str, str] = field(default_factory=dict)  # qoi_name -> column_name
+    # Analysis state
+    sa_db_path: Optional[str] = None  # Sensitivity analysis database
+    sa_method: Optional[str] = None
+    sa_num_samples: int = 0
+    calibration_db_path: Optional[str] = None  # Calibration database
+    calibration_method: Optional[str] = None  # 'bayesian_optimization' or 'abc'
+    # Results
+    sa_results: Optional[Dict] = None
+    calibration_results: Optional[Dict] = None
+    best_fit_parameters: Optional[Dict[str, float]] = None
+    # Run tracking
+    num_replicates: int = 3
+    num_workers: int = 4
+    uq_output_dir: Optional[str] = None  # Working directory for UQ runs
 
 @dataclass
 class MaBoSSContext:
@@ -70,6 +123,9 @@ class SessionState:
     # Initial cell placement fields
     initial_cells: List[Dict[str, Any]] = field(default_factory=list)
     initial_cells_count: int = 0
+
+    # UQ context
+    uq_context: Optional[UQContext] = None
 
     # XML-related fields
     loaded_from_xml: bool = False
