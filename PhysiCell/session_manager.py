@@ -41,6 +41,8 @@ class WorkflowStep(Enum):
     EXPERIMENTAL_DATA_LOADED = "experimental_data_loaded"
     SENSITIVITY_ANALYSIS_COMPLETE = "sensitivity_analysis_complete"
     CALIBRATION_COMPLETE = "calibration_complete"
+    # Literature validation workflow step
+    RULES_VALIDATED = "rules_validated"
 
 @dataclass
 class UQParameterDef:
@@ -57,6 +59,19 @@ class UQParameterDef:
     upper_bound: Optional[float] = None
     # For sensitivity analysis
     perturbation: Optional[List[float]] = None  # e.g. [1.0, 5.0, 10.0] percent
+
+@dataclass
+class RuleValidationResult:
+    """Result of validating a cell rule against published literature."""
+    cell_type: str
+    signal: str
+    direction: str  # 'increases' or 'decreases'
+    behavior: str
+    support_level: str  # 'strong', 'moderate', 'weak', 'contradictory', 'unsupported'
+    evidence_summary: str = ""
+    suggested_half_max: Optional[float] = None
+    suggested_hill_power: Optional[float] = None
+    key_citations: List[str] = field(default_factory=list)
 
 @dataclass
 class UQContext:
@@ -123,6 +138,9 @@ class SessionState:
     # Initial cell placement fields
     initial_cells: List[Dict[str, Any]] = field(default_factory=list)
     initial_cells_count: int = 0
+
+    # Literature validation results
+    rule_validations: List["RuleValidationResult"] = field(default_factory=list)
 
     # UQ context
     uq_context: Optional[UQContext] = None
@@ -272,9 +290,26 @@ class SessionState:
             'physiboss_input_links_count': self.physiboss_input_links_count,
             'physiboss_output_links_count': self.physiboss_output_links_count,
             'physiboss_mutations_count': self.physiboss_mutations_count,
-            'initial_cells_count': self.initial_cells_count
+            'initial_cells_count': self.initial_cells_count,
+            'rule_validations_count': len(self.rule_validations)
         }
-        
+
+        if self.rule_validations:
+            result['rule_validations'] = [
+                {
+                    'cell_type': rv.cell_type,
+                    'signal': rv.signal,
+                    'direction': rv.direction,
+                    'behavior': rv.behavior,
+                    'support_level': rv.support_level,
+                    'evidence_summary': rv.evidence_summary,
+                    'suggested_half_max': rv.suggested_half_max,
+                    'suggested_hill_power': rv.suggested_hill_power,
+                    'key_citations': rv.key_citations,
+                }
+                for rv in self.rule_validations
+            ]
+
         if self.maboss_context:
             result['maboss_context'] = {
                 'model_name': self.maboss_context.model_name,

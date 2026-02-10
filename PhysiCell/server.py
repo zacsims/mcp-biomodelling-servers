@@ -31,6 +31,7 @@ import re
 import math
 import random
 import csv
+import json
 import configparser
 from pathlib import Path
 from typing import Any, Optional, Dict, List
@@ -64,7 +65,7 @@ except ImportError:
 # Import session management
 from session_manager import (
     session_manager, SessionState, WorkflowStep, MaBoSSContext,
-    UQContext, UQParameterDef,
+    UQContext, UQParameterDef, RuleValidationResult,
     get_current_session, ensure_session, analyze_and_update_session_from_config
 )
 
@@ -1685,6 +1686,15 @@ def get_simulation_summary() -> str:
     result += f"- **Substrates ({len(substrates)}):** {', '.join(substrates[:3])}{'...' if len(substrates) > 3 else 'None' if not substrates else ''}\n"
     result += f"- **Cell Types ({len(cell_types)}):** {', '.join(cell_types[:3])}{'...' if len(cell_types) > 3 else 'None' if not cell_types else ''}\n"
     result += f"- **Rules:** {rules_count}\n"
+    if session.rule_validations:
+        validated = len(session.rule_validations)
+        strong = sum(1 for rv in session.rule_validations if rv.support_level == "strong")
+        moderate = sum(1 for rv in session.rule_validations if rv.support_level == "moderate")
+        flagged = sum(1 for rv in session.rule_validations if rv.support_level in ("unsupported", "contradictory"))
+        result += f"- **Rules Validated:** {validated} ({strong} strong, {moderate} moderate"
+        if flagged:
+            result += f", {flagged} flagged"
+        result += ")\n"
     if session.initial_cells_count > 0:
         result += f"- **Initial Cell Positions:** {session.initial_cells_count}\n"
     result += f"- **PhysiBoSS Models:** {session.physiboss_models_count}\n\n"
@@ -1885,6 +1895,292 @@ str: Markdown-formatted export status with file details
         
     except Exception as e:
         return f"Error exporting cell rules CSV: {str(e)}"
+
+# ============================================================================
+# LITERATURE VALIDATION TOOLS
+# ============================================================================
+
+@mcp.tool()
+def get_rules_for_validation() -> str:
+    """
+    Export current cell rules in a structured format suitable for literature validation.
+
+    Returns all rules as a JSON-compatible list that can be passed to the
+    LiteratureValidation MCP server's validate_rules_batch() tool.
+
+    Returns:
+        str: Markdown with structured rule data for validation
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No simulation configured. Create domain and add rules first."
+
+    # Get rules from legacy CSV API
+    try:
+        rules_api = session.config.cell_rules_csv
+        raw_rules = rules_api.get_rules()
+    except Exception:
+        raw_rules = []
+
+    if not raw_rules:
+        return (
+            "**No cell rules to validate.**\n\n"
+            "Add rules with `add_single_cell_rule()` first."
+        )
+
+    # Format rules for validation
+    rules_list = []
+    for r in raw_rules:
+        rule_dict = {
+            "cell_type": r.get("cell_type", ""),
+            "signal": r.get("signal", ""),
+            "direction": r.get("direction", ""),
+            "behavior": r.get("behavior", ""),
+            "half_max": r.get("half_max"),
+            "hill_power": r.get("hill_power"),
+            "base_value": r.get("base_value"),
+        }
+        rules_list.append(rule_dict)
+
+    result = f"## Rules Ready for Validation\n\n"
+    result += f"**Total rules:** {len(rules_list)}\n\n"
+
+    result += "### Rules\n"
+    for i, r in enumerate(rules_list, 1):
+        dir_arrow = ">" if r["direction"] == "increases" else "v"
+        result += (
+            f"{i}. **{r['cell_type']}** | {r['signal']} {dir_arrow} {r['behavior']} "
+            f"(half_max={r['half_max']}, hill={r['hill_power']})\n"
+        )
+
+    result += f"\n### Structured Data (for LiteratureValidation MCP)\n"
+    result += f"```json\n{json.dumps(rules_list, indent=2)}\n```\n\n"
+
+    result += (
+        "**Validation workflow:**\n"
+        "1. For each rule, call `suggest_search_queries()` on the LiteratureValidation server\n"
+        "2. Search PubMed with the suggested queries\n"
+        "3. Add paper abstracts to a collection with `add_papers_to_collection()`\n"
+        "4. Call `validate_rules_batch()` with the rules above\n"
+        "5. Call `store_validation_results()` to save results back here"
+    )
+    return result
+
+
+@mcp.tool()
+def store_validation_results(
+    validations: list[dict],
+) -> str:
+    """
+    Store literature validation results for cell rules in the session.
+
+    Each validation dict should contain:
+    - cell_type (str): Cell type name
+    - signal (str): Signal name
+    - direction (str): 'increases' or 'decreases'
+    - behavior (str): Behavior name
+    - support_level (str): 'strong', 'moderate', 'weak', 'contradictory', 'unsupported'
+    - evidence_summary (str): Summary of evidence from literature
+    - suggested_half_max (float, optional): Literature-suggested half-max value
+    - suggested_hill_power (float, optional): Literature-suggested Hill coefficient
+    - key_citations (list[str], optional): Key paper citations
+
+    Args:
+        validations: List of validation result dicts
+
+    Returns:
+        str: Summary of stored validation results
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No simulation configured."
+
+    if not validations:
+        return "**Error:** No validation results provided."
+
+    valid_levels = {"strong", "moderate", "weak", "contradictory", "unsupported"}
+    stored = 0
+    errors = []
+
+    for v in validations:
+        cell_type = v.get("cell_type", "").strip()
+        signal = v.get("signal", "").strip()
+        direction = v.get("direction", "").strip()
+        behavior = v.get("behavior", "").strip()
+        support_level = v.get("support_level", "").strip().lower()
+
+        if not all([cell_type, signal, direction, behavior, support_level]):
+            errors.append("Skipped entry with missing required fields")
+            continue
+
+        if support_level not in valid_levels:
+            errors.append(f"Skipped '{cell_type}/{signal}': invalid support_level '{support_level}'")
+            continue
+
+        result = RuleValidationResult(
+            cell_type=cell_type,
+            signal=signal,
+            direction=direction,
+            behavior=behavior,
+            support_level=support_level,
+            evidence_summary=v.get("evidence_summary", ""),
+            suggested_half_max=v.get("suggested_half_max"),
+            suggested_hill_power=v.get("suggested_hill_power"),
+            key_citations=v.get("key_citations", []),
+        )
+        session.rule_validations.append(result)
+        stored += 1
+
+    if stored > 0:
+        session.mark_step_complete(WorkflowStep.RULES_VALIDATED)
+
+    output = f"## Validation Results Stored\n\n"
+    output += f"**Stored:** {stored} / {len(validations)} results\n\n"
+
+    if errors:
+        output += "**Warnings:**\n"
+        for err in errors[:5]:
+            output += f"- {err}\n"
+        output += "\n"
+
+    # Summary by support level
+    level_counts: dict[str, int] = {}
+    for rv in session.rule_validations:
+        level_counts[rv.support_level] = level_counts.get(rv.support_level, 0) + 1
+
+    output += "### Support Level Summary\n"
+    for level in ["strong", "moderate", "weak", "contradictory", "unsupported"]:
+        count = level_counts.get(level, 0)
+        if count > 0:
+            output += f"- **{level.capitalize()}:** {count}\n"
+
+    # Flag actionable items
+    flagged = [rv for rv in session.rule_validations
+               if rv.support_level in ("unsupported", "contradictory")]
+    if flagged:
+        output += "\n### Rules Needing Attention\n"
+        for rv in flagged:
+            dir_arrow = ">" if rv.direction == "increases" else "v"
+            output += f"- **{rv.support_level.upper()}**: {rv.cell_type} | {rv.signal} {dir_arrow} {rv.behavior}\n"
+
+    # Show parameter suggestions
+    suggestions = [rv for rv in session.rule_validations
+                   if rv.suggested_half_max is not None or rv.suggested_hill_power is not None]
+    if suggestions:
+        output += "\n### Suggested Parameter Adjustments\n"
+        for rv in suggestions:
+            output += f"- **{rv.cell_type} | {rv.signal} -> {rv.behavior}:**"
+            if rv.suggested_half_max is not None:
+                output += f" half_max={rv.suggested_half_max}"
+            if rv.suggested_hill_power is not None:
+                output += f" hill_power={rv.suggested_hill_power}"
+            output += "\n"
+
+    output += f"\n**Next step:** Use `get_validation_report()` for a full report."
+    return output
+
+
+@mcp.tool()
+def get_validation_report() -> str:
+    """
+    Generate a comprehensive validation report for all cell rules.
+
+    Shows each rule's validation status, evidence summary, and any
+    suggested parameter changes from published literature.
+
+    Returns:
+        str: Markdown-formatted validation report
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "**Error:** No simulation configured."
+
+    if not session.rule_validations:
+        return (
+            "**No validation results stored.**\n\n"
+            "Use the LiteratureValidation MCP server to validate rules, "
+            "then call `store_validation_results()` to save results here.\n\n"
+            "**Quick start:**\n"
+            "1. `get_rules_for_validation()` — export rules\n"
+            "2. `suggest_search_queries()` — get PubMed queries (LiteratureValidation MCP)\n"
+            "3. `search_pubmed()` — find papers (PubMed MCP)\n"
+            "4. `add_papers_to_collection()` — index papers (LiteratureValidation MCP)\n"
+            "5. `validate_rules_batch()` — validate against literature\n"
+            "6. `store_validation_results()` — save results here"
+        )
+
+    # Get current rules for cross-reference
+    try:
+        rules_api = session.config.cell_rules_csv
+        current_rules = rules_api.get_rules()
+    except Exception:
+        current_rules = []
+
+    report = "## Literature Validation Report\n\n"
+    report += f"**Rules validated:** {len(session.rule_validations)}\n"
+    report += f"**Total rules in model:** {session.rules_count}\n\n"
+
+    # Support distribution
+    level_counts: dict[str, int] = {}
+    for rv in session.rule_validations:
+        level_counts[rv.support_level] = level_counts.get(rv.support_level, 0) + 1
+
+    report += "### Overall Assessment\n"
+    for level in ["strong", "moderate", "weak", "contradictory", "unsupported"]:
+        count = level_counts.get(level, 0)
+        if count > 0:
+            report += f"- **{level.capitalize()}:** {count}\n"
+    report += "\n"
+
+    # Detailed per-rule report
+    report += "### Detailed Results\n\n"
+    for i, rv in enumerate(session.rule_validations, 1):
+        dir_arrow = ">" if rv.direction == "increases" else "v"
+        report += f"#### {i}. {rv.cell_type} | {rv.signal} {dir_arrow} {rv.behavior}\n"
+        report += f"**Support:** {rv.support_level.upper()}\n\n"
+
+        if rv.evidence_summary:
+            # Truncate long summaries
+            summary = rv.evidence_summary
+            if len(summary) > 500:
+                summary = summary[:500] + "..."
+            report += f"{summary}\n\n"
+
+        if rv.key_citations:
+            report += "**Key citations:**\n"
+            for cite in rv.key_citations[:5]:
+                report += f"- {cite}\n"
+            report += "\n"
+
+        if rv.suggested_half_max is not None or rv.suggested_hill_power is not None:
+            report += "**Suggested parameters:**"
+            if rv.suggested_half_max is not None:
+                report += f" half_max={rv.suggested_half_max}"
+            if rv.suggested_hill_power is not None:
+                report += f" hill_power={rv.suggested_hill_power}"
+            report += "\n\n"
+
+    # Unvalidated rules
+    validated_keys = {
+        (rv.cell_type, rv.signal, rv.direction, rv.behavior)
+        for rv in session.rule_validations
+    }
+    unvalidated = []
+    for r in current_rules:
+        key = (r.get("cell_type", ""), r.get("signal", ""),
+               r.get("direction", ""), r.get("behavior", ""))
+        if key not in validated_keys:
+            unvalidated.append(r)
+
+    if unvalidated:
+        report += "### Unvalidated Rules\n"
+        for r in unvalidated:
+            report += f"- {r.get('cell_type', '?')} | {r.get('signal', '?')} -> {r.get('behavior', '?')}\n"
+        report += "\n"
+
+    report += f"**Progress:** {session.get_progress_percentage():.0f}%"
+    return report
+
 
 # ============================================================================
 # INITIAL CELL PLACEMENT TOOLS
@@ -4601,6 +4897,12 @@ def get_help() -> str:
 26. **apply_calibrated_parameters()** - Update model with calibrated values
 27. **get_uq_summary()** - Overview of all UQ analysis work
 
+### Phase 6: Literature Validation (Optional, requires LiteratureValidation MCP)
+28. **get_rules_for_validation()** - Export rules for literature validation
+29. *LiteratureValidation MCP:* suggest_search_queries() → search PubMed → add_papers_to_collection() → validate_rules_batch()
+30. **store_validation_results()** - Save validation results in session
+31. **get_validation_report()** - View full literature validation report
+
 ## Helper Functions
 - **list_all_available_signals()** - See what signals cells can sense
 - **list_all_available_behaviors()** - See what cells can do
@@ -4611,6 +4913,7 @@ def get_help() -> str:
 - **stop_simulation()** - Stop a running simulation
 - **get_simulation_output_files()** - List output files
 - **list_uq_runs()** - See all UQ analysis runs
+- **get_validation_report()** - View literature validation results
 
 ## IMPORTANT
 - You MUST call tools in the order shown above
