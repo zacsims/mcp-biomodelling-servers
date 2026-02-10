@@ -9,6 +9,7 @@ Current servers (see their own READMEs & upstream docs):
 | MaBoSS | `MaBoSS/` | https://github.com/colomoto/pyMaBoSS |
 | NeKo | `NeKo/` | https://github.com/sysbio-curie/Neko |
 | PhysiCell (settings wrapper) | `PhysiCell/` | https://github.com/marcorusc/PhysiCell_Settings |
+| Literature Validation (PaperQA2) | `LiteratureValidation/` | https://github.com/Future-House/paper-qa |
 
 All servers are Python processes speaking MCP over stdio.
 
@@ -21,9 +22,10 @@ Each `server.py` advertises modelling actions (e.g. run simulations, manage sess
 ---
 ## Repository Layout
 ```
-MaBoSS/    # MaBoSS MCP server (Boolean / stochastic models)
-NeKo/      # NeKo MCP server
-PhysiCell/ # PhysiCell settings / sessions MCP server
+MaBoSS/                # MaBoSS MCP server (Boolean / stochastic models)
+NeKo/                  # NeKo MCP server
+PhysiCell/             # PhysiCell settings / sessions MCP server
+LiteratureValidation/  # Literature validation MCP server (PaperQA2)
 README.md
 ```
 Consult the README within each tool folder for: purpose, required Python packages, and any model/data file expectations. Installation instructions for the modelling tools themselves live *there* (or in the upstream project links above) — they are intentionally not duplicated here.
@@ -69,6 +71,16 @@ Example (adapt paths to your system; based on the working setup):
       "args": [
         "/absolute/path/to/mcp-biomodelling-servers/PhysiCell/server.py"
       ]
+    },
+    "literature_validation": {
+      "type": "stdio",
+      "command": "/home/you/miniforge3/envs/mcp_modelling_py311/bin/python",
+      "args": [
+        "/absolute/path/to/mcp-biomodelling-servers/LiteratureValidation/server.py"
+      ],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-..."
+      }
     }
   },
   "inputs": [
