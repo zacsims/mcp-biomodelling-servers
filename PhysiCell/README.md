@@ -513,7 +513,7 @@ To verify the server is registered:
 claude mcp list
 ```
 
-#### Recommended: Add CLAUDE.md
+#### Recommended: Add CLAUDE.md and Install Skill
 
 Copy the included `CLAUDE.md` to `~/.claude/CLAUDE.md` to ensure Claude Code always uses the PhysiCell MCP tools directly rather than attempting manual workarounds:
 
@@ -521,7 +521,7 @@ Copy the included `CLAUDE.md` to `~/.claude/CLAUDE.md` to ensure Claude Code alw
 cp /path/to/mcp-biomodelling-servers/PhysiCell/CLAUDE.md ~/.claude/CLAUDE.md
 ```
 
-This file is loaded automatically at the start of every Claude Code conversation and instructs Claude to use the MCP tools as direct tool calls. Without it, Claude may try to call the tools via subprocess or write PhysiCell configuration files manually.
+The repository also includes a `physicell-simulation` AgentSkill (in the `physicell-simulation/` directory) that provides detailed simulation guidance and prevents common configuration mistakes like the "from 0 towards 0" rule bug. The skill is automatically discovered by Claude Code via the `.claude-plugin/plugin.json` manifest when working in this project directory.
 
 #### Verifying the Installation
 
@@ -544,6 +544,54 @@ or calling the `get_help()` tool. If the UQ tools show as unavailable, check tha
 | `pyabc` | ABC-SMC calibration | Optional |
 
 All required dependencies are automatically installed by `uv run` from `pyproject.toml`. Only the optional calibration backends need manual installation.
+
+### AgentSkill: `physicell-simulation`
+
+This repository includes a **Claude Code AgentSkill** that provides LLMs with comprehensive guidance for building PhysiCell simulations correctly. The skill uses progressive disclosure — metadata at startup, full instructions on activation, reference files on demand — keeping context efficient while preventing common configuration mistakes.
+
+#### Why an AgentSkill?
+
+LLMs frequently make configuration mistakes that produce broken or silent-failure simulations. The most common is the **"from 0 towards 0" bug**: setting a Hill function rule where both the `base_value` and the XML default rate are 0, causing the rule to interpolate between 0 and 0 (no effect). This was observed in real sessions where transition rules silently did nothing.
+
+The skill prevents this and other mistakes by providing:
+- Mandatory tool ordering (workflow sequence)
+- Hill function parameter mapping with the critical "from 0 towards 0" prevention checklist
+- Common mistakes quick reference table
+- Typical biological parameter values
+- Post-simulation verification checklist
+
+#### Skill Structure
+
+```
+physicell-simulation/
+├── SKILL.md                                   # Main instructions (~260 lines)
+├── references/
+│   ├── rules-and-hill-functions.md            # Hill function math, "from 0 towards 0" prevention
+│   ├── parameter-reference.md                 # Typical values for biological scenarios
+│   ├── troubleshooting.md                     # Error diagnosis by symptom
+│   ├── uq-calibration-workflow.md             # UQ/sensitivity/calibration details
+│   ├── physiboss-integration.md               # Boolean network integration
+│   └── literature-validation.md               # Literature validation multi-server workflow
+└── scripts/
+    └── validate_config.py                     # Pre-flight XML/CSV validation script
+```
+
+#### Pre-Flight Validation Script
+
+The `validate_config.py` script checks exported XML + rules CSV for common issues before running a simulation:
+
+```bash
+python3 physicell-simulation/scripts/validate_config.py PhysiCell_settings.xml cell_rules.csv
+```
+
+It checks for:
+- "From 0 towards 0" rules (the #1 silent-failure bug)
+- Missing substrates or cell types referenced in rules
+- Dirichlet boundary consistency
+- CRLF line endings in CSV files
+- Invalid Hill function parameters
+
+Exit codes: `0` = PASS, `1` = WARN, `2` = FAIL.
 
 ### Learn More
 
