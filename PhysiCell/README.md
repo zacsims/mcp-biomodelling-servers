@@ -513,7 +513,7 @@ To verify the server is registered:
 claude mcp list
 ```
 
-#### Recommended: Add CLAUDE.md and Install Skill
+#### Recommended: Add CLAUDE.md
 
 Copy the included `CLAUDE.md` to `~/.claude/CLAUDE.md` to ensure Claude Code always uses the PhysiCell MCP tools directly rather than attempting manual workarounds:
 
@@ -521,7 +521,24 @@ Copy the included `CLAUDE.md` to `~/.claude/CLAUDE.md` to ensure Claude Code alw
 cp /path/to/mcp-biomodelling-servers/PhysiCell/CLAUDE.md ~/.claude/CLAUDE.md
 ```
 
-The repository also includes a `physicell-simulation` AgentSkill (in the `physicell-simulation/` directory) that provides detailed simulation guidance and prevents common configuration mistakes like the "from 0 towards 0" rule bug. The skill is automatically discovered by Claude Code via the `.claude-plugin/plugin.json` manifest when working in this project directory.
+#### Install the AgentSkill (Recommended)
+
+The repository includes a `physicell-simulation` AgentSkill that guides LLMs through correct simulation setup and prevents common mistakes (like the "from 0 towards 0" rule bug). To install it:
+
+**Automated install (recommended):**
+
+```bash
+bash /path/to/mcp-biomodelling-servers/PhysiCell/physicell-simulation/install-skill.sh
+```
+
+This script copies the skill to the `life-sciences` Claude Code plugin marketplace, registers it in the plugin cache, and enables it. Requires the `life-sciences` marketplace to be present at `~/.claude/plugins/marketplaces/life-sciences/`.
+
+**What it does:**
+1. Copies skill files to `~/.claude/plugins/marketplaces/life-sciences/physicell-simulation/`
+2. Creates an install cache at `~/.claude/plugins/cache/life-sciences/physicell-simulation/1.0.0/`
+3. Registers the skill in `marketplace.json`, `installed_plugins.json`, and `settings.json`
+
+**Verify:** Start a new Claude Code session and run `/skills`. You should see `physicell-simulation` listed.
 
 #### Verifying the Installation
 
@@ -565,6 +582,7 @@ The skill prevents this and other mistakes by providing:
 ```
 physicell-simulation/
 ├── SKILL.md                                   # Main instructions (~260 lines)
+├── install-skill.sh                           # Automated installer for Claude Code
 ├── references/
 │   ├── rules-and-hill-functions.md            # Hill function math, "from 0 towards 0" prevention
 │   ├── parameter-reference.md                 # Typical values for biological scenarios
