@@ -1,0 +1,9 @@
+{
+  "name": "physicell-simulation",
+  "version": "1.0.0",
+  "description": "Build, configure, and run PhysiCell multicellular simulations using the PhysiCell MCP server",
+  "author": {
+    "name": "simsz"
+  },
+  "skills": ["./physicell-simulation"]
+}

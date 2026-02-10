@@ -1,0 +1,264 @@
+---
+name: physicell-simulation
+description: >
+  Build, configure, and run PhysiCell multicellular simulations using the PhysiCell MCP server.
+  Use when the user asks to model tumors, cells, tissues, or multicellular biological systems.
+  Covers simulation setup, cell rules (Hill functions), initial conditions, PhysiBoSS boolean
+  networks, UQ/calibration, and literature validation. Prevents common configuration mistakes
+  like the "from 0 towards 0" rule bug.
+compatibility: Requires PhysiCell MCP server connection
+metadata:
+  author: simsz
+  version: "1.0"
+---
+
+# PhysiCell Simulation Skill
+
+You MUST call PhysiCell MCP tools using the MCP tool calling mechanism — the same way you call Read, Write, Bash, or Grep. Tools have the prefix `mcp__PhysiCell__`. Do NOT run them via Bash, subprocess, or npx. Do NOT write PhysiCell XML or C++ manually.
+
+## 1. Mandatory Tool Ordering
+
+Follow this sequence. Do not skip steps.
+
+```
+create_session
+  → analyze_biological_scenario
+  → create_simulation_domain
+  → add_single_substrate          (repeat for each substrate)
+  → add_single_cell_type          (repeat for each cell type)
+  → configure_cell_parameters     (repeat for each cell type)
+  → set_substrate_interaction     (repeat for each cell×substrate pair)
+  → add_single_cell_rule          (repeat for each rule — SEE SECTION 2)
+  → place_initial_cells           (repeat for each cell placement)
+  → export_xml_configuration
+  → export_cell_rules_csv
+  → export_cells_csv              (if cells were placed)
+  → create_physicell_project
+  → compile_physicell_project
+  → run_simulation
+  → get_simulation_status         (poll until complete)
+  → generate_simulation_gif
+```
+
+## 2. Hill Function Rules — CRITICAL
+
+### How rules work in PhysiCell
+
+The `add_single_cell_rule` tool writes a CSV row:
+
+```
+cell_type, signal, direction, behavior, base_value, half_max, hill_power, apply_to_dead
+```
+
+PhysiCell reads this CSV and computes behavior values using the Hill function:
+
+```
+                                      signal^n
+behavior = base_value + (saturation - base_value) × ─────────────────
+                                      half_max^n + signal^n
+```
+
+Where:
+- **base_value** = `min_signal` parameter from the tool (default: 0). This is the behavior value when the signal is absent/low.
+- **saturation** = the XML default rate for that behavior. This is NOT a tool parameter — it comes from the cell type definition in the XML.
+- **half_max** = signal level at which the behavior is halfway between base and saturation.
+- **n** = `hill_power` (steepness: 1=gradual, 4=moderate, 8=switch-like).
+
+For `direction = "increases"`: behavior goes from base_value (low signal) toward saturation (high signal).
+For `direction = "decreases"`: behavior goes from saturation (low signal) toward base_value (high signal).
+
+### The "From 0 Towards 0" Bug
+
+**This is the #1 most common PhysiCell configuration mistake.**
+
+If `base_value = 0` AND the XML default rate for the behavior is also 0, the Hill function computes:
+
+```
+behavior = 0 + (0 - 0) × Hill(signal) = 0    ← ALWAYS ZERO, rule does nothing!
+```
+
+**The rule silently has no effect.** No error is raised. The simulation runs but the intended behavior never activates.
+
+### Prevention Checklist — BEFORE adding any rule
+
+For each rule you plan to add, check:
+
+1. **What is the target behavior?** (e.g., "cycle entry", "apoptosis", "necrosis", "migration speed")
+2. **What is its XML default value?** This depends on what was set via `configure_cell_parameters` or the cell type template.
+3. **Is the default nonzero?**
+
+| Behavior | Default from template | Safe to use as-is? |
+|---|---|---|
+| cycle entry | Depends on cycle model (Ki67_basic ≈ 0.00072) | Usually yes |
+| apoptosis | Set by `apoptosis_rate` in `configure_cell_parameters` | Yes if configured |
+| necrosis | Set by `necrosis_rate` in `configure_cell_parameters` | Yes if configured |
+| migration speed | Set by `motility_speed` in `configure_cell_parameters` | Yes if configured |
+| exit from cycle phase 0 | Template default, often 0 | DANGER — check first |
+| Custom transition rates | 0 unless explicitly set | DANGER — must set first |
+
+**If the XML default is 0, you MUST set a nonzero rate BEFORE adding the rule:**
+
+```
+# Example: before adding "oxygen increases cycle entry"
+# Ensure cycle entry rate is nonzero:
+configure_cell_parameters(cell_type="tumor", ...)  # sets rates via cycle model
+
+# Example: before adding a rule targeting a transition rate
+# You may need to set the transition rate directly in the XML
+# or choose a different behavior target
+```
+
+### Worked Example: Oxygen → Necrosis
+
+Goal: Low oxygen increases necrosis rate.
+
+```python
+# 1. Cell type already has necrosis_rate=0.0001 from configure_cell_parameters → XML default = 0.0001 ✓
+# 2. Rule: oxygen DECREASES necrosis (high O2 = less necrosis)
+add_single_cell_rule(
+    cell_type="tumor",
+    signal="oxygen",
+    direction="decreases",     # high oxygen → LESS necrosis
+    behavior="apoptosis",
+    min_signal=0.0,            # base_value: necrosis rate when signal is saturated (high O2)
+    max_signal=38,             # informational, not written to CSV
+    half_max=5.0,              # oxygen level at 50% effect
+    hill_power=4               # moderately steep response
+)
+# Result: necrosis = 0 at high O2, rises toward 0.0001 (XML default) as O2 drops ✓
+```
+
+## 3. Common Mistakes Quick Reference
+
+| # | Mistake | Symptom | Fix |
+|---|---------|---------|-----|
+| 1 | "From 0 towards 0" rule | Rule has no effect, cells ignore signal | Set nonzero XML default for the target behavior BEFORE adding rule |
+| 2 | Dirichlet not enabled per-boundary | Substrate not maintained at boundaries | Set `dirichlet_enabled=True` in `add_single_substrate` |
+| 3 | Wrong cycle model | Desired transition doesn't exist | Check `get_available_cycle_models()` |
+| 4 | Cells placed outside domain | Cells immediately removed or ignored | Ensure placement radius/bounds fit within `create_simulation_domain` extents |
+| 5 | Rule references nonexistent substrate | Rule silently fails | Add substrate BEFORE rules |
+| 6 | Missing `export_cells_csv` | cells.csv not in project, no initial cells | Call `export_cells_csv()` before `create_physicell_project()` |
+| 7 | No substrate interactions set | Cells don't consume/produce substrates | Call `set_substrate_interaction()` for each cell×substrate |
+| 8 | `increases` vs `decreases` swapped | Behavior responds opposite to intent | "increases" = more signal → more behavior |
+| 9 | Not checking simulation status | Don't know if simulation succeeded | Always call `get_simulation_status()` after `run_simulation()` |
+| 10 | Forgetting `compile_physicell_project` | Simulation fails to run | Must compile before running |
+
+## 4. Substrate Defaults
+
+Use these typical values when adding substrates:
+
+| Substrate | Diffusion (μm²/min) | Decay (1/min) | Initial | Dirichlet | Units |
+|-----------|---------------------|---------------|---------|-----------|-------|
+| oxygen | 100000 | 0.1 | 38.0 | 38.0 (enabled) | mmHg |
+| glucose | 30000 | 0.0025 | 16.9 | 16.9 | mM |
+| chemokine | 50000 | 0.01 | 0.0 | — | dimensionless |
+| drug | 100000 | 0.01-0.1 | 0.0 | varies | μM |
+| VEGF | 20000 | 0.01 | 0.0 | — | dimensionless |
+
+For oxygen, **always enable Dirichlet boundaries** to maintain oxygenation:
+```python
+add_single_substrate(
+    substrate_name="oxygen",
+    diffusion_coefficient=100000,
+    decay_rate=0.1,
+    initial_condition=38.0,
+    dirichlet_enabled=True,
+    dirichlet_value=38.0,
+    units="mmHg"
+)
+```
+
+## 5. Cell Placement Patterns
+
+| Pattern | Use when... | Key parameters |
+|---------|------------|----------------|
+| `random_disc` | Tumor mass, circular colony | center_x, center_y, radius, num_cells |
+| `random_rectangle` | Tissue layer, rectangular region | x_min, x_max, y_min, y_max, num_cells |
+| `single` | Individual cell placement | center_x, center_y |
+| `grid` | Uniform tissue, monolayer | x_min, x_max, y_min, y_max, spacing |
+| `annular` | Ring of cells (e.g., immune ring around tumor) | center_x, center_y, radius, inner_radius, num_cells |
+
+Ensure all placements fit within the simulation domain. A 1000×1000 domain spans -500 to +500 in each axis.
+
+## 6. Substrate Interactions
+
+For every cell type × substrate pair, decide if cells consume, secrete, or ignore the substrate:
+
+```python
+# Tumor cells consume oxygen
+set_substrate_interaction(cell_type="tumor", substrate="oxygen", uptake_rate=10.0)
+
+# Tumor cells secrete chemokine
+set_substrate_interaction(cell_type="tumor", substrate="chemokine", secretion_rate=0.1)
+```
+
+Common uptake rates:
+- Oxygen uptake: 10.0 (typical tumor), 5.0 (normal cells)
+- Glucose uptake: 0.5-2.0
+- Drug uptake: 0.01-0.1
+
+## 7. Literature Validation Workflow
+
+When the user asks to validate rules against published literature, or after defining rules for a simulation, orchestrate between three MCP servers:
+
+**Step-by-step:**
+1. `mcp__PhysiCell__get_rules_for_validation()` — export rules as structured JSON
+2. `mcp__LiteratureValidation__create_paper_collection("model_name")` — create document store
+3. For each rule, `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get PubMed queries
+4. Search PubMed using suggested queries (via PubMed MCP: `search_pubmed()`, `get_article_details()`)
+5. `mcp__LiteratureValidation__add_papers_to_collection(name, papers)` — index papers. Each paper: `{title, text, pmid?, doi?, authors?, year?}`
+6. Repeat steps 3-5 for all rules
+7. `mcp__LiteratureValidation__validate_rules_batch(name, rules)` — evaluate all rules
+8. `mcp__LiteratureValidation__get_validation_summary(name)` — overview
+9. `mcp__PhysiCell__store_validation_results(validations)` — persist in session
+10. `mcp__PhysiCell__get_validation_report()` — full report
+
+**Support levels:** strong, moderate, weak, contradictory, unsupported.
+Rules flagged `unsupported` or `contradictory` should be reviewed. Validation may suggest parameter changes (half_max, hill_power).
+
+See `references/literature-validation.md` for the complete guide.
+
+## 8. Post-Simulation Checklist
+
+After `run_simulation()`:
+1. Poll `get_simulation_status()` until complete
+2. Call `generate_simulation_gif()` to visualize
+3. Call `get_simulation_output_files()` to list outputs
+4. Verify cell counts are changing over time (not static)
+5. If rules seem inactive, check `detailed_rules.txt` in output for "from X towards Y" values
+
+## 9. Reference Files
+
+For deep dives on specific topics:
+
+- **`references/rules-and-hill-functions.md`** — Full Hill function math, worked examples, "from 0 towards 0" deep dive
+- **`references/parameter-reference.md`** — Typical biological parameter values by cell type
+- **`references/troubleshooting.md`** — Error diagnosis by symptom
+- **`references/uq-calibration-workflow.md`** — Sensitivity analysis and calibration workflows
+- **`references/physiboss-integration.md`** — Boolean network (MaBoSS/PhysiBoSS) integration
+- **`references/literature-validation.md`** — Multi-server literature validation workflow
+
+## 10. Quick Start Template
+
+For a basic tumor growth simulation:
+
+```
+1. create_session()
+2. analyze_biological_scenario("Tumor growth with oxygen-dependent proliferation and necrosis")
+3. create_simulation_domain(domain_x=1000, domain_y=1000, domain_z=20, max_time=4320)
+4. add_single_substrate("oxygen", 100000, 0.1, 38.0, dirichlet_enabled=True, dirichlet_value=38.0, units="mmHg")
+5. add_single_cell_type("tumor")
+6. configure_cell_parameters(cell_type="tumor", volume_total=2500, motility_speed=0.5, apoptosis_rate=5.31667e-5, necrosis_rate=0.00277)
+7. set_substrate_interaction(cell_type="tumor", substrate="oxygen", uptake_rate=10.0)
+8. add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis", min_signal=0, half_max=3.75, hill_power=8)
+9. add_single_cell_rule(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", min_signal=0, half_max=1.0, hill_power=4)
+10. place_initial_cells(cell_type="tumor", pattern="random_disc", num_cells=200, radius=100)
+11. export_xml_configuration()
+12. export_cell_rules_csv()
+13. export_cells_csv()
+14. create_physicell_project("tumor_growth")
+15. compile_physicell_project("tumor_growth")
+16. run_simulation("tumor_growth")
+17. get_simulation_status(simulation_id)   # poll until complete
+18. generate_simulation_gif(simulation_id)
+```
