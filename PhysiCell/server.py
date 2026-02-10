@@ -1769,7 +1769,7 @@ str: Markdown-formatted export status with file details
         xml_content = session.config.generate_xml()
 
         # Ensure we write to a writable location
-        output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+        output_dir = MCP_OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Always save as PhysiCell_settings.xml for consistency with create_physicell_project
@@ -1859,7 +1859,7 @@ str: Markdown-formatted export status with file details
         # TODO: If new API rules exist, we might need to convert them to legacy format
 
         # Ensure we write to a writable location
-        output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+        output_dir = MCP_OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Always save as cell_rules.csv for consistency with create_physicell_project
@@ -2197,7 +2197,7 @@ def export_cells_csv(filename: str = "cells.csv") -> str:
 
     try:
         # Write CSV file
-        output_dir = Path.home() / "Documents" / "PhysiCell_MCP_Output"
+        output_dir = MCP_OUTPUT_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Always save as cells.csv for consistency with create_physicell_project
