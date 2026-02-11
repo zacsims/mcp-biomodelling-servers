@@ -26,18 +26,20 @@ If you detect a problem (like "from 0 towards 0"), fix it by calling the appropr
 
 When the user asks to base parameters on literature, determine values from published data, or validate rules against papers, you MUST use the LiteratureValidation MCP server (`mcp__LiteratureValidation__*` tools). Do NOT manually read papers/abstracts in context and extract values yourself.
 
-**NEVER call these PubMed tools for parameter extraction:**
+**NEVER use these tools for literature research or parameter extraction:**
+- `WebSearch` / `WebFetch` — NEVER use web search to find biological parameters. Web search results are unreliable, unverifiable, and waste context. Use the PubMed and bioRxiv MCP servers instead.
 - `get_full_text_article` — dumps 50KB+ into context, wastes the context window
 - `get_article_metadata` — reading abstracts in context to manually extract values is unreliable and wasteful
 
 **Instead, follow this workflow:**
 1. Search PubMed with `mcp__plugin_pubmed_PubMed__search_articles()` — collect PMIDs only
-2. Create a collection: `mcp__LiteratureValidation__create_paper_collection("model_name")`
-3. Index papers with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name="model_name", pmids=[...list of PMIDs...], fetch_pdfs=True)`
-4. Query PaperQA for each rule: `mcp__LiteratureValidation__validate_rule(name="model_name", cell_type=..., signal=..., direction=..., behavior=..., half_max=..., hill_power=...)`
-5. Review: `mcp__LiteratureValidation__get_validation_summary("model_name")`
+2. Search bioRxiv with `mcp__plugin_biorxiv_bioRxiv__search_preprints()` — collect bioRxiv DOIs
+3. Create a collection: `mcp__LiteratureValidation__create_paper_collection("model_name")`
+4. Index papers with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name="model_name", pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)`
+5. Query PaperQA for each rule: `mcp__LiteratureValidation__validate_rule(name="model_name", cell_type=..., signal=..., direction=..., behavior=..., half_max=..., hill_power=...)`
+6. Review: `mcp__LiteratureValidation__get_validation_summary("model_name")`
 
-PaperQA indexes full PDFs (from PubMed Central) and uses RAG to extract quantitative parameters — far more accurate than reading abstracts. Use `search_articles` ONLY to find PMIDs, then hand them to `add_papers_by_id`. See Section 7 for the full workflow.
+PaperQA indexes full PDFs (from PubMed Central, 68+ publishers, and preprint servers) and uses RAG to extract quantitative parameters — far more accurate than web search or reading abstracts. Use `search_articles` ONLY to find PMIDs, then hand them to `add_papers_by_id`. See Section 7 for the full workflow.
 
 ## 1. Mandatory Tool Ordering
 
@@ -283,9 +285,11 @@ Use this workflow whenever the user asks you to determine rules, parameters, or 
 
 ### What NOT to do
 
+- Do NOT use `WebSearch` or `WebFetch` for biological parameters — web search is unreliable and unverifiable. Use PubMed/bioRxiv MCP servers to find papers, then LiteratureValidation MCP to extract parameters.
 - Do NOT use `get_full_text_article` — wastes context with 50KB+ responses
 - Do NOT use `get_article_metadata` to read abstracts into context and then manually extract parameter values — let PaperQA do the extraction via `validate_rule()`
 - Do NOT skip the LiteratureValidation MCP when the user asks for literature-based parameters
+- Do NOT invent parameter values from general knowledge — all values must come from indexed literature via PaperQA
 
 **Support levels:** strong, moderate, weak, contradictory, unsupported.
 Rules flagged `unsupported` or `contradictory` should be reviewed. Validation may suggest parameter changes (half_max, hill_power).
