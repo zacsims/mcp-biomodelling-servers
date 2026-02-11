@@ -4,6 +4,7 @@
 #   "fastmcp>=2.14.4",
 #   "paper-qa>=5",
 #   "httpx>=0.27",
+#   "coredis>=4",
 # ]
 # ///
 """
