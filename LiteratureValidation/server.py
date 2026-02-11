@@ -64,11 +64,11 @@ _validation_results: dict[str, list[dict]] = {}
 # ============================================================================
 
 def _get_paperqa_settings() -> "Settings":
-    """Build PaperQA Settings using Claude via litellm."""
+    """Build PaperQA Settings using OpenAI models."""
     return Settings(
-        llm="litellm/claude-sonnet-4-20250514",
-        summary_llm="litellm/claude-haiku-4-5-20251001",
-        embedding="litellm/text-embedding-3-small",
+        llm="gpt-4o",
+        summary_llm="gpt-4o-mini",
+        embedding="text-embedding-3-small",
         answer=AnswerSettings(
             evidence_k=10,
             answer_max_sources=5,
