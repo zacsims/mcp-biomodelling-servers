@@ -9,4 +9,7 @@ dependencies = [
     "paper-qa>=5",
     "httpx>=0.27",
     "coredis>=4",
+    "metapub>=0.5",
+    "pypdf[image]",
+    "setuptools<72",
 ]
