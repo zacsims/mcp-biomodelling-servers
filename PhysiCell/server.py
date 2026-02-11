@@ -2754,6 +2754,16 @@ def get_validation_report() -> str:
         report += "\n"
 
     report += f"**Progress:** {session.get_progress_percentage():.0f}%"
+
+    # Export report to output directory
+    try:
+        MCP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = MCP_OUTPUT_DIR / "validation_report.md"
+        report_path.write_text(report, encoding="utf-8")
+        report += f"\n\n**Report exported to:** `{report_path}`"
+    except Exception:
+        pass
+
     return report
 
 
