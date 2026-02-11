@@ -5,6 +5,9 @@
 #   "paper-qa>=5",
 #   "httpx>=0.27",
 #   "coredis>=4",
+#   "metapub>=0.5",
+#   "pypdf[image]",
+#   "setuptools<72",
 # ]
 # ///
 """
@@ -39,6 +42,13 @@ try:
     PAPERQA_AVAILABLE = True
 except ImportError:
     PAPERQA_AVAILABLE = False
+
+# metapub for PDF discovery (68+ publishers, 97% coverage)
+try:
+    from metapub import FindIt
+    METAPUB_AVAILABLE = True
+except ImportError:
+    METAPUB_AVAILABLE = False
 
 # ============================================================================
 # CONFIGURATION
@@ -102,25 +112,6 @@ async def _get_or_create_docs(name: str) -> "Docs":
     return docs
 
 
-async def _pmid_to_pmcid(pmid: str) -> str | None:
-    """Convert a PubMed ID to a PMC ID using the NCBI ID converter API.
-
-    Returns the PMCID string (e.g. 'PMC9046468') or None if no PMC version exists.
-    """
-    url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={pmid}&format=json"
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-            records = data.get("records", [])
-            if records and "pmcid" in records[0]:
-                return records[0]["pmcid"]
-    except Exception:
-        pass
-    return None
-
-
 async def _download_pdf(url: str, dest: Path) -> bool:
     """Download a PDF from a URL to a local file path.
 
@@ -140,10 +131,36 @@ async def _download_pdf(url: str, dest: Path) -> bool:
         return False
 
 
+def _find_pdf_url(pmid: str | None = None, doi: str | None = None) -> str | None:
+    """Use metapub FindIt to locate a PDF URL for a paper.
+
+    FindIt covers 68+ publishers (97% coverage) including Elsevier, Wiley,
+    Springer, Nature, PLOS, BMC, PMC, and many more.
+    Returns a direct PDF URL or None.
+    """
+    if not METAPUB_AVAILABLE:
+        return None
+    try:
+        import time
+        time.sleep(0.4)  # Avoid NCBI rate limiting (3 req/s without API key)
+        kwargs = {}
+        if pmid:
+            kwargs["pmid"] = pmid
+        if doi:
+            kwargs["doi"] = doi
+        if not kwargs:
+            return None
+        src = FindIt(**kwargs)
+        return src.url or None
+    except Exception:
+        return None
+
+
 async def _try_fetch_pdf(paper: dict, papers_path: Path) -> Path | None:
     """Attempt to fetch a full PDF for a paper.
 
-    Tries bioRxiv direct download first, then PMC for PubMed papers.
+    Uses metapub FindIt for broad publisher coverage (68+ publishers),
+    with bioRxiv direct download as fallback for preprints.
     Returns the PDF file path on success, None on failure.
     """
     title = paper.get("title", "unknown")
@@ -154,23 +171,22 @@ async def _try_fetch_pdf(paper: dict, papers_path: Path) -> Path | None:
     if pdf_path.exists() and pdf_path.stat().st_size > 1000:
         return pdf_path
 
-    # 1. bioRxiv DOI (explicit field or DOI with 10.1101/ prefix)
-    biorxiv_doi = paper.get("biorxiv_doi")
+    pmid = paper.get("pmid")
     doi = paper.get("doi", "")
+    biorxiv_doi = paper.get("biorxiv_doi")
+
+    # 1. bioRxiv DOI — direct PDF download (always available)
     if biorxiv_doi or (doi and doi.startswith("10.1101/")):
         biorxiv_doi = biorxiv_doi or doi
         pdf_url = f"https://www.biorxiv.org/content/{biorxiv_doi}v1.full.pdf"
         if await _download_pdf(pdf_url, pdf_path):
             return pdf_path
 
-    # 2. PubMed → PMC PDF
-    pmid = paper.get("pmid")
-    if pmid:
-        pmcid = await _pmid_to_pmcid(pmid)
-        if pmcid:
-            pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
-            if await _download_pdf(pdf_url, pdf_path):
-                return pdf_path
+    # 2. metapub FindIt — covers 68+ publishers (Elsevier, Wiley, Springer, etc.)
+    pdf_url = _find_pdf_url(pmid=pmid, doi=doi if doi else None)
+    if pdf_url:
+        if await _download_pdf(pdf_url, pdf_path):
+            return pdf_path
 
     return None
 
