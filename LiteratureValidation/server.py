@@ -156,11 +156,49 @@ def _find_pdf_url(pmid: str | None = None, doi: str | None = None) -> str | None
         return None
 
 
+async def _unpaywall_pdf_url(doi: str) -> str | None:
+    """Query Unpaywall API for an open-access PDF URL.
+
+    Unpaywall aggregates OA locations including preprint repositories
+    (bioRxiv, medRxiv), institutional repositories, and green OA copies.
+    Falls back through all oa_locations if best_oa_location has no PDF.
+    """
+    if not doi:
+        return None
+    url = f"https://api.unpaywall.org/v2/{doi}?email=mcp_literature_validation@users.noreply.github.com"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        if not data.get("is_oa"):
+            return None
+
+        # Try best_oa_location first
+        best = data.get("best_oa_location") or {}
+        if best.get("url_for_pdf"):
+            return best["url_for_pdf"]
+
+        # Fall through all oa_locations looking for a PDF URL
+        for loc in data.get("oa_locations", []):
+            if loc.get("url_for_pdf"):
+                return loc["url_for_pdf"]
+            # Some locations only have url (landing page), skip those
+
+    except Exception:
+        pass
+    return None
+
+
 async def _try_fetch_pdf(paper: dict, papers_path: Path) -> Path | None:
     """Attempt to fetch a full PDF for a paper.
 
-    Uses metapub FindIt for broad publisher coverage (68+ publishers),
-    with bioRxiv direct download as fallback for preprints.
+    Strategy (in order):
+    1. bioRxiv direct download (if bioRxiv DOI)
+    2. metapub FindIt — 68+ publisher-specific strategies
+    3. Unpaywall — finds preprints/OA copies of paywalled papers
+
     Returns the PDF file path on success, None on failure.
     """
     title = paper.get("title", "unknown")
@@ -184,6 +222,12 @@ async def _try_fetch_pdf(paper: dict, papers_path: Path) -> Path | None:
 
     # 2. metapub FindIt — covers 68+ publishers (Elsevier, Wiley, Springer, etc.)
     pdf_url = _find_pdf_url(pmid=pmid, doi=doi if doi else None)
+    if pdf_url:
+        if await _download_pdf(pdf_url, pdf_path):
+            return pdf_path
+
+    # 3. Unpaywall — finds preprints & OA copies of paywalled papers
+    pdf_url = await _unpaywall_pdf_url(doi)
     if pdf_url:
         if await _download_pdf(pdf_url, pdf_path):
             return pdf_path
