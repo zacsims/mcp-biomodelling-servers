@@ -286,15 +286,15 @@ def create_paper_collection(name: str) -> str:
         return (
             "**Error:** paper-qa is not installed.\n\n"
             "Install with: `pip install 'paper-qa>=5'`\n"
-            "The ANTHROPIC_API_KEY environment variable must also be set."
+            "The OPENAI_API_KEY environment variable must also be set."
         )
 
     # Check for API key
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not os.environ.get("OPENAI_API_KEY"):
         return (
-            "**Error:** ANTHROPIC_API_KEY environment variable is not set.\n\n"
-            "PaperQA uses Claude via litellm for question answering. "
-            "Set your Anthropic API key before using this server."
+            "**Error:** OPENAI_API_KEY environment variable is not set.\n\n"
+            "PaperQA uses OpenAI models for question answering. "
+            "Set your OpenAI API key in the MCP server env config."
         )
 
     name = name.strip().lower().replace(" ", "_")
