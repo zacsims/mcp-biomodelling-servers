@@ -27,12 +27,13 @@ If you detect a problem (like "from 0 towards 0"), fix it by calling the appropr
 When the user asks to base parameters on literature, determine values from published data, or validate rules against papers, you MUST use the LiteratureValidation MCP server (`mcp__LiteratureValidation__*` tools). Do NOT manually read papers/abstracts in context and extract values yourself.
 
 **NEVER use these tools for literature research or parameter extraction:**
-- `WebSearch` / `WebFetch` — NEVER use web search to find biological parameters. Web search results are unreliable, unverifiable, and waste context. Use the PubMed and bioRxiv MCP servers instead.
+- `WebSearch` / `WebFetch` — NEVER use web search to find biological parameters or read papers. Web search results are unreliable, unverifiable, and waste context. Use the PubMed and bioRxiv MCP servers instead. **If the PubMed MCP is unavailable (failed to load), use WebSearch ONLY to collect PMIDs, then immediately pass them to `add_papers_by_id()`. Do NOT extract parameters from web search results.**
 - `get_full_text_article` — dumps 50KB+ into context, wastes the context window
 - `get_article_metadata` — reading abstracts in context to manually extract values is unreliable and wasteful
 
 **Instead, follow this workflow:**
 1. Search PubMed with `mcp__plugin_pubmed_PubMed__search_articles()` — collect PMIDs only
+   - **Fallback if PubMed MCP is unavailable:** Use `WebSearch` with queries like `"hypoxia migration PMID"` to find PMIDs, then pass them to `add_papers_by_id()`. Do NOT read or extract parameters from the web search results.
 2. Search bioRxiv with `mcp__plugin_biorxiv_bioRxiv__search_preprints()` — collect bioRxiv DOIs
 3. Create a collection: `mcp__LiteratureValidation__create_paper_collection("model_name")`
 4. Index papers with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name="model_name", pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)`
@@ -264,6 +265,7 @@ Use this workflow whenever the user asks you to determine rules, parameters, or 
 1. `mcp__LiteratureValidation__create_paper_collection("model_name")` — create PaperQA document store
 2. `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized PubMed queries and bioRxiv category suggestions
 3. Search PubMed: `mcp__plugin_pubmed_PubMed__search_articles(query)` — find relevant papers
+   - **If PubMed MCP is unavailable:** Use `WebSearch` to find PMIDs (e.g. search `"hypoxia tumor migration PMID"`). Extract ONLY the PMIDs from results — do NOT read or use any other content from web search. Then proceed to step 4.
 4. Add papers by PMID with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name, pmids=[...], fetch_pdfs=True)` — this automatically fetches metadata, downloads PDFs from PubMed Central when available, and indexes them in PaperQA
 5. Optionally search bioRxiv: `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=90)` — find recent preprints
 6. Add bioRxiv preprints: `mcp__LiteratureValidation__add_papers_by_id(name, biorxiv_dois=[...])` — PDFs are always available from bioRxiv
