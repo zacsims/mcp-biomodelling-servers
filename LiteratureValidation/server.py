@@ -240,21 +240,39 @@ async def _try_fetch_pdf(paper: dict, papers_path: Path) -> Path | None:
     return None
 
 
+_SIGNAL_UNITS: dict[str, str] = {
+    "oxygen": "mmHg",
+    "glucose": "mM",
+    "pressure": "dimensionless (0-1)",
+    "TNF": "pg/mL",
+    "IFN-gamma": "pg/mL",
+    "TGF-beta": "ng/mL",
+    "VEGF": "ng/mL",
+}
+
+
 def _build_validation_question(cell_type: str, signal: str, direction: str,
                                 behavior: str, half_max: float | None = None,
-                                hill_power: float | None = None) -> str:
+                                hill_power: float | None = None,
+                                signal_units: str | None = None) -> str:
     """Build a focused question for PaperQA to answer about a cell rule."""
+    # Auto-detect units if not provided
+    if signal_units is None:
+        signal_units = _SIGNAL_UNITS.get(signal.lower())
+
     dir_word = "increase" if direction == "increases" else "decrease"
+    units_note = f" (measured in {signal_units})" if signal_units else ""
     question = (
-        f"Does {signal} {dir_word} {behavior} in {cell_type} cells? "
+        f"Does {signal}{units_note} {dir_word} {behavior} in {cell_type} cells? "
         f"What is the experimental evidence for this relationship? "
         f"If quantitative data exists, what signal concentration causes "
         f"a half-maximal response (EC50/half-max)? "
         f"How switch-like (Hill coefficient) is the response?"
     )
     if half_max is not None:
+        units_str = f" {signal_units}" if signal_units else ""
         question += (
-            f" The proposed model uses a half-max of {half_max}. "
+            f" The proposed model uses a half-max of {half_max}{units_str}. "
             f"Is this consistent with published data?"
         )
     if hill_power is not None:
@@ -798,6 +816,7 @@ async def validate_rule(
     hill_power: float | None = None,
     min_signal: float | None = None,
     max_signal: float | None = None,
+    signal_units: str | None = None,
 ) -> str:
     """
     Validate a single cell rule against literature in the collection.
@@ -815,6 +834,8 @@ async def validate_rule(
         hill_power: Proposed Hill coefficient (optional)
         min_signal: Minimum signal value (optional)
         max_signal: Maximum signal value (optional)
+        signal_units: Units for signal values (e.g., "mmHg", "mM"). Auto-detected
+                      for common signals (oxygen=mmHg, glucose=mM) if not provided.
 
     Returns:
         str: Validation result with support level, evidence summary, and citations
@@ -846,7 +867,7 @@ async def validate_rule(
     # Build and ask the question
     settings = _get_paperqa_settings()
     question = _build_validation_question(
-        cell_type, signal, direction, behavior, half_max, hill_power
+        cell_type, signal, direction, behavior, half_max, hill_power, signal_units
     )
 
     try:
@@ -959,6 +980,7 @@ async def validate_rules_batch(
             hill_power=rule.get("hill_power"),
             min_signal=rule.get("min_signal"),
             max_signal=rule.get("max_signal"),
+            signal_units=rule.get("signal_units"),
         )
         results.append(result)
 
