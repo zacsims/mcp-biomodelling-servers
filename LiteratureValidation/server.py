@@ -78,6 +78,7 @@ def _get_paperqa_settings() -> "Settings":
     return Settings(
         llm="o4-mini",
         summary_llm="o4-mini",
+        temperature=1,  # Required for reasoning models (o4-mini)
         embedding="text-embedding-3-small",
         parsing=ParsingSettings(
             # Chunk size larger than any paper so each summary = one paper
