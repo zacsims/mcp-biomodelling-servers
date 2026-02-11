@@ -29,6 +29,7 @@ Follow this sequence. Do not skip steps.
 ```
 create_session
   → analyze_biological_scenario
+  → [LITERATURE RESEARCH — if user asks to base parameters on literature, SEE SECTION 7]
   → create_simulation_domain
   → add_single_substrate          (repeat for each substrate)
   → add_single_cell_type          (repeat for each cell type)
@@ -224,26 +225,53 @@ Common uptake rates:
 - Glucose uptake: 0.5-2.0
 - Drug uptake: 0.01-0.1
 
-## 7. Literature Validation Workflow
+## 7. Literature-Based Parameters and Validation
 
-When the user asks to validate rules against published literature, or after defining rules for a simulation, orchestrate between three MCP servers:
+### IMPORTANT: Never read full papers into context
 
-**Step-by-step:**
-1. `mcp__PhysiCell__get_rules_for_validation()` — export rules as structured JSON
-2. `mcp__LiteratureValidation__create_paper_collection("model_name")` — create document store
-3. For each rule, `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get PubMed queries
-4. Search PubMed using suggested queries (via PubMed MCP: `search_pubmed()`, `get_article_details()`)
-5. `mcp__LiteratureValidation__add_papers_to_collection(name, papers)` — index papers. Each paper: `{title, text, pmid?, doi?, authors?, year?}`
-6. Repeat steps 3-5 for all rules
-7. `mcp__LiteratureValidation__validate_rules_batch(name, rules)` — evaluate all rules
-8. `mcp__LiteratureValidation__get_validation_summary(name)` — overview
-9. `mcp__PhysiCell__store_validation_results(validations)` — persist in session
-10. `mcp__PhysiCell__get_validation_report()` — full report
+**NEVER use `get_full_text_article` from the PubMed MCP server.** It dumps entire papers (50KB+) into the conversation context, which wastes context and is ineffective for extracting parameters.
+
+Instead, **always use the LiteratureValidation MCP server** to download and index papers as PDFs into PaperQA, then query them with `validate_rule()`. This applies to:
+- **Finding parameters from literature** (user says "base on literature", "determine from literature", "use published values")
+- **Validating rules after defining them** (user says "validate against literature", "check my rules")
+
+### When to use this workflow
+
+Use this workflow whenever the user asks you to determine rules, parameters, or biological relationships from published research. Do NOT try to extract parameters by reading papers directly — use PaperQA's RAG pipeline via the LiteratureValidation MCP.
+
+### Step-by-step workflow
+
+**Phase 1: Build a paper collection**
+1. `mcp__LiteratureValidation__create_paper_collection("model_name")` — create PaperQA document store
+2. `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized PubMed queries and bioRxiv category suggestions
+3. Search PubMed: `mcp__plugin_pubmed_PubMed__search_articles(query)` — find relevant papers
+4. Add papers by PMID with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name, pmids=[...], fetch_pdfs=True)` — this automatically fetches metadata, downloads PDFs from PubMed Central when available, and indexes them in PaperQA
+5. Optionally search bioRxiv: `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=90)` — find recent preprints
+6. Add bioRxiv preprints: `mcp__LiteratureValidation__add_papers_by_id(name, biorxiv_dois=[...])` — PDFs are always available from bioRxiv
+7. Repeat steps 2-6 for each biological relationship you need to investigate
+
+**Phase 2: Query the literature**
+8. `mcp__LiteratureValidation__validate_rule(name, cell_type, signal, direction, behavior, half_max, hill_power)` — ask PaperQA about a specific rule, including proposed parameter values
+9. Or `mcp__LiteratureValidation__validate_rules_batch(name, rules)` — validate all rules at once
+10. `mcp__LiteratureValidation__get_validation_summary(name)` — overview of support levels
+
+**Phase 3: Persist results (optional)**
+11. `mcp__PhysiCell__store_validation_results(validations)` — save in PhysiCell session
+12. `mcp__PhysiCell__get_validation_report()` — full report
+
+### Key tools for adding papers
+
+- **`add_papers_by_id(name, pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)`** — Preferred method. Give it PMIDs or bioRxiv DOIs and it handles everything: metadata fetch, PDF download, PaperQA indexing. Falls back to abstract text when PDFs aren't available (~84% of PubMed articles lack PMC full text).
+- **`add_papers_to_collection(name, papers, fetch_pdfs=True)`** — Alternative when you already have paper metadata. Pass `fetch_pdfs=True` to attempt PDF downloads.
+
+### What NOT to do
+
+- Do NOT use `get_full_text_article` — wastes context with 50KB+ responses
+- Do NOT use `get_article_metadata` to read abstracts into context and then manually extract parameter values — let PaperQA do the extraction via `validate_rule()`
+- Do NOT skip the LiteratureValidation MCP when the user asks for literature-based parameters
 
 **Support levels:** strong, moderate, weak, contradictory, unsupported.
 Rules flagged `unsupported` or `contradictory` should be reviewed. Validation may suggest parameter changes (half_max, hill_power).
-
-See `references/literature-validation.md` for the complete guide.
 
 ## 8. Post-Simulation Checklist
 
@@ -263,7 +291,7 @@ For deep dives on specific topics:
 - **`references/troubleshooting.md`** — Error diagnosis by symptom
 - **`references/uq-calibration-workflow.md`** — Sensitivity analysis and calibration workflows
 - **`references/physiboss-integration.md`** — Boolean network (MaBoSS/PhysiBoSS) integration
-- **`references/literature-validation.md`** — Multi-server literature validation workflow
+- **`references/literature-validation.md`** — Multi-server literature research and validation workflow (PDF indexing, PaperQA, bioRxiv)
 
 ## 10. Quick Start Template
 

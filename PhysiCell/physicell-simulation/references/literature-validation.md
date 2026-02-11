@@ -1,58 +1,43 @@
-# Literature Validation Guide
+# Literature Research and Validation Guide
 
-Validate PhysiCell cell rules against published biomedical literature using a multi-server orchestration workflow.
+Use the LiteratureValidation MCP server to find parameters from published literature and validate PhysiCell cell rules. This server downloads and indexes papers (as PDFs when available) into PaperQA2, then uses RAG to answer questions about biological relationships and parameter values.
+
+## IMPORTANT: Never read full papers into context
+
+**Do NOT use `get_full_text_article` from the PubMed MCP.** It returns 50KB+ of raw text into the conversation, which wastes context and is far less effective than PaperQA's chunked retrieval.
+
+**Do NOT use `get_article_metadata` to manually extract parameters from abstracts.** Let PaperQA do the extraction via `validate_rule()`.
+
+Instead, use `add_papers_by_id()` to download PDFs and index them in PaperQA, then query with `validate_rule()`.
 
 ## Architecture
 
-Three MCP servers are involved:
+Four MCP servers are involved:
 
 1. **PhysiCell MCP** — Exports rules, stores validation results, generates reports
-2. **LiteratureValidation MCP** — Creates paper collections, suggests queries, validates rules using PaperQA2
-3. **PubMed MCP** (Anthropic plugin) — Searches PubMed, retrieves article abstracts
+2. **LiteratureValidation MCP** — Downloads PDFs, indexes papers in PaperQA2, validates rules against literature
+3. **PubMed MCP** (`plugin_pubmed_PubMed`) — Searches PubMed, retrieves PMIDs and basic metadata
+4. **bioRxiv MCP** (`plugin_biorxiv_bioRxiv`) — Searches bioRxiv/medRxiv preprints by category and date
 
-The LLM orchestrates between all three servers.
+The LLM orchestrates between all four servers.
 
-## When to Validate
+## When to Use
 
-- **After defining cell rules**, before running the simulation
+- **Finding parameters from literature** — user says "base on literature", "determine from published data", "use published values"
+- **After defining cell rules** — validate assumptions before running simulation
 - **For novel biological assumptions** that aren't well-established
 - **When rules produce unexpected results** — check if the biology is correct
-- **Before publishing** simulation results
 
 ## Complete Workflow
 
-### Step 1: Export Rules from PhysiCell
+### Phase 1: Build a Paper Collection
 
-```python
-mcp__PhysiCell__get_rules_for_validation()
-```
-
-Returns rules as structured JSON:
-```json
-[
-    {
-        "cell_type": "tumor",
-        "signal": "oxygen",
-        "direction": "decreases",
-        "behavior": "necrosis",
-        "half_max": 3.75,
-        "hill_power": 8
-    }
-]
-```
-
-### Step 2: Create Paper Collection
-
+**Step 1: Create collection**
 ```python
 mcp__LiteratureValidation__create_paper_collection("tumor_oxygen_model")
 ```
 
-Creates a PaperQA2 document store for indexing and querying papers.
-
-### Step 3: Get Search Queries
-
-For each rule (or batch):
-
+**Step 2: Get search queries**
 ```python
 mcp__LiteratureValidation__suggest_search_queries(
     cell_type="tumor",
@@ -61,67 +46,57 @@ mcp__LiteratureValidation__suggest_search_queries(
     behavior="necrosis"
 )
 ```
+Returns optimized PubMed queries AND suggested bioRxiv categories.
 
-Returns ~5 queries at different specificity levels:
-```
-1. "oxygen hypoxia tumor necrosis cell death"
-2. "hypoxia-induced necrosis cancer cells"
-3. "oxygen tension necrotic core tumor spheroid"
-4. "HIF pathway necrosis solid tumor"
-5. "pO2 threshold tumor cell death mechanism"
-```
-
-### Step 4: Search PubMed
-
-Use the PubMed MCP tools with the suggested queries:
-
+**Step 3: Search PubMed**
 ```python
-search_pubmed("hypoxia-induced necrosis cancer cells", max_results=10)
-# Then for each relevant result:
-get_article_details(pmid="12345678")
-```
-
-### Step 5: Index Papers
-
-Format papers and add to the collection:
-
-```python
-mcp__LiteratureValidation__add_papers_to_collection(
-    name="tumor_oxygen_model",
-    papers=[
-        {
-            "title": "Hypoxia-induced necrosis in solid tumors",
-            "text": "Abstract text or full text content...",
-            "pmid": "12345678",
-            "doi": "10.1234/example",
-            "authors": "Smith et al.",
-            "year": "2023"
-        },
-        {
-            "title": "Another relevant paper",
-            "text": "Abstract text...",
-            "pmid": "23456789"
-        }
-    ]
+mcp__plugin_pubmed_PubMed__search_articles(
+    query="hypoxia-induced necrosis cancer cells",
+    max_results=10
 )
 ```
+Collect PMIDs from the search results.
 
-**Paper dict format**:
-- `title` (str, required) — Paper title
-- `text` (str, required) — Abstract or full text content
-- `pmid` (str, optional) — PubMed ID
-- `doi` (str, optional) — Digital Object Identifier
-- `authors` (str, optional) — Author list
-- `year` (str, optional) — Publication year
+**Step 4: Add papers by PMID with PDF download**
+```python
+mcp__LiteratureValidation__add_papers_by_id(
+    name="tumor_oxygen_model",
+    pmids=["35486828", "33264437", "28558982"],
+    fetch_pdfs=True
+)
+```
+This automatically:
+- Fetches title, abstract, authors, year from NCBI
+- Converts PMIDs to PMCIDs and downloads full PDFs from PubMed Central
+- Falls back to abstract-only text when no PMC version exists (~84% of articles)
+- Indexes everything in PaperQA
 
-### Step 6: Repeat Steps 3-5
+**Step 5 (optional): Search bioRxiv**
+```python
+mcp__plugin_biorxiv_bioRxiv__search_preprints(
+    category="cancer biology",
+    recent_days=90,
+    limit=20
+)
+```
+Note: bioRxiv uses category + date filtering, not keyword search.
 
-Iterate for all rules to build a comprehensive literature base. You can batch queries for efficiency.
+**Step 6 (optional): Add bioRxiv preprints**
+```python
+mcp__LiteratureValidation__add_papers_by_id(
+    name="tumor_oxygen_model",
+    biorxiv_dois=["10.1101/2024.01.15.123456"]
+)
+```
+bioRxiv PDFs are always available (100% success rate).
 
-### Step 7: Validate Rules
+**Repeat** steps 2-6 for each biological relationship you need to investigate.
+
+### Phase 2: Query the Literature
+
+**Step 7: Validate rules**
 
 Validate all rules at once:
-
 ```python
 mcp__LiteratureValidation__validate_rules_batch(
     name="tumor_oxygen_model",
@@ -138,8 +113,7 @@ mcp__LiteratureValidation__validate_rules_batch(
 )
 ```
 
-Or validate one at a time:
-
+Or validate one at a time (useful for iterating on parameter values):
 ```python
 mcp__LiteratureValidation__validate_rule(
     name="tumor_oxygen_model",
@@ -152,16 +126,19 @@ mcp__LiteratureValidation__validate_rule(
 )
 ```
 
-### Step 8: Get Validation Summary
+PaperQA queries the indexed papers and returns:
+- Whether the relationship is supported
+- Evidence summary with citations
+- Whether proposed parameter values are consistent with published data
 
+**Step 8: Get validation summary**
 ```python
 mcp__LiteratureValidation__get_validation_summary("tumor_oxygen_model")
 ```
 
-Returns distribution of support levels and flagged rules.
+### Phase 3: Persist Results in PhysiCell Session
 
-### Step 9: Store Results in PhysiCell Session
-
+**Step 9: Store results**
 ```python
 mcp__PhysiCell__store_validation_results(validations=[
     {
@@ -178,24 +155,33 @@ mcp__PhysiCell__store_validation_results(validations=[
 ])
 ```
 
-**Validation dict fields**:
-- `cell_type` (str, required)
-- `signal` (str, required)
-- `direction` (str, required) — "increases" or "decreases"
-- `behavior` (str, required)
-- `support_level` (str, required) — "strong", "moderate", "weak", "contradictory", "unsupported"
-- `evidence_summary` (str, required) — Summary of literature evidence
-- `suggested_half_max` (float, optional) — Literature-suggested value
-- `suggested_hill_power` (float, optional) — Literature-suggested value
-- `key_citations` (list[str], optional) — Key paper references
-
-### Step 10: Generate Report
-
+**Step 10: Generate report**
 ```python
 mcp__PhysiCell__get_validation_report()
 ```
 
-Returns a markdown report showing each rule's validation status, evidence, and suggestions.
+## Alternative: Add Papers with Metadata
+
+If you already have paper metadata (e.g., from PubMed search results), you can use `add_papers_to_collection` directly:
+
+```python
+mcp__LiteratureValidation__add_papers_to_collection(
+    name="tumor_oxygen_model",
+    papers=[
+        {
+            "title": "Hypoxia-induced necrosis in solid tumors",
+            "text": "Abstract text...",
+            "pmid": "12345678",
+            "doi": "10.1234/example",
+            "authors": "Smith et al.",
+            "year": "2023"
+        }
+    ],
+    fetch_pdfs=True  # Attempt PDF download from PMC/bioRxiv
+)
+```
+
+With `fetch_pdfs=False` (default), only the abstract text is indexed.
 
 ## Support Level Interpretation
 
@@ -219,7 +205,6 @@ Returns a markdown report showing each rule's validation status, evidence, and s
 - Look for additional papers that might strengthen the evidence
 
 ### For `contradictory` support
-- Read the cited papers carefully
 - The contradiction may be context-dependent (different cell type, species, conditions)
 - Consider reversing the direction or removing the rule
 - Document the decision and rationale
@@ -230,75 +215,12 @@ Returns a markdown report showing each rule's validation status, evidence, and s
 - Consider if the relationship is derived from first principles or expert knowledge
 - If keeping, explicitly document it as an assumption
 
-## Worked Example
-
-### Validating "oxygen decreases cancer cell migration"
-
-**Step 1**: Export rules
-```python
-rules = mcp__PhysiCell__get_rules_for_validation()
-# Contains: {"cell_type":"tumor", "signal":"oxygen", "direction":"decreases", "behavior":"migration speed"}
-```
-
-**Step 2**: Create collection
-```python
-mcp__LiteratureValidation__create_paper_collection("tumor_migration")
-```
-
-**Step 3**: Get queries
-```python
-queries = mcp__LiteratureValidation__suggest_search_queries(
-    cell_type="tumor",
-    signal="oxygen",
-    direction="decreases",
-    behavior="migration speed"
-)
-# Returns queries about hypoxia-induced migration, HIF and cell motility, etc.
-```
-
-**Step 4**: Search PubMed and get abstracts
-```python
-results = search_pubmed("hypoxia induced cancer cell migration", max_results=10)
-# Get details for top results
-paper1 = get_article_details(pmid="...")
-paper2 = get_article_details(pmid="...")
-```
-
-**Step 5**: Index papers
-```python
-mcp__LiteratureValidation__add_papers_to_collection("tumor_migration", papers=[
-    {"title": paper1.title, "text": paper1.abstract, "pmid": paper1.pmid},
-    {"title": paper2.title, "text": paper2.abstract, "pmid": paper2.pmid}
-])
-```
-
-**Step 7**: Validate
-```python
-result = mcp__LiteratureValidation__validate_rule(
-    name="tumor_migration",
-    cell_type="tumor",
-    signal="oxygen",
-    direction="decreases",
-    behavior="migration speed"
-)
-# Result: support_level="strong"
-# Evidence: "Multiple studies show hypoxia promotes cancer cell migration via HIF-1α..."
-```
-
-**Step 9**: Store
-```python
-mcp__PhysiCell__store_validation_results(validations=[result])
-```
-
-**Step 10**: Report
-```python
-mcp__PhysiCell__get_validation_report()
-```
-
 ## Tips
 
-1. **Index more papers** for better validation accuracy — PaperQA2 works better with more context
-2. **Include review articles** — they summarize the state of knowledge
-3. **Search for both supporting and contradicting evidence** — use queries like "oxygen does NOT affect migration"
-4. **Validate early** — it's easier to change rules before the simulation is tuned
-5. **Keep collections organized** — one collection per model or biological question
+1. **Use `add_papers_by_id` with `fetch_pdfs=True`** — PDFs contain far more information than abstracts alone
+2. **Index 5-10+ papers per rule** for better validation accuracy — PaperQA2 works better with more context
+3. **Include review articles** — they summarize the state of knowledge
+4. **Search for both supporting and contradicting evidence** — use queries like "oxygen does NOT affect migration"
+5. **Validate early** — it's easier to change rules before the simulation is tuned
+6. **Keep collections organized** — one collection per model or biological question
+7. **Combine PubMed and bioRxiv** — bioRxiv has the latest research (preprints), PubMed has peer-reviewed articles
