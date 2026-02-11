@@ -20,11 +20,14 @@ and a PubMed MCP server to:
 """
 
 import os
+import re
 import json
 import hashlib
 from pathlib import Path
 from typing import Any, Optional
 from dataclasses import dataclass, field
+
+import httpx
 
 from mcp.server.fastmcp import FastMCP
 
@@ -100,6 +103,79 @@ async def _get_or_create_docs(name: str) -> "Docs":
     docs = Docs()
     _collections[name] = docs
     return docs
+
+
+async def _pmid_to_pmcid(pmid: str) -> str | None:
+    """Convert a PubMed ID to a PMC ID using the NCBI ID converter API.
+
+    Returns the PMCID string (e.g. 'PMC9046468') or None if no PMC version exists.
+    """
+    url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={pmid}&format=json"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+            records = data.get("records", [])
+            if records and "pmcid" in records[0]:
+                return records[0]["pmcid"]
+    except Exception:
+        pass
+    return None
+
+
+async def _download_pdf(url: str, dest: Path) -> bool:
+    """Download a PDF from a URL to a local file path.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            content = resp.content
+            if len(content) < 1000:
+                # Too small to be a real PDF
+                return False
+            dest.write_bytes(content)
+            return True
+    except Exception:
+        return False
+
+
+async def _try_fetch_pdf(paper: dict, papers_path: Path) -> Path | None:
+    """Attempt to fetch a full PDF for a paper.
+
+    Tries bioRxiv direct download first, then PMC for PubMed papers.
+    Returns the PDF file path on success, None on failure.
+    """
+    title = paper.get("title", "unknown")
+    safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
+    pdf_path = papers_path / f"{safe_name}.pdf"
+
+    # Already downloaded
+    if pdf_path.exists() and pdf_path.stat().st_size > 1000:
+        return pdf_path
+
+    # 1. bioRxiv DOI (explicit field or DOI with 10.1101/ prefix)
+    biorxiv_doi = paper.get("biorxiv_doi")
+    doi = paper.get("doi", "")
+    if biorxiv_doi or (doi and doi.startswith("10.1101/")):
+        biorxiv_doi = biorxiv_doi or doi
+        pdf_url = f"https://www.biorxiv.org/content/{biorxiv_doi}v1.full.pdf"
+        if await _download_pdf(pdf_url, pdf_path):
+            return pdf_path
+
+    # 2. PubMed → PMC PDF
+    pmid = paper.get("pmid")
+    if pmid:
+        pmcid = await _pmid_to_pmcid(pmid)
+        if pmcid:
+            pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
+            if await _download_pdf(pdf_url, pdf_path):
+                return pdf_path
+
+    return None
 
 
 def _build_validation_question(cell_type: str, signal: str, direction: str,
@@ -184,8 +260,9 @@ mcp = FastMCP(
     instructions=(
         "Literature validation server for PhysiCell cell rules. "
         "Uses PaperQA2 to validate rules against published biomedical literature. "
-        "Workflow: create_paper_collection → add_papers_to_collection → "
-        "validate_rule/validate_rules_batch → get_validation_summary."
+        "Workflow: create_paper_collection → add_papers_to_collection (with fetch_pdfs=True) "
+        "or add_papers_by_id → validate_rule/validate_rules_batch → get_validation_summary. "
+        "Supports full PDF indexing from PubMed Central and bioRxiv."
     ),
 )
 
@@ -248,6 +325,7 @@ def create_paper_collection(name: str) -> str:
 async def add_papers_to_collection(
     name: str,
     papers: list[dict[str, str]],
+    fetch_pdfs: bool = False,
 ) -> str:
     """
     Add papers (abstracts or full text) to a collection for indexing by PaperQA.
@@ -257,12 +335,15 @@ async def add_papers_to_collection(
     - "text": Abstract or full text content
     - "pmid" (optional): PubMed ID
     - "doi" (optional): DOI
+    - "biorxiv_doi" (optional): bioRxiv DOI for direct PDF download
     - "authors" (optional): Author list string
     - "year" (optional): Publication year
 
     Args:
         name: Collection name (must exist)
         papers: List of paper dicts with at minimum "title" and "text"
+        fetch_pdfs: If True, attempt to download full PDFs from PMC/bioRxiv
+                    before falling back to text-only indexing (default: False)
 
     Returns:
         str: Summary of papers added and indexed
@@ -285,6 +366,8 @@ async def add_papers_to_collection(
         return f"**Error:** {e}"
 
     added_count = 0
+    pdf_count = 0
+    txt_count = 0
     errors = []
 
     for paper in papers:
@@ -295,25 +378,40 @@ async def add_papers_to_collection(
             errors.append(f"Skipped paper with missing title or text")
             continue
 
-        # Build metadata header
-        meta_lines = [f"Title: {title}"]
-        if paper.get("authors"):
-            meta_lines.append(f"Authors: {paper['authors']}")
-        if paper.get("year"):
-            meta_lines.append(f"Year: {paper['year']}")
-        if paper.get("pmid"):
-            meta_lines.append(f"PMID: {paper['pmid']}")
-        if paper.get("doi"):
-            meta_lines.append(f"DOI: {paper['doi']}")
-        meta_lines.append("")  # blank line before content
-        meta_lines.append(text)
+        paper_file = None
+        used_pdf = False
 
-        full_text = "\n".join(meta_lines)
+        # Try PDF download if requested
+        if fetch_pdfs:
+            try:
+                pdf_path = await _try_fetch_pdf(paper, papers_path)
+                if pdf_path:
+                    paper_file = pdf_path
+                    used_pdf = True
+            except Exception:
+                pass  # Fall through to text
 
-        # Write paper to file for PaperQA
-        safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
-        paper_file = papers_path / f"{safe_name}.txt"
-        paper_file.write_text(full_text, encoding="utf-8")
+        # Fall back to text file
+        if paper_file is None:
+            meta_lines = [f"Title: {title}"]
+            if paper.get("authors"):
+                meta_lines.append(f"Authors: {paper['authors']}")
+            if paper.get("year"):
+                meta_lines.append(f"Year: {paper['year']}")
+            if paper.get("pmid"):
+                meta_lines.append(f"PMID: {paper['pmid']}")
+            if paper.get("doi"):
+                meta_lines.append(f"DOI: {paper['doi']}")
+            if paper.get("biorxiv_doi"):
+                meta_lines.append(f"DOI: {paper['biorxiv_doi']}")
+            meta_lines.append("")  # blank line before content
+            meta_lines.append(text)
+
+            full_text = "\n".join(meta_lines)
+
+            safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
+            paper_file = papers_path / f"{safe_name}.txt"
+            paper_file.write_text(full_text, encoding="utf-8")
 
         # Add to PaperQA Docs
         try:
@@ -323,11 +421,17 @@ async def add_papers_to_collection(
                 docname=title[:80],
             )
             added_count += 1
+            if used_pdf:
+                pdf_count += 1
+            else:
+                txt_count += 1
         except Exception as e:
             errors.append(f"Failed to index '{title[:40]}...': {e}")
 
     result = f"## Papers Added to `{name}`\n\n"
     result += f"**Indexed:** {added_count} / {len(papers)} papers\n"
+    if fetch_pdfs:
+        result += f"**PDFs:** {pdf_count} | **Text-only:** {txt_count}\n"
     result += f"**Papers directory:** `{papers_path}`\n"
 
     if errors:
@@ -336,6 +440,278 @@ async def add_papers_to_collection(
             result += f"- {err}\n"
         if len(errors) > 5:
             result += f"- ... and {len(errors) - 5} more\n"
+
+    result += (
+        f"\n**Next step:** Use `validate_rule()` or `validate_rules_batch()` "
+        f"to check rules against this literature."
+    )
+    return result
+
+
+@mcp.tool()
+async def add_papers_by_id(
+    name: str,
+    pmids: list[str] | None = None,
+    biorxiv_dois: list[str] | None = None,
+    fetch_pdfs: bool = True,
+) -> str:
+    """
+    Add papers by PubMed ID or bioRxiv DOI to a collection.
+
+    Automatically fetches metadata (title, abstract) and optionally full PDFs.
+    For PubMed papers, PDFs are fetched from PubMed Central when available.
+    For bioRxiv preprints, PDFs are always available and fetched by default.
+
+    Args:
+        name: Collection name (must exist)
+        pmids: List of PubMed IDs (e.g., ["35486828", "33264437"])
+        biorxiv_dois: List of bioRxiv DOIs (e.g., ["10.1101/2024.01.15.123456"])
+        fetch_pdfs: If True, download full PDFs when available (default: True)
+
+    Returns:
+        str: Summary of papers added
+    """
+    if not PAPERQA_AVAILABLE:
+        return "**Error:** paper-qa is not installed."
+
+    name = name.strip().lower().replace(" ", "_")
+    papers_path = _papers_dir(name)
+    if not papers_path.exists():
+        return f"**Error:** Collection `{name}` does not exist. Create it first with `create_paper_collection()`."
+
+    if not pmids and not biorxiv_dois:
+        return "**Error:** Provide at least one PMID or bioRxiv DOI."
+
+    try:
+        docs = await _get_or_create_docs(name)
+    except RuntimeError as e:
+        return f"**Error:** {e}"
+
+    added_count = 0
+    pdf_count = 0
+    txt_count = 0
+    errors = []
+
+    # Process PubMed IDs
+    if pmids:
+        # Fetch metadata from NCBI E-utilities efetch
+        ids_str = ",".join(pmids)
+        efetch_url = (
+            f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            f"?db=pubmed&id={ids_str}&rettype=xml&retmode=xml"
+        )
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+                resp = await client.get(efetch_url)
+                resp.raise_for_status()
+                xml_text = resp.text
+        except Exception as e:
+            errors.append(f"Failed to fetch PubMed metadata: {e}")
+            xml_text = ""
+
+        if xml_text:
+            # Simple XML parsing for title, abstract, PMID
+            # Split into individual articles
+            articles = re.findall(
+                r"<PubmedArticle>(.*?)</PubmedArticle>", xml_text, re.DOTALL
+            )
+            for article_xml in articles:
+                pmid_match = re.search(r"<PMID[^>]*>(\d+)</PMID>", article_xml)
+                title_match = re.search(
+                    r"<ArticleTitle>(.*?)</ArticleTitle>", article_xml, re.DOTALL
+                )
+                # Abstract may have multiple AbstractText elements
+                abstract_parts = re.findall(
+                    r"<AbstractText[^>]*>(.*?)</AbstractText>", article_xml, re.DOTALL
+                )
+
+                pmid = pmid_match.group(1) if pmid_match else "unknown"
+                title = title_match.group(1).strip() if title_match else f"PMID:{pmid}"
+                # Strip any remaining XML tags from title
+                title = re.sub(r"<[^>]+>", "", title)
+                abstract = " ".join(
+                    re.sub(r"<[^>]+>", "", part).strip() for part in abstract_parts
+                )
+
+                if not abstract:
+                    errors.append(f"PMID {pmid}: No abstract available")
+                    continue
+
+                # Extract DOI if present
+                doi_match = re.search(
+                    r'<ArticleId IdType="doi">([^<]+)</ArticleId>', article_xml
+                )
+                doi = doi_match.group(1) if doi_match else ""
+
+                # Extract authors
+                author_parts = re.findall(
+                    r"<LastName>([^<]+)</LastName>\s*<ForeName>([^<]+)</ForeName>",
+                    article_xml,
+                )
+                authors = ", ".join(f"{ln} {fn}" for ln, fn in author_parts[:5])
+                if len(author_parts) > 5:
+                    authors += " et al."
+
+                # Extract year
+                year_match = re.search(
+                    r"<PubDate>\s*<Year>(\d{4})</Year>", article_xml
+                )
+                year = year_match.group(1) if year_match else ""
+
+                paper = {
+                    "title": title,
+                    "text": abstract,
+                    "pmid": pmid,
+                    "doi": doi,
+                    "authors": authors,
+                    "year": year,
+                }
+
+                paper_file = None
+                used_pdf = False
+
+                if fetch_pdfs:
+                    try:
+                        pdf_path = await _try_fetch_pdf(paper, papers_path)
+                        if pdf_path:
+                            paper_file = pdf_path
+                            used_pdf = True
+                    except Exception:
+                        pass
+
+                # Fall back to text
+                if paper_file is None:
+                    meta_lines = [f"Title: {title}"]
+                    if authors:
+                        meta_lines.append(f"Authors: {authors}")
+                    if year:
+                        meta_lines.append(f"Year: {year}")
+                    meta_lines.append(f"PMID: {pmid}")
+                    if doi:
+                        meta_lines.append(f"DOI: {doi}")
+                    meta_lines.append("")
+                    meta_lines.append(abstract)
+
+                    safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
+                    paper_file = papers_path / f"{safe_name}.txt"
+                    paper_file.write_text("\n".join(meta_lines), encoding="utf-8")
+
+                try:
+                    await docs.aadd(
+                        paper_file,
+                        citation=title,
+                        docname=title[:80],
+                    )
+                    added_count += 1
+                    if used_pdf:
+                        pdf_count += 1
+                    else:
+                        txt_count += 1
+                except Exception as e:
+                    errors.append(f"Failed to index PMID {pmid}: {e}")
+
+    # Process bioRxiv DOIs
+    if biorxiv_dois:
+        for biorxiv_doi in biorxiv_dois:
+            # Normalize DOI
+            biorxiv_doi = biorxiv_doi.strip()
+            if biorxiv_doi.startswith("https://doi.org/"):
+                biorxiv_doi = biorxiv_doi[len("https://doi.org/"):]
+
+            # Fetch metadata from bioRxiv API
+            api_url = f"https://api.biorxiv.org/details/biorxiv/{biorxiv_doi}"
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+                    resp = await client.get(api_url)
+                    resp.raise_for_status()
+                    data = resp.json()
+            except Exception as e:
+                errors.append(f"bioRxiv {biorxiv_doi}: Failed to fetch metadata: {e}")
+                continue
+
+            collection = data.get("collection", [])
+            if not collection:
+                errors.append(f"bioRxiv {biorxiv_doi}: No metadata found")
+                continue
+
+            # Use the latest version
+            entry = collection[-1]
+            title = entry.get("title", f"bioRxiv:{biorxiv_doi}")
+            abstract = entry.get("abstract", "")
+            authors = entry.get("authors", "")
+            date = entry.get("date", "")
+            year = date[:4] if date else ""
+            version = entry.get("version", "1")
+
+            if not abstract:
+                errors.append(f"bioRxiv {biorxiv_doi}: No abstract available")
+                continue
+
+            paper = {
+                "title": title,
+                "text": abstract,
+                "biorxiv_doi": biorxiv_doi,
+                "doi": biorxiv_doi,
+                "authors": authors,
+                "year": year,
+            }
+
+            paper_file = None
+            used_pdf = False
+
+            if fetch_pdfs:
+                # bioRxiv PDFs use the version number
+                safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
+                pdf_path = papers_path / f"{safe_name}.pdf"
+                pdf_url = f"https://www.biorxiv.org/content/{biorxiv_doi}v{version}.full.pdf"
+                try:
+                    if await _download_pdf(pdf_url, pdf_path):
+                        paper_file = pdf_path
+                        used_pdf = True
+                except Exception:
+                    pass
+
+            # Fall back to text
+            if paper_file is None:
+                meta_lines = [f"Title: {title}"]
+                if authors:
+                    meta_lines.append(f"Authors: {authors}")
+                if year:
+                    meta_lines.append(f"Year: {year}")
+                meta_lines.append(f"DOI: {biorxiv_doi}")
+                meta_lines.append("")
+                meta_lines.append(abstract)
+
+                safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
+                paper_file = papers_path / f"{safe_name}.txt"
+                paper_file.write_text("\n".join(meta_lines), encoding="utf-8")
+
+            try:
+                await docs.aadd(
+                    paper_file,
+                    citation=title,
+                    docname=title[:80],
+                )
+                added_count += 1
+                if used_pdf:
+                    pdf_count += 1
+                else:
+                    txt_count += 1
+            except Exception as e:
+                errors.append(f"Failed to index bioRxiv {biorxiv_doi}: {e}")
+
+    total_requested = len(pmids or []) + len(biorxiv_dois or [])
+    result = f"## Papers Added to `{name}`\n\n"
+    result += f"**Indexed:** {added_count} / {total_requested} papers\n"
+    result += f"**PDFs:** {pdf_count} | **Text-only:** {txt_count}\n"
+    result += f"**Papers directory:** `{papers_path}`\n"
+
+    if errors:
+        result += f"\n**Warnings:**\n"
+        for err in errors[:10]:
+            result += f"- {err}\n"
+        if len(errors) > 10:
+            result += f"- ... and {len(errors) - 10} more\n"
 
     result += (
         f"\n**Next step:** Use `validate_rule()` or `validate_rules_batch()` "
@@ -393,7 +769,7 @@ async def validate_rule(
 
     # Check that the collection has papers
     papers_path = _papers_dir(name)
-    paper_files = list(papers_path.glob("*.txt"))
+    paper_files = list(papers_path.glob("*.txt")) + list(papers_path.glob("*.pdf"))
     if not paper_files:
         return (
             f"**Error:** Collection `{name}` has no papers indexed.\n"
@@ -674,9 +1050,57 @@ def suggest_search_queries(
 
     result += (
         "**Usage:** Pass these queries to the PubMed MCP server's "
-        "`search_pubmed()` tool, then add the returned abstracts to "
-        "this collection with `add_papers_to_collection()`."
+        "`search_articles()` tool, then add the returned papers to "
+        "this collection with `add_papers_to_collection(fetch_pdfs=True)` "
+        "or `add_papers_by_id()` with their PMIDs.\n"
     )
+
+    # bioRxiv category suggestions
+    biorxiv_categories: dict[str, list[str]] = {
+        "cancer": ["cancer biology", "cell biology"],
+        "tumor": ["cancer biology", "cell biology"],
+        "macrophage": ["immunology", "cell biology"],
+        "T cell": ["immunology"],
+        "immune": ["immunology"],
+        "fibroblast": ["cell biology", "cancer biology"],
+        "endothelial": ["cell biology", "physiology"],
+        "epithelial": ["cell biology", "developmental biology"],
+        "neuron": ["neuroscience"],
+        "stem cell": ["developmental biology", "cell biology"],
+    }
+    signal_categories: dict[str, list[str]] = {
+        "oxygen": ["cell biology", "physiology", "cancer biology"],
+        "glucose": ["cell biology", "biochemistry"],
+        "VEGF": ["cancer biology", "cell biology"],
+        "TNF": ["immunology", "cell biology"],
+        "TGF-beta": ["cancer biology", "cell biology", "developmental biology"],
+        "IFN-gamma": ["immunology"],
+    }
+
+    # Collect relevant categories
+    categories: set[str] = set()
+    for key, cats in biorxiv_categories.items():
+        if key.lower() in cell_type.lower():
+            categories.update(cats)
+    for key, cats in signal_categories.items():
+        if key.lower() in signal.lower():
+            categories.update(cats)
+    if not categories:
+        categories = {"cell biology"}
+
+    result += "\n### bioRxiv Preprint Search\n\n"
+    result += (
+        "The bioRxiv MCP server uses **category + date range** filtering "
+        "(no keyword search). Suggested categories:\n"
+    )
+    for cat in sorted(categories):
+        result += f"- `{cat}`\n"
+    result += (
+        "\nUse `search_preprints(category=\"...\", recent_days=90)` from the "
+        "bioRxiv MCP server to find recent preprints, then add them with "
+        "`add_papers_by_id(biorxiv_dois=[...])`."
+    )
+
     return result
 
 
