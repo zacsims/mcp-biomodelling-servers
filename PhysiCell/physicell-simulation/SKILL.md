@@ -24,7 +24,7 @@ If you detect a problem (like "from 0 towards 0"), fix it by calling the appropr
 
 ## ABSOLUTE RULE 2: Literature Research Uses the LiteratureValidation MCP
 
-When the user asks to base parameters on literature, determine values from published data, or validate rules against papers, you MUST use the LiteratureValidation MCP server (`mcp__LiteratureValidation__*` tools). Do NOT manually read papers/abstracts in context and extract values yourself.
+When the user asks to base parameters on literature, determine values from published data, or validate rules against papers, you MUST use the LiteratureValidation MCP server (`mcp__LiteratureValidation__*` tools) **directly from the main conversation**. Do NOT manually read papers/abstracts in context and extract values yourself.
 
 **NEVER use these tools for literature research or parameter extraction:**
 - `WebSearch` / `WebFetch` — NEVER use web search to find biological parameters or read papers. Web search results are unreliable, unverifiable, and waste context. Use the PubMed and bioRxiv MCP servers instead. **If the PubMed MCP is unavailable (failed to load), use WebSearch ONLY to collect PMIDs, then immediately pass them to `add_papers_by_id()`. Do NOT extract parameters from web search results.**
@@ -41,6 +41,17 @@ When the user asks to base parameters on literature, determine values from publi
 6. Review: `mcp__LiteratureValidation__get_validation_summary("model_name")`
 
 PaperQA indexes full PDFs (from PubMed Central, 68+ publishers, and preprint servers) and uses RAG to extract quantitative parameters — far more accurate than web search or reading abstracts. Use `search_articles` ONLY to find PMIDs, then hand them to `add_papers_by_id`. See Section 7 for the full workflow.
+
+## ABSOLUTE RULE 3: No Background Agents for Literature Research
+
+**NEVER delegate literature research to a background agent or subagent (Task tool).** Subagents do NOT have access to MCP tools (LiteratureValidation, PubMed, bioRxiv). If you launch a subagent for literature, it will fall back to WebSearch and extract unreliable parameters.
+
+**NEVER proceed with simulation setup while literature research is pending.** Literature must complete FIRST because parameters depend on the results. Do NOT set up cell types, rules, or parameters until literature-derived values are available.
+
+The correct approach is:
+1. Complete ALL literature research in the main conversation using MCP tools (Section 7)
+2. Extract parameter values from PaperQA validation results
+3. THEN proceed with simulation setup using those values
 
 ## 1. Mandatory Tool Ordering
 
