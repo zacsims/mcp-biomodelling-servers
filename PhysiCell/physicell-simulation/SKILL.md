@@ -93,61 +93,47 @@ For each rule you plan to add, check:
 2. **What is its XML default value?** This depends on what was set via `configure_cell_parameters` or the cell type template.
 3. **Is the default nonzero?**
 
-| Behavior | Default from template | Safe to use as-is? |
+| Behavior | Default | Setter tool |
 |---|---|---|
-| cycle entry | Depends on cycle model (Ki67_basic ≈ 0.00072) | Usually yes |
-| apoptosis | Set by `apoptosis_rate` in `configure_cell_parameters` | Yes if configured |
-| necrosis | Set by `necrosis_rate` in `configure_cell_parameters` | Yes if configured |
-| migration speed | Set by `motility_speed` in `configure_cell_parameters` | Yes if configured |
-| exit from cycle phase 0 | Template default, often 0 | DANGER — check first |
-| transition to X / transform to X | 0 unless explicitly set | DANGER — see below |
-| X secretion / X uptake | 0 unless set via `set_substrate_interaction` | DANGER — set first |
+| cycle entry | Depends on cycle model (Ki67_basic ≈ 0.00072) | Usually safe as-is |
+| apoptosis / necrosis | Set via `configure_cell_parameters` | `apoptosis_rate`, `necrosis_rate` |
+| migration speed / persistence | Set via `configure_cell_parameters` | `motility_speed`, `persistence_time` |
+| X secretion / X uptake | 0 | `set_substrate_interaction()` |
+| transition to X | 0 | `set_cell_transformation_rate()` |
+| attack X / phagocytose X / fuse to X | 0 | `set_cell_interaction()` |
+| phagocytose apoptotic/necrotic/other dead cell | 0 | `configure_cell_interactions()` |
+| cell attachment rate / cell detachment rate | 0 | `configure_cell_mechanics()` |
+| damage rate / damage repair rate | 0 | `configure_cell_integrity()` |
+| exit from cycle phase N | Often 0 | No setter — use nonzero `min_signal` |
+| custom behaviors | 0 | No setter — use nonzero `min_signal` |
 
-**If the XML default is 0, you MUST set a nonzero rate BEFORE adding the rule using MCP tools:**
+**If the XML default is 0, you MUST set a nonzero rate BEFORE adding the rule.** The server validates rules and rejects "from 0 towards 0" with a specific error message guiding you to the correct setter tool.
+
+**Examples — setting nonzero defaults before rules:**
 
 ```
-# For death rates, motility, volume:
+# Death rates, motility, volume:
 configure_cell_parameters(cell_type="tumor", apoptosis_rate=0.001, necrosis_rate=0.00277, motility_speed=0.5)
 
-# For secretion/uptake:
+# Secretion/uptake:
 set_substrate_interaction(cell_type="tumor", substrate="chemokine", secretion_rate=0.1)
+
+# Cell transformation:
+set_cell_transformation_rate(cell_type="tumor", target_cell_type="motile_tumor", rate=0.001)
+
+# Per-cell-type interactions (attack, phagocytose live, fuse):
+set_cell_interaction(cell_type="macrophage", target_cell_type="tumor", interaction_type="attack", rate=0.1)
+set_cell_interaction(cell_type="macrophage", target_cell_type="tumor", interaction_type="phagocytose", rate=0.01)
+
+# Dead-cell phagocytosis:
+configure_cell_interactions(cell_type="macrophage", apoptotic_phagocytosis_rate=0.01, necrotic_phagocytosis_rate=0.01)
+
+# Attachment/detachment:
+configure_cell_mechanics(cell_type="tumor", attachment_rate=0.01, detachment_rate=0.001)
+
+# Damage/repair:
+configure_cell_integrity(cell_type="tumor", damage_rate=0.001, damage_repair_rate=0.0001)
 ```
-
-### Behaviors NOT settable via current MCP tools
-
-The following behaviors have XML defaults of 0 and **cannot** be set to nonzero via existing MCP tools:
-- `transition to <cell_type>` / `transform to <cell_type>` (cell type transformation rates)
-- `exit from cycle phase N` (individual phase transition rates)
-- Custom behaviors
-
-**For these behaviors, use the `min_signal` parameter as the nonzero endpoint instead of relying on the XML default.** The `min_signal` parameter maps to `base_value` in the CSV — this is one end of the Hill function interpolation. Set it to the desired nonzero rate:
-
-```
-# WRONG — "from 0 towards 0" because XML default transformation rate = 0:
-add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="decreases",
-    behavior="transition to motile_tumor", min_signal=0, half_max=5, hill_power=4)
-
-# CORRECT — set min_signal to the desired transformation rate:
-add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="decreases",
-    behavior="transition to motile_tumor", min_signal=0.001, half_max=5, hill_power=4)
-# Result: at high O2 → rate = 0.001 (base_value); at low O2 → rate approaches 0 (XML default)
-# NOTE: for "decreases", base_value is the HIGH-signal end, saturation (XML) is the LOW-signal end.
-# So this gives LESS transformation at low oxygen — which may be backwards from intent.
-```
-
-**If the rule direction makes the nonzero endpoint land on the wrong end of the signal range, swap the direction and adjust:**
-
-```
-# Want: low oxygen → MORE transformation (rate=0.001), high oxygen → NO transformation (rate=0)
-# Use "increases" with min_signal=0.001 — even though it sounds backwards:
-add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="increases",
-    behavior="transition to motile_tumor", min_signal=0.001, half_max=5, hill_power=4)
-# At low O2 (signal≈0): rate = base_value = 0.001 (cells transform) ✓
-# At high O2 (signal≈38): rate → saturation (XML default) = 0 (no transformation) ✓
-# The Hill function: rate = 0.001 + (0 - 0.001) × H(signal) = 0.001 × (1 - H(signal))
-```
-
-**If neither approach gives the right behavior, inform the user** that transformation rates require a future MCP tool enhancement, rather than editing the XML directly.
 
 ### Worked Example: Oxygen → Necrosis
 
