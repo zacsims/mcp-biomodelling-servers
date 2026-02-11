@@ -16,27 +16,31 @@ This server answers that question by:
 
 ### Architecture: LLM-Orchestrated Multi-Server Workflow
 
-The Literature Validation server does not work alone. It is one part of a three-server system orchestrated by the LLM:
+The Literature Validation server does not work alone. It is one part of a four-server system orchestrated by the LLM:
 
 ```
 LLM (Claude)
   |
-  |-- PhysiCell MCP -------- get_rules_for_validation()
-  |                          store_validation_results()
-  |                          get_validation_report()
+  |-- PhysiCell MCP ---------- get_rules_for_validation()
+  |                            store_validation_results()
+  |                            get_validation_report()
   |
-  |-- PubMed MCP ----------- search_pubmed()
-  |                          get_article_details()
+  |-- PubMed MCP ------------- search_pubmed()
+  |                            get_article_details()
   |
-  |-- LiteratureValidation -- suggest_search_queries()
-       MCP (this server)      create_paper_collection()
-                              add_papers_to_collection()
-                              validate_rule()
-                              validate_rules_batch()
-                              get_validation_summary()
+  |-- bioRxiv MCP ------------ search_preprints()
+  |                            get_preprint_details()
+  |
+  |-- LiteratureValidation --- suggest_search_queries()
+       MCP (this server)       create_paper_collection()
+                               add_papers_to_collection()
+                               add_papers_by_id()
+                               validate_rule()
+                               validate_rules_batch()
+                               get_validation_summary()
 ```
 
-The LLM reads rules from the PhysiCell session, searches PubMed for evidence, indexes papers here, runs validation queries, and stores results back in the PhysiCell session. No server-to-server communication is needed — the LLM handles all coordination.
+The LLM reads rules from the PhysiCell session, searches PubMed and bioRxiv for evidence, indexes papers here (with full PDF download when available), runs validation queries, and stores results back in the PhysiCell session. No server-to-server communication is needed — the LLM handles all coordination.
 
 ### Why a Separate Server?
 
@@ -54,9 +58,9 @@ Output: Collection created with papers directory at
         ~/Documents/LiteratureValidation/hypoxia_migration/papers/
 ```
 
-#### `add_papers_to_collection(name, papers)`
+#### `add_papers_to_collection(name, papers, fetch_pdfs=False)`
 
-Indexes papers into a collection. Each paper is a dict with `title` and `text` (abstract or full text), plus optional metadata (`pmid`, `doi`, `authors`, `year`). Papers are written as text files and indexed by PaperQA for semantic search.
+Indexes papers into a collection. Each paper is a dict with `title` and `text` (abstract or full text), plus optional metadata (`pmid`, `doi`, `biorxiv_doi`, `authors`, `year`). When `fetch_pdfs=True`, attempts to download full PDFs before falling back to text-only indexing.
 
 ```
 Input:  name = "hypoxia_migration"
@@ -65,10 +69,27 @@ Input:  name = "hypoxia_migration"
            "text": "Abstract text here...",
            "pmid": "12345678", "year": "2020"}
         ]
-Output: 1 / 1 papers indexed
+        fetch_pdfs = True
+Output: 1 / 1 papers indexed (PDFs: 1 | Text-only: 0)
 ```
 
 The typical workflow is: search PubMed via a PubMed MCP server, collect abstracts, then pass them here for indexing.
+
+#### `add_papers_by_id(name, pmids=None, biorxiv_dois=None, fetch_pdfs=True)`
+
+Streamlined tool for adding papers when you already have PubMed IDs or bioRxiv DOIs. Automatically fetches metadata (title, abstract) and downloads full PDFs when available.
+
+PDF discovery uses a three-layer strategy:
+1. **bioRxiv direct download** — always available for bioRxiv preprints
+2. **metapub FindIt** — publisher-specific strategies for 68+ publishers (Elsevier, Wiley, Springer, Nature, PLOS, BMC, PMC, etc.)
+3. **Unpaywall** — finds preprints (arXiv, bioRxiv, medRxiv) and green OA copies of paywalled papers
+
+```
+Input:  name = "hypoxia_migration"
+        pmids = ["35486828", "33264437", "28400552"]
+        fetch_pdfs = True
+Output: 3 / 3 papers indexed (PDFs: 2 | Text-only: 1)
+```
 
 #### `suggest_search_queries(cell_type, signal, direction, behavior)`
 
@@ -154,13 +175,18 @@ LitValidation:  suggest_search_queries("cancer", "oxygen",
                   "decreases", "migration_speed")
                 → Returns 5 PubMed query strings
 
-# Step 4: Search PubMed for papers
+# Step 4: Search PubMed and bioRxiv for papers
 PubMed MCP:     search_pubmed("cancer cells oxygen decreases migration")
                 get_article_details(pmid_list)
                 → Returns titles, abstracts, metadata
+bioRxiv MCP:    search_preprints(category="cancer biology", recent_days=90)
+                → Returns preprint DOIs
 
-# Step 5: Index papers into the collection
-LitValidation:  add_papers_to_collection("tumor_model_v1", papers)
+# Step 5: Index papers into the collection (with full PDF download)
+LitValidation:  add_papers_by_id("tumor_model_v1",
+                  pmids=["12345678", ...],
+                  biorxiv_dois=["10.1101/2024.01.15.123456", ...],
+                  fetch_pdfs=True)
 
 # Step 6: Repeat steps 3-5 for each rule to build the literature base
 
@@ -212,11 +238,11 @@ The LLM would:
 
 - **Python 3.11+** — Required by PaperQA2
 - **[uv](https://docs.astral.sh/uv/)** — Python package manager
-- **ANTHROPIC_API_KEY** — PaperQA uses Claude via litellm for question answering
+- **OPENAI_API_KEY** — PaperQA uses OpenAI models via litellm for question answering
 
 ```bash
-# Set your Anthropic API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+# Set your OpenAI API key
+export OPENAI_API_KEY="sk-proj-..."
 ```
 
 #### Install Dependencies
@@ -258,7 +284,7 @@ Add to your Claude Desktop configuration:
         "/absolute/path/to/mcp-biomodelling-servers/LiteratureValidation/server.py"
       ],
       "env": {
-        "ANTHROPIC_API_KEY": "sk-ant-..."
+        "OPENAI_API_KEY": "sk-proj-..."
       }
     }
   }
@@ -277,20 +303,17 @@ or call `suggest_search_queries()` with a test rule to confirm the server is res
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `ANTHROPIC_API_KEY` | *(required)* | API key for Claude (used by PaperQA via litellm) |
+| `OPENAI_API_KEY` | *(required)* | API key for OpenAI (used by PaperQA via litellm) |
 | `LITERATURE_VALIDATION_DIR` | `~/Documents/LiteratureValidation` | Root directory for paper collections |
 
 ### PaperQA2 Configuration
 
 The server configures PaperQA with:
 
-- **LLM**: `claude-sonnet-4-20250514` via litellm (main reasoning)
-- **Summary LLM**: `claude-haiku-4-5-20251001` via litellm (document summarization)
+- **LLM**: `gpt-4o` via litellm (main reasoning)
+- **Summary LLM**: `gpt-4o-mini` via litellm (document summarization)
 - **Embeddings**: `text-embedding-3-small` via litellm
-- **Chunk size**: 3000 characters with 300-character overlap
 - **Evidence retrieval**: Top 10 chunks, max 5 sources per answer
-
-These settings are tuned for biomedical abstracts. For full-text papers, you may want to adjust chunk sizes.
 
 ### File Storage
 
@@ -300,14 +323,15 @@ Papers and collections are stored under `LITERATURE_VALIDATION_DIR`:
 ~/Documents/LiteratureValidation/
   hypoxia_migration/
     papers/
-      a1b2c3d4e5f6.txt    # Indexed paper (MD5 hash of title)
+      a1b2c3d4e5f6.pdf    # Full PDF (when available)
+      b2c3d4e5f6a1.txt    # Abstract text (fallback)
       ...
   tumor_immune/
     papers/
       ...
 ```
 
-Each paper file contains metadata headers (title, authors, year, PMID, DOI) followed by the abstract or full text content.
+PDF files are downloaded from PubMed Central, publisher sites (via metapub), or preprint repositories (via Unpaywall). Text files contain metadata headers (title, authors, year, PMID, DOI) followed by the abstract.
 
 ### Dependencies
 
@@ -315,7 +339,11 @@ Each paper file contains metadata headers (title, authors, year, PMID, DOI) foll
 |---------|---------|-----------|
 | `fastmcp` | MCP server framework | Yes |
 | `paper-qa` | RAG-based question answering over scientific literature | Yes |
-| `httpx` | HTTP client (used by paper-qa) | Yes |
+| `httpx` | Async HTTP client for API calls | Yes |
+| `metapub` | PDF discovery across 68+ publishers via FindIt | Yes |
+| `pypdf[image]` | PDF parsing with image extraction support | Yes |
+| `setuptools` | Runtime dependency for metapub/eutils | Yes |
+| `coredis` | Redis client (paper-qa dependency) | Yes |
 
 ### Integration with PhysiCell MCP
 
