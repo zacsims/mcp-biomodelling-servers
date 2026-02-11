@@ -310,7 +310,7 @@ Rules flagged `unsupported` or `contradictory` should be reviewed. Validation ma
 ## 8. Post-Simulation Checklist
 
 After `run_simulation()`:
-1. Poll `get_simulation_status()` until complete
+1. Poll `get_simulation_status()` **every 60 seconds** until complete or failed
 2. Call `generate_simulation_gif()` to visualize
 3. Call `get_simulation_output_files()` to list outputs
 4. Verify cell counts are changing over time (not static)
