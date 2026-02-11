@@ -3544,7 +3544,7 @@ def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
         result += f"**PID:** {process.pid}\n"
         result += f"**Output folder:** {output_folder}\n\n"
         result += f"**Next steps:**\n"
-        result += f"- Use `get_simulation_status('{simulation_id}')` to check progress\n"
+        result += f"- Poll `get_simulation_status('{simulation_id}')` every 60 seconds until complete\n"
         result += f"- Use `list_simulations()` to see all running simulations\n"
         result += f"- Use `stop_simulation('{simulation_id}')` to stop if needed"
 
