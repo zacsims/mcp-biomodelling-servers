@@ -38,7 +38,7 @@ from mcp.server.fastmcp import FastMCP
 # PaperQA imports
 try:
     from paperqa import Docs, Settings
-    from paperqa.settings import AnswerSettings
+    from paperqa.settings import AnswerSettings, ParsingSettings
     PAPERQA_AVAILABLE = True
 except ImportError:
     PAPERQA_AVAILABLE = False
@@ -74,11 +74,15 @@ _validation_results: dict[str, list[dict]] = {}
 # ============================================================================
 
 def _get_paperqa_settings() -> "Settings":
-    """Build PaperQA Settings using OpenAI models."""
+    """Build PaperQA Settings using OpenAI o4-mini."""
     return Settings(
-        llm="gpt-4o",
-        summary_llm="gpt-4o-mini",
+        llm="o4-mini",
+        summary_llm="o4-mini",
         embedding="text-embedding-3-small",
+        parsing=ParsingSettings(
+            # Chunk size larger than any paper so each summary = one paper
+            reader_config={"chunk_chars": 500_000, "overlap": 0},
+        ),
         answer=AnswerSettings(
             evidence_k=10,
             answer_max_sources=5,
@@ -422,6 +426,7 @@ async def add_papers_to_collection(
     except RuntimeError as e:
         return f"**Error:** {e}"
 
+    settings = _get_paperqa_settings()
     added_count = 0
     pdf_count = 0
     txt_count = 0
@@ -476,6 +481,7 @@ async def add_papers_to_collection(
                 paper_file,
                 citation=title,
                 docname=title[:80],
+                settings=settings,
             )
             added_count += 1
             if used_pdf:
@@ -544,6 +550,7 @@ async def add_papers_by_id(
     except RuntimeError as e:
         return f"**Error:** {e}"
 
+    settings = _get_paperqa_settings()
     added_count = 0
     pdf_count = 0
     txt_count = 0
@@ -658,6 +665,7 @@ async def add_papers_by_id(
                         paper_file,
                         citation=title,
                         docname=title[:80],
+                        settings=settings,
                     )
                     added_count += 1
                     if used_pdf:
@@ -748,6 +756,7 @@ async def add_papers_by_id(
                     paper_file,
                     citation=title,
                     docname=title[:80],
+                    settings=settings,
                 )
                 added_count += 1
                 if used_pdf:
@@ -834,16 +843,25 @@ async def validate_rule(
         )
 
     # Build and ask the question
+    settings = _get_paperqa_settings()
     question = _build_validation_question(
         cell_type, signal, direction, behavior, half_max, hill_power
     )
 
     try:
-        response = await docs.aquery(question)
+        response = await docs.aquery(question, settings=settings)
         answer_text = response.answer
         references = response.references
+        formatted_answer = response.formatted_answer
     except Exception as e:
         return f"**Error querying PaperQA:** {e}"
+
+    # Save full PaperQA answer to output file
+    answers_dir = _collection_dir(name) / "answers"
+    answers_dir.mkdir(parents=True, exist_ok=True)
+    safe_key = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{direction}_{behavior}")
+    answer_file = answers_dir / f"{safe_key}.md"
+    answer_file.write_text(formatted_answer, encoding="utf-8")
 
     # Determine support level
     support_level = _parse_support_level(answer_text)
@@ -859,6 +877,7 @@ async def validate_rule(
         "support_level": support_level,
         "evidence_summary": answer_text,
         "references": references,
+        "answer_file": str(answer_file),
     }
     if name not in _validation_results:
         _validation_results[name] = []
@@ -885,6 +904,8 @@ async def validate_rule(
         result += f"**Proposed half-max:** {half_max}\n"
     if hill_power is not None:
         result += f"**Proposed Hill power:** {hill_power}\n"
+
+    result += f"\n**Full answer saved to:** `{answer_file}`\n"
 
     return result
 
