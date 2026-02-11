@@ -46,12 +46,13 @@ PaperQA indexes full PDFs (from PubMed Central, 68+ publishers, and preprint ser
 
 **NEVER delegate literature research to a background agent or subagent (Task tool).** Subagents do NOT have access to MCP tools (LiteratureValidation, PubMed, bioRxiv). If you launch a subagent for literature, it will fall back to WebSearch and extract unreliable parameters.
 
-**NEVER proceed with simulation setup while literature research is pending.** Literature must complete FIRST because parameters depend on the results. Do NOT set up cell types, rules, or parameters until literature-derived values are available.
+**NEVER proceed with export/compile/run while literature validation is pending.** If the user asked for literature validation, it must complete BEFORE exporting configuration files.
 
 The correct approach is:
-1. Complete ALL literature research in the main conversation using MCP tools (Section 7)
-2. Extract parameter values from PaperQA validation results
-3. THEN proceed with simulation setup using those values
+1. Build the full model (substrates, cell types, rules, initial cells) in the main conversation
+2. Validate ALL rules against literature using MCP tools (Section 7)
+3. Adjust parameters if validation flags issues
+4. THEN export, compile, and run
 
 ## 1. Mandatory Tool Ordering
 
@@ -60,7 +61,6 @@ Follow this sequence. Do not skip steps.
 ```
 create_session
   → analyze_biological_scenario
-  → [LITERATURE RESEARCH — if user asks to base parameters on literature, SEE SECTION 7]
   → create_simulation_domain
   → add_single_substrate          (repeat for each substrate)
   → add_single_cell_type          (repeat for each cell type)
@@ -68,15 +68,18 @@ create_session
   → set_substrate_interaction     (repeat for each cell×substrate pair)
   → add_single_cell_rule          (repeat for each rule — SEE SECTION 2)
   → place_initial_cells           (repeat for each cell placement)
+  → [LITERATURE VALIDATION — if user asks to validate against literature, SEE SECTION 7]
   → export_xml_configuration
   → export_cell_rules_csv
   → export_cells_csv              (if cells were placed)
   → create_physicell_project
   → compile_physicell_project
   → run_simulation
-  → get_simulation_status         (poll until complete)
+  → get_simulation_status         (poll every 60s until complete)
   → generate_simulation_gif
 ```
+
+**Literature validation comes AFTER rules are defined.** Build the model first using your biological knowledge and the scenario analysis, then validate the rules and parameters against indexed literature. This lets PaperQA check your proposed parameter values (half_max, hill_power) against published data. If validation flags issues, adjust parameters before exporting.
 
 ## 2. Hill Function Rules — CRITICAL
 
@@ -256,53 +259,59 @@ Common uptake rates:
 - Glucose uptake: 0.5-2.0
 - Drug uptake: 0.01-0.1
 
-## 7. Literature-Based Parameters and Validation
-
-### IMPORTANT: Never read full papers into context
-
-**NEVER use `get_full_text_article` from the PubMed MCP server.** It dumps entire papers (50KB+) into the conversation context, which wastes context and is ineffective for extracting parameters.
-
-Instead, **always use the LiteratureValidation MCP server** to download and index papers as PDFs into PaperQA, then query them with `validate_rule()`. This applies to:
-- **Finding parameters from literature** (user says "base on literature", "determine from literature", "use published values")
-- **Validating rules after defining them** (user says "validate against literature", "check my rules")
+## 7. Literature Validation of Rules and Parameters
 
 ### When to use this workflow
 
-Use this workflow whenever the user asks you to determine rules, parameters, or biological relationships from published research. Do NOT try to extract parameters by reading papers directly — use PaperQA's RAG pipeline via the LiteratureValidation MCP.
+Use this workflow whenever the user mentions literature, published data, or validation — e.g., "validate against literature", "determine from literature", "base on published values", "check my rules against papers". **This step is mandatory when the user requests it — do NOT skip it or wait to be prompted again.**
 
-### Step-by-step workflow
+### Workflow: Build Model First, Then Validate
+
+The correct order is:
+1. **Build the full model** (Sections 1-6) — define substrates, cell types, rules, and parameters using your biological knowledge and scenario analysis
+2. **Then validate ALL rules** against literature using the LiteratureValidation MCP
+3. **Adjust parameters** if validation flags issues, then re-export
+
+Do NOT try to extract parameters by reading papers directly — use PaperQA's RAG pipeline via the LiteratureValidation MCP.
+
+### Step-by-step validation workflow
 
 **Phase 1: Build a paper collection**
-1. `mcp__LiteratureValidation__create_paper_collection("model_name")` — create PaperQA document store
-2. `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized PubMed queries and bioRxiv category suggestions
+1. `mcp__LiteratureValidation__create_paper_collection("model_name")`
+2. `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized PubMed queries
 3. Search PubMed: `mcp__plugin_pubmed_PubMed__search_articles(query)` — find relevant papers
-   - **If PubMed MCP is unavailable:** Use `WebSearch` to find PMIDs (e.g. search `"hypoxia tumor migration PMID"`). Extract ONLY the PMIDs from results — do NOT read or use any other content from web search. Then proceed to step 4.
-4. Add papers by PMID with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name, pmids=[...], fetch_pdfs=True)` — this automatically fetches metadata, downloads PDFs from PubMed Central when available, and indexes them in PaperQA
-5. Optionally search bioRxiv: `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=90)` — find recent preprints
-6. Add bioRxiv preprints: `mcp__LiteratureValidation__add_papers_by_id(name, biorxiv_dois=[...])` — PDFs are always available from bioRxiv
-7. Repeat steps 2-6 for each biological relationship you need to investigate
+   - **If PubMed MCP is unavailable:** Use `WebSearch` to find PMIDs (e.g. `"hypoxia tumor migration PMID"`). Extract ONLY the PMIDs — do NOT extract parameters from web search results.
+4. `mcp__LiteratureValidation__add_papers_by_id(name, pmids=[...], fetch_pdfs=True)` — downloads PDFs and indexes them
+5. Optionally search bioRxiv: `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=90)`
+6. `mcp__LiteratureValidation__add_papers_by_id(name, biorxiv_dois=[...])` — bioRxiv PDFs are always available
+7. Repeat steps 2-6 for each biological relationship in your model
 
-**Phase 2: Query the literature**
-8. `mcp__LiteratureValidation__validate_rule(name, cell_type, signal, direction, behavior, half_max, hill_power)` — ask PaperQA about a specific rule, including proposed parameter values
-9. Or `mcp__LiteratureValidation__validate_rules_batch(name, rules)` — validate all rules at once
-10. `mcp__LiteratureValidation__get_validation_summary(name)` — overview of support levels
+**Phase 2: Validate ALL rules**
+8. Use `mcp__PhysiCell__get_rules_for_validation()` — extract the rule list from your PhysiCell session
+9. `mcp__LiteratureValidation__validate_rules_batch(name, rules)` — validate all rules at once, OR use `validate_rule()` individually for each rule. **Include signal_units when known** (e.g., signal_units="mmHg" for oxygen) to prevent unit confusion.
+10. `mcp__LiteratureValidation__get_validation_summary(name)` — review support levels
 
-**Phase 3: Persist results (optional)**
-11. `mcp__PhysiCell__store_validation_results(validations)` — save in PhysiCell session
-12. `mcp__PhysiCell__get_validation_report()` — full report
+**Phase 3: Act on results**
+11. For rules flagged `unsupported` or `contradictory` — review the evidence summary and adjust half_max, hill_power, or direction as suggested
+12. `mcp__PhysiCell__store_validation_results(validations)` — persist in PhysiCell session
+13. `mcp__PhysiCell__get_validation_report()` — final report
+14. Re-export configuration if parameters were changed
 
-### Key tools for adding papers
+### IMPORTANT: Never read full papers into context
 
-- **`add_papers_by_id(name, pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)`** — Preferred method. Give it PMIDs or bioRxiv DOIs and it handles everything: metadata fetch, PDF download, PaperQA indexing. Falls back to abstract text when PDFs aren't available (~84% of PubMed articles lack PMC full text).
-- **`add_papers_to_collection(name, papers, fetch_pdfs=True)`** — Alternative when you already have paper metadata. Pass `fetch_pdfs=True` to attempt PDF downloads.
+- **NEVER use `get_full_text_article`** — dumps 50KB+ into context, wastes the context window
+- **NEVER use `get_article_metadata`** to read abstracts and manually extract values — let PaperQA do the extraction via `validate_rule()`
+- **NEVER use `WebSearch`/`WebFetch`** to find biological parameters — web search is unreliable and unverifiable
 
-### What NOT to do
+### Signal units
 
-- Do NOT use `WebSearch` or `WebFetch` for biological parameters — web search is unreliable and unverifiable. Use PubMed/bioRxiv MCP servers to find papers, then LiteratureValidation MCP to extract parameters.
-- Do NOT use `get_full_text_article` — wastes context with 50KB+ responses
-- Do NOT use `get_article_metadata` to read abstracts into context and then manually extract parameter values — let PaperQA do the extraction via `validate_rule()`
-- Do NOT skip the LiteratureValidation MCP when the user asks for literature-based parameters
-- Do NOT invent parameter values from general knowledge — all values must come from indexed literature via PaperQA
+PaperQA can misinterpret parameter values if units are ambiguous. Common PhysiCell signal units:
+- **oxygen** → mmHg (e.g., half_max=3.75 means 3.75 mmHg ≈ 0.49% O₂)
+- **glucose** → mM
+- **pressure** → dimensionless (0-1)
+- **drugs** → μM
+
+Auto-detection is built in for common signals, but always pass `signal_units` explicitly when available.
 
 **Support levels:** strong, moderate, weak, contradictory, unsupported.
 Rules flagged `unsupported` or `contradictory` should be reviewed. Validation may suggest parameter changes (half_max, hill_power).
