@@ -88,7 +88,7 @@ def _papers_dir(name: str) -> Path:
 
 async def _get_or_create_docs(name: str) -> "Docs":
     """Get existing Docs instance or create a new one for the collection."""
-    if name in _collections:
+    if name in _collections and _collections[name] is not None:
         return _collections[name]
 
     if not PAPERQA_AVAILABLE:
