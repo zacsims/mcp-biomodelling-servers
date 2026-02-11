@@ -22,13 +22,24 @@ LLMs can construct complete simulations from biological descriptions:
 
 **LLM Tool Chain**:
 ```
-1. analyze_biological_scenario("Breast cancer in hypoxic 3D tissue with immune infiltration")
-2. create_simulation_domain(3000, 3000, 500, max_time=7200)
-3. add_single_substrate("oxygen", 100000, 0.01, 38)
-4. add_single_cell_type("cancer_cell", "Ki67_basic")
-5. add_single_cell_type("immune_cell", "live_cell")
-6. add_single_cell_rule("cancer_cell", "oxygen", "decreases", "apoptosis rate")
-7. export_xml_configuration("tumor_simulation.xml")
+1.  create_session()
+2.  analyze_biological_scenario("Breast cancer in hypoxic 3D tissue with immune infiltration")
+3.  create_simulation_domain(3000, 3000, 500, max_time=7200)
+4.  add_single_substrate("oxygen", 100000, 0.01, 38)
+5.  add_single_cell_type("cancer_cell", "Ki67_basic")
+6.  add_single_cell_type("immune_cell", "live_cell")
+7.  set_substrate_interaction("cancer_cell", "oxygen", uptake_rate=10)
+8.  add_single_cell_rule("cancer_cell", "oxygen", "decreases", "apoptosis rate")
+9.  place_initial_cells("cancer_cell", "random_disc", num_cells=500, radius=300)
+10. place_initial_cells("immune_cell", "annular", num_cells=100, radius=600, inner_radius=400)
+11. export_cells_csv()
+12. export_xml_configuration()
+13. export_cell_rules_csv()
+14. create_physicell_project("tumor_simulation")
+15. compile_physicell_project("tumor_simulation")
+16. run_simulation("tumor_simulation")
+17. get_simulation_status(simulation_id)  # poll every 60s until complete
+18. generate_simulation_gif(simulation_id)
 ```
 
 #### 2. Multiscale Integration Workflows
@@ -53,18 +64,30 @@ PhysiCell:  add_physiboss_model() → link genes to behaviors → simulate
 
 ### Tool Categories Exposed
 
+#### Session & Workflow
+- `create_session()` - Start a new simulation build session
+- `get_workflow_status()` - Track progress across complex builds
+- `switch_session()` / `list_sessions()` - Multi-session management
+
 #### Simulation Framework
 - `create_simulation_domain()` - Define 3D spatial and temporal boundaries
 - `add_single_substrate()` - Add chemical environments (oxygen, drugs, nutrients)
-- Session management with progress tracking across complex workflows
+- `analyze_biological_scenario()` - Get biological context and guidance
 
 #### Cell Population Definition
 - `add_single_cell_type()` - Define cancer, immune, stromal cell populations
 - `configure_cell_parameters()` - Set size, motility, death rates
 - `set_substrate_interaction()` - Define consumption and secretion
 
+#### Cell Property Setters
+- `set_cell_transformation_rate()` - Set transformation rates between cell types
+- `set_cell_interaction()` - Set attack/phagocytose/fuse rates per target
+- `configure_cell_interactions()` - Dead-cell phagocytosis and attack parameters
+- `configure_cell_mechanics()` - Attachment, detachment, adhesion, repulsion
+- `configure_cell_integrity()` - Damage and repair rates
+
 #### Behavioral Programming
-- `add_single_cell_rule()` - Create environmental sensing and response
+- `add_single_cell_rule()` - Create environmental sensing and response (Hill functions)
 - `list_all_available_signals()` and `list_all_available_behaviors()` - Discovery tools
 - Context-aware signal/behavior expansion based on simulation components
 
@@ -73,6 +96,15 @@ PhysiCell:  add_physiboss_model() → link genes to behaviors → simulate
 - `get_initial_conditions_summary()` - Review current cell placements
 - `remove_initial_cells()` - Clear placed cells
 - `export_cells_csv()` - Export cells.csv for PhysiCell to load at simulation start
+
+#### Export, Build & Run
+- `export_xml_configuration()` - Write PhysiCell XML settings file
+- `export_cell_rules_csv()` - Write cell rules CSV (Hill function parameters)
+- `create_physicell_project()` - Package config into a PhysiCell project
+- `compile_physicell_project()` - Compile the C++ simulation executable
+- `run_simulation()` - Launch simulation as background process
+- `get_simulation_status()` - Poll progress (every 60s until complete)
+- `generate_simulation_gif()` - Create visualization from output
 
 #### PhysiBoSS Multiscale Integration
 - `add_physiboss_model()` - Integrate Boolean networks into cell behavior
@@ -141,15 +173,21 @@ The `place_initial_cells()` tool generates x,y,z coordinates for cells and store
 
 **LLM Tool Chain:**
 ```
-1. create_simulation_domain(1000, 1000, 20)
-2. add_single_substrate("oxygen", 100000, 0.01, 38)
-3. add_single_cell_type("breast_cancer", "Ki67_basic")
-4. add_single_cell_type("cytotoxic_T_cell", "live_cell")
-5. place_initial_cells("breast_cancer", "random_disc", num_cells=500, radius=200)
-6. place_initial_cells("cytotoxic_T_cell", "annular", num_cells=100, radius=400, inner_radius=250)
-7. export_cells_csv()
-8. export_xml_configuration()
-9. create_physicell_project("tumor_immune")
+1.  create_session()
+2.  create_simulation_domain(1000, 1000, 20)
+3.  add_single_substrate("oxygen", 100000, 0.01, 38)
+4.  add_single_cell_type("breast_cancer", "Ki67_basic")
+5.  add_single_cell_type("cytotoxic_T_cell", "live_cell")
+6.  set_substrate_interaction("breast_cancer", "oxygen", uptake_rate=10)
+7.  add_single_cell_rule("breast_cancer", "oxygen", "decreases", "necrosis rate")
+8.  place_initial_cells("breast_cancer", "random_disc", num_cells=500, radius=200)
+9.  place_initial_cells("cytotoxic_T_cell", "annular", num_cells=100, radius=400, inner_radius=250)
+10. export_cells_csv()
+11. export_xml_configuration()
+12. export_cell_rules_csv()
+13. create_physicell_project("tumor_immune")
+14. compile_physicell_project("tumor_immune")
+15. run_simulation("tumor_immune")
 ```
 
 **Tissue layers:**
@@ -279,19 +317,22 @@ Each rule parameter targets a specific field (saturation/half_max/hill_power) of
 2. create_simulation_domain(1500, 1500, 20, max_time=7200)
 3. add_single_substrate("oxygen", 100000, 0.1, 38)
 4. add_single_cell_type("tumor", "Ki67_basic")
-5. add_single_cell_rule("tumor", "oxygen", "increases", "cycle entry",
+5. set_substrate_interaction("tumor", "oxygen", uptake_rate=10)
+6. add_single_cell_rule("tumor", "oxygen", "increases", "cycle entry",
      min_signal=0.00072, max_signal=0.0072, half_max=21.5, hill_power=4)
-6. add_single_cell_rule("tumor", "pressure", "decreases", "cycle entry",
+7. add_single_cell_rule("tumor", "pressure", "decreases", "cycle entry",
      min_signal=0, max_signal=0.00072, half_max=0.25, hill_power=3)
-7. export_xml_configuration()
-8. export_cell_rules_csv()
-9. create_physicell_project("tumor_calibration")
-10. compile_physicell_project("tumor_calibration")
+8. place_initial_cells("tumor", "random_disc", num_cells=500, radius=200)
+9. export_cells_csv()
+10. export_xml_configuration()
+11. export_cell_rules_csv()
+12. create_physicell_project("tumor_calibration")
+13. compile_physicell_project("tumor_calibration")
 
 # Phase 2: UQ Setup
-11. setup_uq_analysis("tumor_calibration", num_replicates=3, num_workers=8)
-12. get_uq_parameter_suggestions()
-13. define_uq_parameters([
+14. setup_uq_analysis("tumor_calibration", num_replicates=3, num_workers=8)
+15. get_uq_parameter_suggestions()
+16. define_uq_parameters([
       {"name": "cycle_hfm", "type": "rules",
        "rule_key": "tumor,oxygen,increases,cycle entry,half_max",
        "ref_value": 21.5, "lower_bound": 10, "upper_bound": 35},
@@ -302,25 +343,25 @@ Each rule parameter targets a specific field (saturation/half_max/hill_power) of
        "rule_key": "tumor,pressure,decreases,cycle entry,half_max",
        "ref_value": 0.25, "lower_bound": 0.05, "upper_bound": 1.0}
     ])
-14. define_quantities_of_interest([
+17. define_quantities_of_interest([
       {"name": "live_tumor", "function": "cell_count:tumor",
        "obs_column": "Tumor Count"}
     ])
 
 # Phase 3: Sensitivity Analysis
-15. run_sensitivity_analysis(method="Sobol", num_samples=64, num_workers=8)
-16. get_sensitivity_results()  # Identify which params matter most
+18. run_sensitivity_analysis(method="Sobol", num_samples=64, num_workers=8)
+19. get_sensitivity_results()  # Identify which params matter most
 
 # Phase 4: Calibration
-17. provide_experimental_data("obs_data.csv",
+20. provide_experimental_data("obs_data.csv",
       column_mapping={"live_tumor": "Tumor Count"}, time_column="Time")
-18. run_bayesian_calibration(num_initial_samples=10, num_iterations=50)
-19. get_calibration_results()
+21. run_bayesian_calibration(num_initial_samples=10, num_iterations=50)
+22. get_calibration_results()
 
 # Phase 5: Validation
-20. apply_calibrated_parameters()
-21. run_simulation("tumor_calibration")
-22. generate_simulation_gif()
+23. apply_calibrated_parameters()
+24. run_simulation("tumor_calibration")
+25. generate_simulation_gif()
 ```
 
 #### Sensitivity Analysis Methods
@@ -445,7 +486,7 @@ LLMs can monitor and guide users through simulation construction:
 
 Clone this repository:
 ```bash
-git clone https://github.com/your-org/mcp-biomodelling-servers.git
+git clone https://github.com/zacsims/mcp-biomodelling-servers.git
 cd mcp-biomodelling-servers/PhysiCell
 ```
 
@@ -511,14 +552,6 @@ This registers the MCP server at the user level (`-s user`), making it available
 To verify the server is registered:
 ```bash
 claude mcp list
-```
-
-#### Recommended: Add CLAUDE.md
-
-Copy the included `CLAUDE.md` to `~/.claude/CLAUDE.md` to ensure Claude Code always uses the PhysiCell MCP tools directly rather than attempting manual workarounds:
-
-```bash
-cp /path/to/mcp-biomodelling-servers/PhysiCell/CLAUDE.md ~/.claude/CLAUDE.md
 ```
 
 #### Install the AgentSkill (Recommended)
