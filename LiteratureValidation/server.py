@@ -35,7 +35,7 @@ from mcp.server.fastmcp import FastMCP
 # PaperQA imports
 try:
     from paperqa import Docs, Settings
-    from paperqa.settings import AnswerSettings, ParsingSettings
+    from paperqa.settings import AnswerSettings
     PAPERQA_AVAILABLE = True
 except ImportError:
     PAPERQA_AVAILABLE = False
@@ -72,10 +72,6 @@ def _get_paperqa_settings() -> "Settings":
         answer=AnswerSettings(
             evidence_k=10,
             answer_max_sources=5,
-        ),
-        parsing=ParsingSettings(
-            chunk_size=3000,
-            overlap=300,
         ),
     )
 
