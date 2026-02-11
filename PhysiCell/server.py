@@ -69,32 +69,75 @@ from session_manager import (
     get_current_session, ensure_session, analyze_and_update_session_from_config
 )
 
-# Try to import UQ-PhysiCell modules
-try:
-    from uq_physicell import PhysiCell_Model
-    from uq_physicell.model_analysis import ModelAnalysisContext, run_simulations as uq_run_simulations
-    UQ_AVAILABLE = True
-except ImportError:
-    UQ_AVAILABLE = False
+# Lazy-load UQ-PhysiCell modules to avoid slow startup (VTK/ome_types take ~4s)
+# Availability flags are resolved on first access via _ensure_uq_imports()
+_uq_imports_checked = False
+UQ_AVAILABLE = False
+UQ_BO_AVAILABLE = False
+UQ_ABC_AVAILABLE = False
 
-try:
-    from uq_physicell.bo import (
-        CalibrationContext as BOCalibrationContext,
-        run_bayesian_optimization as uq_run_bo,
-        SumSquaredDifferences, Manhattan, Chebyshev
-    )
-    UQ_BO_AVAILABLE = True
-except ImportError:
-    UQ_BO_AVAILABLE = False
+# These will be populated by _ensure_uq_imports()
+PhysiCell_Model = None
+ModelAnalysisContext = None
+uq_run_simulations = None
+BOCalibrationContext = None
+uq_run_bo = None
+SumSquaredDifferences = None
+Manhattan = None
+Chebyshev = None
+ABCCalibrationContext = None
+uq_run_abc = None
 
-try:
-    from uq_physicell.abc import (
-        CalibrationContext as ABCCalibrationContext,
-        run_abc_calibration as uq_run_abc
-    )
-    UQ_ABC_AVAILABLE = True
-except ImportError:
-    UQ_ABC_AVAILABLE = False
+def _ensure_uq_imports():
+    """Lazy-load UQ modules on first use. Called by UQ tool functions."""
+    global _uq_imports_checked, UQ_AVAILABLE, UQ_BO_AVAILABLE, UQ_ABC_AVAILABLE
+    global PhysiCell_Model, ModelAnalysisContext, uq_run_simulations
+    global BOCalibrationContext, uq_run_bo, SumSquaredDifferences, Manhattan, Chebyshev
+    global ABCCalibrationContext, uq_run_abc
+
+    if _uq_imports_checked:
+        return
+
+    _uq_imports_checked = True
+
+    try:
+        from uq_physicell import PhysiCell_Model as _PM
+        from uq_physicell.model_analysis import ModelAnalysisContext as _MAC
+        from uq_physicell.model_analysis import run_simulations as _rs
+        PhysiCell_Model = _PM
+        ModelAnalysisContext = _MAC
+        uq_run_simulations = _rs
+        UQ_AVAILABLE = True
+    except ImportError:
+        UQ_AVAILABLE = False
+
+    try:
+        from uq_physicell.bo import (
+            CalibrationContext as _BOCtx,
+            run_bayesian_optimization as _run_bo,
+            SumSquaredDifferences as _SSD,
+            Manhattan as _Man,
+            Chebyshev as _Cheb
+        )
+        BOCalibrationContext = _BOCtx
+        uq_run_bo = _run_bo
+        SumSquaredDifferences = _SSD
+        Manhattan = _Man
+        Chebyshev = _Cheb
+        UQ_BO_AVAILABLE = True
+    except ImportError:
+        UQ_BO_AVAILABLE = False
+
+    try:
+        from uq_physicell.abc import (
+            CalibrationContext as _ABCCtx,
+            run_abc_calibration as _run_abc
+        )
+        ABCCalibrationContext = _ABCCtx
+        uq_run_abc = _run_abc
+        UQ_ABC_AVAILABLE = True
+    except ImportError:
+        UQ_ABC_AVAILABLE = False
 
 from mcp.server.fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
@@ -123,6 +166,7 @@ class SimulationRun:
     completed_at: Optional[float] = None
     return_code: Optional[int] = None
     error_message: str = ""
+    log_file: str = ""
 
 # Global simulation tracking
 running_simulations: Dict[str, SimulationRun] = {}
@@ -1052,6 +1096,298 @@ str: Success message with interaction details
     except Exception as e:
         return f"Error setting substrate interaction: {str(e)}"
 
+
+@mcp.tool()
+def set_cell_transformation_rate(cell_type: str, target_cell_type: str, rate: float = 0.001) -> str:
+    """
+When the user asks to set transformation rates, cell type transitions, or EMT/MET rates,
+this function sets the base transformation rate from one cell type to another in the XML config.
+This MUST be called BEFORE adding rules that target 'transition to X' behaviors,
+because the XML default transformation rate is 0 and rules interpolate toward the XML default.
+The function modifies an existing cell type; it does not create a new one.
+To set multiple transformation rates, use this function repeatedly.
+
+Input parameters:
+cell_type (str): Name of existing cell type that will transform
+target_cell_type (str): Name of existing cell type to transform into
+rate (float): Transformation rate in 1/min (default: 0.001)
+
+Returns:
+str: Success message with transformation rate details
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    if target_cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Target cell type '{target_cell_type}' not found. Available: {available}"
+
+    if rate < 0:
+        return "Error: Transformation rate must be non-negative"
+
+    # Set the rate directly in the config dict
+    transformations = cell_types_dict[cell_type]['phenotype']['cell_transformations']
+    transformations['transformation_rates'][target_cell_type] = rate
+
+    # Update legacy global for backward compatibility
+    _set_legacy_config(session.config)
+
+    # Track modification if loaded from XML
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    return (
+        f"**Transformation rate set:** {cell_type} → {target_cell_type} at {rate:g} min⁻¹\n"
+        f"You can now add rules targeting `transition to {target_cell_type}` — "
+        f"the XML default is {rate:g} (nonzero), so Hill function interpolation will work correctly."
+    )
+
+
+@mcp.tool()
+def set_cell_interaction(cell_type: str, target_cell_type: str,
+                         interaction_type: str, rate: float = 0.001) -> str:
+    """
+When the user asks to set attack rates, phagocytosis rates, or fusion rates between cell types,
+this function sets the per-target-cell-type interaction rate in the XML config.
+This MUST be called BEFORE adding rules that target 'attack X', 'phagocytose X', or 'fuse to X'
+behaviors, because their XML defaults are 0 and rules interpolate toward the XML default.
+The function modifies an existing cell type; it does not create a new one.
+To set multiple interactions, use this function repeatedly.
+
+Input parameters:
+cell_type (str): Name of existing cell type that performs the interaction
+target_cell_type (str): Name of existing cell type that is the target
+interaction_type (str): Type of interaction - 'attack', 'phagocytose', or 'fuse'
+rate (float): Interaction rate in 1/min (default: 0.001)
+
+Returns:
+str: Success message with interaction details
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    if target_cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Target cell type '{target_cell_type}' not found. Available: {available}"
+
+    if rate < 0:
+        return "Error: Rate must be non-negative"
+
+    interactions = cell_types_dict[cell_type]['phenotype']['cell_interactions']
+
+    type_map = {
+        'attack': ('attack_rates', 'attack'),
+        'phagocytose': ('live_phagocytosis_rates', 'phagocytose'),
+        'fuse': ('fusion_rates', 'fuse to'),
+    }
+    if interaction_type not in type_map:
+        return f"Error: interaction_type must be 'attack', 'phagocytose', or 'fuse'. Got: '{interaction_type}'"
+
+    dict_key, behavior_prefix = type_map[interaction_type]
+    interactions[dict_key][target_cell_type] = rate
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    behavior_name = f"{behavior_prefix} {target_cell_type}"
+    return (
+        f"**Interaction rate set:** {cell_type} {interaction_type}s {target_cell_type} at {rate:g} min⁻¹\n"
+        f"You can now add rules targeting `{behavior_name}` — "
+        f"the XML default is {rate:g} (nonzero), so Hill function interpolation will work correctly."
+    )
+
+
+@mcp.tool()
+def configure_cell_interactions(cell_type: str,
+                                apoptotic_phagocytosis_rate: Optional[float] = None,
+                                necrotic_phagocytosis_rate: Optional[float] = None,
+                                other_dead_phagocytosis_rate: Optional[float] = None,
+                                attack_damage_rate: Optional[float] = None,
+                                attack_duration: Optional[float] = None) -> str:
+    """
+When the user asks to set dead-cell phagocytosis rates, attack damage rate, or attack duration,
+this function configures non-per-type cell interaction parameters.
+This should be called BEFORE adding rules that target these behaviors when their defaults are 0.
+Only parameters that are explicitly provided will be modified.
+
+Input parameters:
+cell_type (str): Name of existing cell type
+apoptotic_phagocytosis_rate (float): Rate of phagocytosing apoptotic cells (1/min, default 0.0)
+necrotic_phagocytosis_rate (float): Rate of phagocytosing necrotic cells (1/min, default 0.0)
+other_dead_phagocytosis_rate (float): Rate of phagocytosing other dead cells (1/min, default 0.0)
+attack_damage_rate (float): Rate of damage during attack (1/min, default 1.0)
+attack_duration (float): Duration of attack (min, default 0.1)
+
+Returns:
+str: Success message with configured parameters
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    interactions = cell_types_dict[cell_type]['phenotype']['cell_interactions']
+    changes = []
+
+    params = {
+        'apoptotic_phagocytosis_rate': apoptotic_phagocytosis_rate,
+        'necrotic_phagocytosis_rate': necrotic_phagocytosis_rate,
+        'other_dead_phagocytosis_rate': other_dead_phagocytosis_rate,
+        'attack_damage_rate': attack_damage_rate,
+        'attack_duration': attack_duration,
+    }
+
+    for key, value in params.items():
+        if value is not None:
+            if value < 0:
+                return f"Error: {key} must be non-negative"
+            interactions[key] = value
+            changes.append(f"- {key}: {value:g}")
+
+    if not changes:
+        return "Error: No parameters provided. Specify at least one parameter to set."
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    return f"**Cell interactions configured for {cell_type}:**\n" + "\n".join(changes)
+
+
+@mcp.tool()
+def configure_cell_mechanics(cell_type: str,
+                             attachment_rate: Optional[float] = None,
+                             detachment_rate: Optional[float] = None,
+                             cell_cell_adhesion_strength: Optional[float] = None,
+                             cell_cell_repulsion_strength: Optional[float] = None,
+                             relative_maximum_adhesion_distance: Optional[float] = None) -> str:
+    """
+When the user asks to set cell attachment rates, detachment rates, adhesion, or repulsion,
+this function configures cell mechanics parameters.
+This should be called BEFORE adding rules that target 'cell attachment rate' or
+'cell detachment rate' behaviors, because their XML defaults are 0.
+Only parameters that are explicitly provided will be modified.
+
+Input parameters:
+cell_type (str): Name of existing cell type
+attachment_rate (float): Rate of cell attachment (1/min, default 0.0)
+detachment_rate (float): Rate of cell detachment (1/min, default 0.0)
+cell_cell_adhesion_strength (float): Adhesion strength (micron/min, default 0.4)
+cell_cell_repulsion_strength (float): Repulsion strength (micron/min, default 10.0)
+relative_maximum_adhesion_distance (float): Max adhesion distance (dimensionless, default 1.25)
+
+Returns:
+str: Success message with configured parameters
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    mechanics = cell_types_dict[cell_type]['phenotype']['mechanics']
+    changes = []
+
+    params = {
+        'attachment_rate': attachment_rate,
+        'detachment_rate': detachment_rate,
+        'cell_cell_adhesion_strength': cell_cell_adhesion_strength,
+        'cell_cell_repulsion_strength': cell_cell_repulsion_strength,
+        'relative_maximum_adhesion_distance': relative_maximum_adhesion_distance,
+    }
+
+    for key, value in params.items():
+        if value is not None:
+            if value < 0:
+                return f"Error: {key} must be non-negative"
+            mechanics[key] = value
+            changes.append(f"- {key}: {value:g}")
+
+    if not changes:
+        return "Error: No parameters provided. Specify at least one parameter to set."
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    return f"**Cell mechanics configured for {cell_type}:**\n" + "\n".join(changes)
+
+
+@mcp.tool()
+def configure_cell_integrity(cell_type: str,
+                             damage_rate: Optional[float] = None,
+                             damage_repair_rate: Optional[float] = None) -> str:
+    """
+When the user asks to set cell damage rates or damage repair rates,
+this function configures cell integrity parameters.
+This should be called BEFORE adding rules that target 'damage rate' or
+'damage repair rate' behaviors, because their XML defaults are 0.
+Only parameters that are explicitly provided will be modified.
+
+Input parameters:
+cell_type (str): Name of existing cell type
+damage_rate (float): Rate of damage accumulation (1/min, default 0.0)
+damage_repair_rate (float): Rate of damage repair (1/min, default 0.0)
+
+Returns:
+str: Success message with configured parameters
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    integrity = cell_types_dict[cell_type]['phenotype']['cell_integrity']
+    changes = []
+
+    params = {
+        'damage_rate': damage_rate,
+        'damage_repair_rate': damage_repair_rate,
+    }
+
+    for key, value in params.items():
+        if value is not None:
+            if value < 0:
+                return f"Error: {key} must be non-negative"
+            integrity[key] = value
+            changes.append(f"- {key}: {value:g}")
+
+    if not changes:
+        return "Error: No parameters provided. Specify at least one parameter to set."
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    return f"**Cell integrity configured for {cell_type}:**\n" + "\n".join(changes)
+
+
 # ============================================================================
 # PARAMETER DISCOVERY AND DEFAULTS
 # ============================================================================
@@ -1200,6 +1536,128 @@ def list_all_available_behaviors() -> str:
 # CELL RULES AND PHYSIBOSS
 # ============================================================================
 
+def _get_behavior_default_from_config(session, cell_type: str, behavior: str) -> Optional[float]:
+    """Look up the current XML default value for a behavior from the in-memory config.
+
+    Returns the default value (float) if the behavior is recognized and the
+    cell type exists, or None if the behavior cannot be mapped.
+    """
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        return None
+
+    phenotype = cell_types_dict[cell_type]['phenotype']
+    behavior = behavior.strip()
+
+    try:
+        # Death rates
+        if behavior == "apoptosis":
+            death = phenotype.get('death', {}).get('apoptosis', {})
+            return death.get('default_rate', death.get('rate', None))
+        if behavior == "necrosis":
+            death = phenotype.get('death', {}).get('necrosis', {})
+            return death.get('default_rate', death.get('rate', None))
+
+        # Motility
+        if behavior == "migration speed":
+            return phenotype.get('motility', {}).get('speed', None)
+        if behavior == "migration bias":
+            return phenotype.get('motility', {}).get('migration_bias', None)
+        if behavior in ("persistence time", "migration persistence time"):
+            return phenotype.get('motility', {}).get('persistence_time', None)
+
+        # Transformation: "transition to X" or "transform to X"
+        for prefix in ("transition to ", "transform to "):
+            if behavior.startswith(prefix):
+                target = behavior[len(prefix):]
+                rates = phenotype.get('cell_transformations', {}).get('transformation_rates', {})
+                return rates.get(target, 0.0)
+
+        # Secretion / uptake: "X secretion" or "X uptake"
+        if behavior.endswith(" secretion"):
+            substrate = behavior[:-len(" secretion")]
+            return phenotype.get('secretion', {}).get(substrate, {}).get('secretion_rate', 0.0)
+        if behavior.endswith(" uptake"):
+            substrate = behavior[:-len(" uptake")]
+            return phenotype.get('secretion', {}).get(substrate, {}).get('uptake_rate', 0.0)
+
+        # Cycle entry (first transition rate)
+        if behavior == "cycle entry":
+            cycle = phenotype.get('cycle', {})
+            rates = cycle.get('transition_rates', [])
+            if rates:
+                return rates[0].get('rate', None)
+            return None
+
+        # Exit from cycle phase N
+        if behavior.startswith("exit from cycle phase "):
+            try:
+                phase_idx = int(behavior[len("exit from cycle phase "):])
+                cycle = phenotype.get('cycle', {})
+                rates = cycle.get('transition_rates', [])
+                if phase_idx < len(rates):
+                    return rates[phase_idx].get('rate', None)
+            except (ValueError, IndexError):
+                pass
+            return None
+
+        # --- Cell interactions ---
+        interactions = phenotype.get('cell_interactions', {})
+
+        # Dead-cell phagocytosis
+        if behavior == "phagocytose apoptotic cell":
+            return interactions.get('apoptotic_phagocytosis_rate', 0.0)
+        if behavior == "phagocytose necrotic cell":
+            return interactions.get('necrotic_phagocytosis_rate', 0.0)
+        if behavior == "phagocytose other dead cell":
+            return interactions.get('other_dead_phagocytosis_rate', 0.0)
+
+        # Per-cell-type interactions: "attack X", "phagocytose X", "fuse to X"
+        if behavior.startswith("attack "):
+            target = behavior[len("attack "):]
+            return interactions.get('attack_rates', {}).get(target, 0.0)
+        if behavior.startswith("phagocytose "):
+            target = behavior[len("phagocytose "):]
+            return interactions.get('live_phagocytosis_rates', {}).get(target, 0.0)
+        if behavior.startswith("fuse to "):
+            target = behavior[len("fuse to "):]
+            return interactions.get('fusion_rates', {}).get(target, 0.0)
+
+        # Attack parameters
+        if behavior == "attack damage rate":
+            return interactions.get('attack_damage_rate', 1.0)
+        if behavior == "attack duration":
+            return interactions.get('attack_duration', 0.1)
+
+        # --- Mechanics ---
+        mechanics = phenotype.get('mechanics', {})
+
+        if behavior == "cell attachment rate":
+            return mechanics.get('attachment_rate', 0.0)
+        if behavior == "cell detachment rate":
+            return mechanics.get('detachment_rate', 0.0)
+        if behavior == "cell-cell adhesion":
+            return mechanics.get('cell_cell_adhesion_strength', 0.4)
+        if behavior == "cell-cell repulsion":
+            return mechanics.get('cell_cell_repulsion_strength', 10.0)
+        if behavior == "relative maximum adhesion distance":
+            return mechanics.get('relative_maximum_adhesion_distance', 1.25)
+
+        # --- Cell integrity ---
+        integrity = phenotype.get('cell_integrity', {})
+
+        if behavior == "damage rate":
+            return integrity.get('damage_rate', 0.0)
+        if behavior == "damage repair rate":
+            return integrity.get('damage_repair_rate', 0.0)
+
+    except (KeyError, TypeError, IndexError):
+        return None
+
+    # Unrecognized behavior — skip validation
+    return None
+
+
 @mcp.tool()
 def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: str,
                         min_signal: float = 0, max_signal: float = 1, 
@@ -1241,7 +1699,108 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
     
     # Update context from current config before adding rule
     update_signals_behaviors_context_from_config(session.config)
-    
+
+    # --- "From 0 towards 0" detection ---
+    # If both the base_value (min_signal) and the XML default are 0, the Hill
+    # function evaluates to 0 everywhere, making the rule silently useless.
+    xml_default = _get_behavior_default_from_config(session, cell_type.strip(), behavior.strip())
+    if xml_default is not None and xml_default == 0 and min_signal == 0:
+        b = behavior.strip()
+        ct = cell_type.strip()
+        fix = None
+
+        # Build a specific fix suggestion depending on behavior type
+        if b.startswith("transition to ") or b.startswith("transform to "):
+            prefix = "transition to " if b.startswith("transition to ") else "transform to "
+            target = b[len(prefix):]
+            fix = (
+                f"Call `set_cell_transformation_rate(cell_type=\"{ct}\", "
+                f"target_cell_type=\"{target}\", rate=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        elif b.endswith(" secretion") or b.endswith(" uptake"):
+            substrate = b.rsplit(" ", 1)[0]
+            rate_type = "secretion_rate" if b.endswith(" secretion") else "uptake_rate"
+            fix = (
+                f"Call `set_substrate_interaction(cell_type=\"{ct}\", "
+                f"substrate=\"{substrate}\", {rate_type}=0.1)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        elif b in ("apoptosis", "necrosis"):
+            rate_kwarg = f"{b}_rate"
+            fix = (
+                f"Call `configure_cell_parameters(cell_type=\"{ct}\", "
+                f"{rate_kwarg}=0.0001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        # Per-cell-type interactions: attack, phagocytose (live), fuse
+        elif b.startswith("attack "):
+            target = b[len("attack "):]
+            fix = (
+                f"Call `set_cell_interaction(cell_type=\"{ct}\", "
+                f"target_cell_type=\"{target}\", interaction_type=\"attack\", rate=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        elif b.startswith("phagocytose ") and b not in (
+            "phagocytose apoptotic cell", "phagocytose necrotic cell", "phagocytose other dead cell"
+        ):
+            target = b[len("phagocytose "):]
+            fix = (
+                f"Call `set_cell_interaction(cell_type=\"{ct}\", "
+                f"target_cell_type=\"{target}\", interaction_type=\"phagocytose\", rate=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        elif b.startswith("fuse to "):
+            target = b[len("fuse to "):]
+            fix = (
+                f"Call `set_cell_interaction(cell_type=\"{ct}\", "
+                f"target_cell_type=\"{target}\", interaction_type=\"fuse\", rate=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        # Dead-cell phagocytosis
+        elif b in ("phagocytose apoptotic cell", "phagocytose necrotic cell", "phagocytose other dead cell"):
+            param_map = {
+                "phagocytose apoptotic cell": "apoptotic_phagocytosis_rate",
+                "phagocytose necrotic cell": "necrotic_phagocytosis_rate",
+                "phagocytose other dead cell": "other_dead_phagocytosis_rate",
+            }
+            param = param_map[b]
+            fix = (
+                f"Call `configure_cell_interactions(cell_type=\"{ct}\", "
+                f"{param}=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        # Mechanics: attachment/detachment
+        elif b in ("cell attachment rate", "cell detachment rate"):
+            param = "attachment_rate" if "attachment" in b else "detachment_rate"
+            fix = (
+                f"Call `configure_cell_mechanics(cell_type=\"{ct}\", "
+                f"{param}=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        # Cell integrity: damage/repair
+        elif b in ("damage rate", "damage repair rate"):
+            param = "damage_rate" if b == "damage rate" else "damage_repair_rate"
+            fix = (
+                f"Call `configure_cell_integrity(cell_type=\"{ct}\", "
+                f"{param}=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+
+        if fix is None:
+            fix = (
+                f"Set a nonzero XML default for `{b}` before adding this rule, "
+                f"or use a nonzero `min_signal` value."
+            )
+
+        return (
+            f"**Error: \"From 0 towards 0\" rule detected — this rule would have no effect.**\n\n"
+            f"Both `min_signal` (base_value={min_signal}) and the XML default for "
+            f"`{b}` (={xml_default}) are 0.\n"
+            f"The Hill function computes: rate = 0 + (0 − 0) × H(signal) = **0 always**.\n\n"
+            f"**Fix:** {fix}"
+        )
+
     # Add rule to configuration - check if we should use the new API or legacy
     try:
         # Try new API first (from test)
@@ -1303,12 +1862,21 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
     if session.loaded_from_xml:
         session.mark_xml_modification()
 
-    # Format result
+    # Format result with interpolation range
+    # For "increases": low signal → base_value (min_signal), high signal → xml_default (saturation)
+    # For "decreases": low signal → xml_default (saturation), high signal → base_value (min_signal)
     result = f"**Cell rule added:**\n"
     result += f"- Rule: {cell_type} | {signal} {direction} → {behavior}\n"
     result += f"- Signal range: {min_signal} to {max_signal}\n"
     result += f"- Half-max: {half_max}\n"
     result += f"- Hill power: {hill_power}\n"
+    if xml_default is not None:
+        if direction == "increases":
+            result += f"- At low signal: {behavior} = {min_signal:g} (base_value)\n"
+            result += f"- At high signal: {behavior} → {xml_default:g} (XML default/saturation)\n"
+        else:
+            result += f"- At high signal: {behavior} = {min_signal:g} (base_value)\n"
+            result += f"- At low signal: {behavior} → {xml_default:g} (XML default/saturation)\n"
     result += f"- Progress: {session.get_progress_percentage():.0f}%\n"
     
     # Check if ready for export based on core components (not arbitrary percentage)
@@ -1876,6 +2444,13 @@ str: Markdown-formatted export status with file details
         output_path = output_dir / "cell_rules.csv"
 
         rules.generate_csv(str(output_path))
+
+        # Fix CRLF → LF: the library's csv.writer uses \r\n (RFC 4180),
+        # but PhysiCell doesn't strip \r, causing the last field to include
+        # a trailing carriage return that silently breaks rule parsing.
+        content = output_path.read_bytes()
+        if b'\r\n' in content:
+            output_path.write_bytes(content.replace(b'\r\n', b'\n'))
 
         # Ensure the ruleset is registered as enabled in XML config
         session.config.cell_rules.add_ruleset(
@@ -2928,14 +3503,23 @@ def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
                 pass
 
         # Start the simulation process
+        # Redirect stdout/stderr to a log file instead of PIPE to prevent
+        # the process from blocking when the pipe buffer fills up.
+        # PhysiCell prints a lot during initialization (one line per cell),
+        # and with many cells the 64KB pipe buffer fills instantly.
+        log_file = output_folder / "simulation.log"
+        log_handle = open(log_file, 'w')
         cmd = f"./{exec_name} {config_path}"
         process = subprocess.Popen(
             cmd,
             shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
             cwd=str(PHYSICELL_ROOT)
         )
+
+        # Close the Python file handle — the subprocess has inherited the fd
+        log_handle.close()
 
         # Track the simulation
         sim_run = SimulationRun(
@@ -2946,7 +3530,8 @@ def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
             status="running",
             output_folder=str(output_folder),
             config_file=config_path,
-            started_at=time.time()
+            started_at=time.time(),
+            log_file=str(log_file)
         )
 
         with simulations_lock:
@@ -3030,10 +3615,18 @@ def get_simulation_status(simulation_id: str) -> str:
         result += f"**Next step:** Use `generate_simulation_gif('{simulation_id}')` to create visualization."
     elif sim.status == "failed":
         result += f"\n**Simulation failed** (exit code: {sim.return_code})\n"
-        if sim.process:
-            stderr = sim.process.stderr.read().decode() if sim.process.stderr else ""
-            if stderr:
-                result += f"**Error:** {stderr[:500]}"
+        # Read last lines from log file for error context
+        if sim.log_file:
+            try:
+                log_path = Path(sim.log_file)
+                if log_path.exists():
+                    log_text = log_path.read_text()
+                    # Show last 500 chars of log for error context
+                    tail = log_text[-500:] if len(log_text) > 500 else log_text
+                    if tail.strip():
+                        result += f"**Log tail:**\n```\n{tail.strip()}\n```"
+            except Exception:
+                pass
     elif sim.status == "running":
         result += f"\n**Simulation is running...**"
 
@@ -3455,6 +4048,7 @@ def setup_uq_analysis(project_name: Optional[str] = None,
     Returns:
         str: Setup status and next steps
     """
+    _ensure_uq_imports()
     if not UQ_AVAILABLE:
         return "**Error:** uq-physicell package not installed. Run: `pip install uq-physicell`"
 
@@ -3798,6 +4392,7 @@ def run_sensitivity_analysis(method: str = "Sobol",
     Returns:
         str: Sensitivity analysis status and run ID
     """
+    _ensure_uq_imports()
     if not UQ_AVAILABLE:
         return "**Error:** uq-physicell not installed. Run: `pip install uq-physicell`"
 
@@ -4095,6 +4690,7 @@ def run_bayesian_calibration(
     Returns:
         str: Calibration status and run ID
     """
+    _ensure_uq_imports()
     if not UQ_BO_AVAILABLE:
         return "**Error:** Bayesian optimization requires: `pip install torch botorch gpytorch`"
 
@@ -4254,6 +4850,7 @@ def run_abc_calibration(
     Returns:
         str: Calibration status and run ID
     """
+    _ensure_uq_imports()
     if not UQ_ABC_AVAILABLE:
         return "**Error:** ABC calibration requires: `pip install pyabc`"
 
