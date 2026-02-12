@@ -3668,10 +3668,15 @@ def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
     except Exception as e:
         return f"Error starting simulation: {str(e)}"
 
+_last_status_check: dict[str, float] = {}  # simulation_id -> last check timestamp
+
 @mcp.tool()
 def get_simulation_status(simulation_id: str) -> str:
     """
     Check the status of a running or completed simulation.
+
+    IMPORTANT: Do NOT call this more than once per minute for a running simulation.
+    Wait at least 60 seconds between calls.
 
     Args:
         simulation_id: The simulation ID returned by run_simulation()
@@ -3686,6 +3691,19 @@ def get_simulation_status(simulation_id: str) -> str:
             return f"Error: Simulation '{simulation_id}' not found. Use list_simulations() to see available simulations."
 
         sim = running_simulations[simulation_id]
+
+    # Rate limit: reject if called less than 55 seconds since last check (for running sims)
+    if sim.status == "running":
+        now = time.time()
+        last = _last_status_check.get(simulation_id, 0)
+        if now - last < 55:
+            wait = int(55 - (now - last))
+            return (
+                f"**Too soon.** Last status check was {int(now - last)}s ago. "
+                f"Wait {wait} more seconds before checking again. "
+                f"Simulations typically take 5-30 minutes."
+            )
+        _last_status_check[simulation_id] = now
 
     # Check if process is still running
     if sim.process:
@@ -3743,7 +3761,7 @@ def get_simulation_status(simulation_id: str) -> str:
             except Exception:
                 pass
     elif sim.status == "running":
-        result += f"\n**Simulation is running...**"
+        result += f"\n**Simulation is running.** Do NOT call `get_simulation_status()` again for at least 60 seconds. Wait, then check again."
 
     return result
 
