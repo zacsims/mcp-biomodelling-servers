@@ -293,7 +293,7 @@ Do NOT try to extract parameters by reading papers directly — use PaperQA's RA
 
 **Phase 3: Act on results**
 11. For rules flagged `unsupported` or `contradictory` — review the evidence summary and adjust half_max, hill_power, or direction as suggested
-12. `mcp__PhysiCell__store_validation_results(validations)` — persist in PhysiCell session
+12. `mcp__PhysiCell__store_validation_results(validations)` — persist in PhysiCell session. **CRITICAL: Each validation dict MUST include `raw_paperqa_answer` containing the EXACT answer text from PaperQA's validate_rule() output. The support level will be independently verified from this text. Do NOT paraphrase, summarize, or omit the raw answer. Do NOT override PaperQA's findings with your own assessment.**
 13. `mcp__PhysiCell__get_validation_report()` — final report
 14. Re-export configuration if parameters were changed
 

@@ -309,7 +309,17 @@ def _parse_support_level(answer_text: str) -> str:
     unsupported_signals = [
         "no evidence", "not supported", "no published",
         "insufficient information", "cannot determine",
-        "i cannot answer",
+        "i cannot answer", "cannot answer",
+        "lack direct experimental support",
+        "lacks direct experimental support",
+        "lacks direct support", "lack direct support",
+        "no direct experimental support",
+        "no experimental support",
+        "no direct evidence", "no direct data",
+        "not been reported", "have not been reported",
+        "no studies have quantified", "no studies have measured",
+        "not been experimentally", "not experimentally validated",
+        "no dose-response", "no dose–response",
     ]
 
     for phrase in unsupported_signals:
@@ -328,7 +338,8 @@ def _parse_support_level(answer_text: str) -> str:
         if phrase in lower:
             return "weak"
 
-    return "moderate"
+    # Default to unsupported — require positive evidence, not absence of denial
+    return "unsupported"
 
 
 # ============================================================================
