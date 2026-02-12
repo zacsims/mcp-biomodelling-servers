@@ -280,67 +280,24 @@ def _build_validation_question(cell_type: str, signal: str, direction: str,
             f" The proposed Hill coefficient is {hill_power}. "
             f"Is this consistent with published data?"
         )
+    question += (
+        " Conclude your answer with exactly one of the following verdict lines:\n"
+        "VERDICT: STRONG — extensive, well-documented experimental support\n"
+        "VERDICT: MODERATE — evidence supports the relationship but specific parameters lack quantitative validation\n"
+        "VERDICT: WEAK — limited or indirect evidence only\n"
+        "VERDICT: CONTRADICTORY — evidence contradicts the proposed relationship or parameters\n"
+        "VERDICT: UNSUPPORTED — no relevant experimental evidence found"
+    )
     return question
 
 
 def _parse_support_level(answer_text: str) -> str:
-    """Parse PaperQA answer to determine support level."""
-    lower = answer_text.lower()
-
-    strong_positive = [
-        "well established", "well-established", "strongly supported",
-        "extensive evidence", "clearly demonstrates", "well documented",
-        "well-documented", "confirmed by multiple", "robust evidence",
-    ]
-    moderate_positive = [
-        "evidence suggests", "supported by", "consistent with",
-        "studies show", "has been reported", "has been observed",
-        "indicates that", "demonstrated that",
-    ]
-    weak_signals = [
-        "limited evidence", "some evidence", "preliminary",
-        "few studies", "not well studied", "indirect evidence",
-        "may", "might", "could potentially",
-    ]
-    contradictory_signals = [
-        "contradictory", "conflicting", "inconsistent",
-        "some studies show the opposite", "debated",
-        "conflicts with", "does not drive",
-        "overestimates", "underestimates",
-    ]
-    unsupported_signals = [
-        "no evidence", "not supported", "no published",
-        "insufficient information", "cannot determine",
-        "i cannot answer", "cannot answer",
-        "lack direct experimental support",
-        "lacks direct experimental support",
-        "lacks direct support", "lack direct support",
-        "no direct experimental support",
-        "no experimental support",
-        "no direct evidence", "no direct data",
-        "not been reported", "have not been reported",
-        "no studies have quantified", "no studies have measured",
-        "not been experimentally", "not experimentally validated",
-        "no dose-response", "no dose–response",
-    ]
-
-    for phrase in unsupported_signals:
-        if phrase in lower:
-            return "unsupported"
-    for phrase in contradictory_signals:
-        if phrase in lower:
-            return "contradictory"
-    for phrase in strong_positive:
-        if phrase in lower:
-            return "strong"
-    for phrase in moderate_positive:
-        if phrase in lower:
-            return "moderate"
-    for phrase in weak_signals:
-        if phrase in lower:
-            return "weak"
-
-    # Default to unsupported — require positive evidence, not absence of denial
+    """Extract VERDICT classification from PaperQA answer text."""
+    import re
+    valid = {"strong", "moderate", "weak", "contradictory", "unsupported"}
+    match = re.search(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", answer_text, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
     return "unsupported"
 
 
