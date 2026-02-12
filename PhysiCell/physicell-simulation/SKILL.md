@@ -26,21 +26,28 @@ If you detect a problem (like "from 0 towards 0"), fix it by calling the appropr
 
 When the user asks to base parameters on literature, determine values from published data, or validate rules against papers, you MUST use the LiteratureValidation MCP server (`mcp__LiteratureValidation__*` tools) **directly from the main conversation**. Do NOT manually read papers/abstracts in context and extract values yourself.
 
-**NEVER use these tools for literature research or parameter extraction:**
-- `WebSearch` / `WebFetch` — NEVER use web search to find biological parameters or read papers. Web search results are unreliable, unverifiable, and waste context. Use the PubMed and bioRxiv MCP servers instead. **If the PubMed MCP is unavailable (failed to load), use WebSearch ONLY to collect PMIDs, then immediately pass them to `add_papers_by_id()`. Do NOT extract parameters from web search results.**
+**NEVER extract biological parameters from these sources:**
 - `get_full_text_article` — dumps 50KB+ into context, wastes the context window
 - `get_article_metadata` — reading abstracts in context to manually extract values is unreliable and wasteful
+- `WebSearch` / `WebFetch` results — NEVER extract parameter values (half_max, hill_power, rates) from web search snippets. Web results lack the rigor of PaperQA's RAG pipeline.
+
+**WebSearch IS allowed for finding paper identifiers:**
+- Use `WebSearch` to find **PMIDs and bioRxiv DOIs** when PubMed MCP is unavailable or rate-limited
+- Example queries: `"hypoxia tumor migration PMID"`, `"oxygen necrosis threshold tumor site:biorxiv.org"`
+- Pass discovered PMIDs/DOIs to `add_papers_by_id()` — do NOT read the web results for parameter values
+
+**NEVER use `add_papers_to_collection()`** — this tool allows passing arbitrary text as "papers," which creates circular validation when the text comes from your own training data. Use **only** `add_papers_by_id()` with real PMIDs or bioRxiv DOIs.
 
 **Instead, follow this workflow:**
-1. Search PubMed with `mcp__plugin_pubmed_PubMed__search_articles()` — collect PMIDs only
-   - **Fallback if PubMed MCP is unavailable:** Use `WebSearch` with queries like `"hypoxia migration PMID"` to find PMIDs, then pass them to `add_papers_by_id()`. Do NOT read or extract parameters from the web search results.
-2. Search bioRxiv with `mcp__plugin_biorxiv_bioRxiv__search_preprints()` — collect bioRxiv DOIs
+1. Search **bioRxiv first** with `mcp__plugin_biorxiv_bioRxiv__search_preprints()` — no rate limiting, 100% PDF availability
+2. Search PubMed with `mcp__plugin_pubmed_PubMed__search_articles()` — collect PMIDs only
+   - **If PubMed is unavailable or rate-limited:** Use `WebSearch` with queries like `"hypoxia migration PMID"` to find PMIDs.
 3. Create a collection: `mcp__LiteratureValidation__create_paper_collection("model_name")`
 4. Index papers with PDF download: `mcp__LiteratureValidation__add_papers_by_id(name="model_name", pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)`
 5. Query PaperQA for each rule: `mcp__LiteratureValidation__validate_rule(name="model_name", cell_type=..., signal=..., direction=..., behavior=..., half_max=..., hill_power=...)`
 6. Review: `mcp__LiteratureValidation__get_validation_summary("model_name")`
 
-PaperQA indexes full PDFs (from PubMed Central, 68+ publishers, and preprint servers) and uses RAG to extract quantitative parameters — far more accurate than web search or reading abstracts. Use `search_articles` ONLY to find PMIDs, then hand them to `add_papers_by_id`. See Section 7 for the full workflow.
+PaperQA indexes full PDFs (from PubMed Central, 68+ publishers, and preprint servers) and uses RAG to extract quantitative parameters — far more accurate than web search or reading abstracts. See Section 7 for the full workflow.
 
 ## ABSOLUTE RULE 3: No Background Agents for Literature Research
 
@@ -278,13 +285,14 @@ Do NOT try to extract parameters by reading papers directly — use PaperQA's RA
 
 **Phase 1: Build a paper collection**
 1. `mcp__LiteratureValidation__create_paper_collection("model_name")`
-2. `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized PubMed queries
-3. Search PubMed: `mcp__plugin_pubmed_PubMed__search_articles(query)` — find relevant papers
-   - **If PubMed MCP is unavailable:** Use `WebSearch` to find PMIDs (e.g. `"hypoxia tumor migration PMID"`). Extract ONLY the PMIDs — do NOT extract parameters from web search results.
-4. `mcp__LiteratureValidation__add_papers_by_id(name, pmids=[...], fetch_pdfs=True)` — downloads PDFs and indexes them
-5. Optionally search bioRxiv: `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=90)`
-6. `mcp__LiteratureValidation__add_papers_by_id(name, biorxiv_dois=[...])` — bioRxiv PDFs are always available
-7. Repeat steps 2-6 for each biological relationship in your model
+2. `mcp__LiteratureValidation__suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized search queries
+3. Search **bioRxiv first** (no rate limiting): `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=365)` — collect bioRxiv DOIs
+4. Search PubMed: `mcp__plugin_pubmed_PubMed__search_articles(query)` — collect PMIDs
+   - **If PubMed is unavailable or rate-limited:** Use `WebSearch` to find PMIDs (e.g. `"hypoxia tumor migration PMID"`, `"oxygen necrosis threshold mmHg PMID"`). Extract ONLY the PMIDs — do NOT extract parameters from web results.
+5. `mcp__LiteratureValidation__add_papers_by_id(name, pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)` — downloads PDFs and indexes them
+6. Repeat steps 2-5 for each biological relationship in your model
+
+**NEVER use `add_papers_to_collection()`** — only use `add_papers_by_id()` with real PMIDs or bioRxiv DOIs. Writing your own paper summaries and passing them as papers creates circular, fabricated validation.
 
 **Phase 2: Validate ALL rules**
 8. Use `mcp__PhysiCell__get_rules_for_validation()` — extract the rule list from your PhysiCell session
@@ -297,11 +305,12 @@ Do NOT try to extract parameters by reading papers directly — use PaperQA's RA
 13. `mcp__PhysiCell__get_validation_report()` — final report
 14. Re-export configuration if parameters were changed
 
-### IMPORTANT: Never read full papers into context
+### IMPORTANT: Never extract parameters manually
 
 - **NEVER use `get_full_text_article`** — dumps 50KB+ into context, wastes the context window
 - **NEVER use `get_article_metadata`** to read abstracts and manually extract values — let PaperQA do the extraction via `validate_rule()`
-- **NEVER use `WebSearch`/`WebFetch`** to find biological parameters — web search is unreliable and unverifiable
+- **NEVER extract parameter values** (half_max, hill_power, rates) **from WebSearch/WebFetch results** — web snippets lack rigor. WebSearch is allowed ONLY for finding PMIDs and bioRxiv DOIs.
+- **NEVER use `add_papers_to_collection()`** — writing your own paper text and passing it to PaperQA is fabrication. Use only `add_papers_by_id()` with real identifiers.
 
 ### Signal units
 
