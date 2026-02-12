@@ -305,6 +305,8 @@ def _parse_support_level(answer_text: str) -> str:
     contradictory_signals = [
         "contradictory", "conflicting", "inconsistent",
         "some studies show the opposite", "debated",
+        "conflicts with", "does not drive",
+        "overestimates", "underestimates",
     ]
     unsupported_signals = [
         "no evidence", "not supported", "no published",
