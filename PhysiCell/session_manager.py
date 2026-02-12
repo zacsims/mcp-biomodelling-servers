@@ -69,6 +69,7 @@ class RuleValidationResult:
     behavior: str
     support_level: str  # 'strong', 'moderate', 'weak', 'contradictory', 'unsupported'
     evidence_summary: str = ""
+    raw_paperqa_answer: str = ""  # Raw PaperQA answer for audit trail
     suggested_half_max: Optional[float] = None
     suggested_hill_power: Optional[float] = None
     key_citations: List[str] = field(default_factory=list)

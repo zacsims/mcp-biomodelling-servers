@@ -85,33 +85,14 @@ Key conversions:
 | Dirichlet boundary | varies | μM |
 | Typical uptake rate | 0.01-0.1 | 1/min |
 
-## Hill Function Parameters for Common Rules
+## Hill Function Parameters
 
-### Oxygen-related rules
-| Rule | half_max | hill_power | Notes |
-|------|:--------:|:----------:|-------|
-| O2 decreases necrosis | 3.75 | 8 | Sharp hypoxia threshold |
-| O2 increases cycle entry | 5-10 | 4 | Moderate response |
-| O2 decreases migration speed | 10 | 4 | Hypoxia-driven migration |
-| O2 increases apoptosis | 2-5 | 4 | Severe hypoxia |
+Hill function parameters (half_max, hill_power) for cell rules must be derived from literature validation using `validate_rules_batch()`. Do NOT use hardcoded default values — these parameters are model-specific and must be justified by experimental evidence.
 
-### Pressure-related rules
-| Rule | half_max | hill_power | Notes |
-|------|:--------:|:----------:|-------|
-| pressure decreases cycle entry | 0.5-1.0 | 4 | Contact inhibition |
-| pressure increases migration speed | 0.5 | 2 | Pressure-driven escape |
-
-### Chemokine-related rules
-| Rule | half_max | hill_power | Notes |
-|------|:--------:|:----------:|-------|
-| chemokine increases migration speed | 0.1-0.5 | 4 | Chemotaxis activation |
-| chemokine increases chemotactic response | 0.1-0.5 | 4 | Directed migration |
-
-### Drug-related rules
-| Rule | half_max | hill_power | Notes |
-|------|:--------:|:----------:|-------|
-| drug increases apoptosis | 0.1-1.0 | 2-4 | Dose-dependent killing |
-| drug decreases cycle entry | 0.1-1.0 | 4 | Cytostatic effect |
+General guidance:
+- **hill_power 2-4**: Graded, dose-dependent response
+- **hill_power 6-10**: Sharp, switch-like threshold response
+- **half_max**: Should correspond to the EC50/IC50 from experimental dose-response data
 
 ## Cell Cycle Models
 
