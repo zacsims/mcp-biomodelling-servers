@@ -2572,6 +2572,8 @@ def _verify_support_level(raw_answer: str) -> str:
     contradictory_phrases = [
         "contradictory", "conflicting", "inconsistent",
         "some studies show the opposite", "debated",
+        "conflicts with", "does not drive",
+        "overestimates", "underestimates",
     ]
     for phrase in contradictory_phrases:
         if phrase in lower:
