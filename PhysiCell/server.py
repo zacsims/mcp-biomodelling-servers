@@ -2542,70 +2542,12 @@ def get_rules_for_validation() -> str:
     return result
 
 
-def _verify_support_level(raw_answer: str) -> str:
-    """Independently verify support level from raw PaperQA answer text.
-
-    Uses conservative parsing — defaults to 'unsupported' unless positive
-    evidence phrases are found. This prevents agent fabrication of support levels.
-    """
-    lower = raw_answer.lower()
-
-    # Check unsupported signals first (highest priority)
-    unsupported_phrases = [
-        "i cannot answer", "cannot answer",
-        "no evidence", "not supported", "no published",
-        "insufficient information", "cannot determine",
-        "lack direct experimental support", "lacks direct experimental support",
-        "lacks direct support", "lack direct support",
-        "no direct experimental support", "no experimental support",
-        "no direct evidence", "no direct data",
-        "not been reported", "have not been reported",
-        "no studies have quantified", "no studies have measured",
-        "not been experimentally", "not experimentally validated",
-        "no dose-response", "no dose–response",
-        "lacks experimental support", "lack experimental support",
-    ]
-    for phrase in unsupported_phrases:
-        if phrase in lower:
-            return "unsupported"
-
-    contradictory_phrases = [
-        "contradictory", "conflicting", "inconsistent",
-        "some studies show the opposite", "debated",
-        "conflicts with", "does not drive",
-        "overestimates", "underestimates",
-    ]
-    for phrase in contradictory_phrases:
-        if phrase in lower:
-            return "contradictory"
-
-    strong_phrases = [
-        "well established", "well-established", "strongly supported",
-        "extensive evidence", "clearly demonstrates", "well documented",
-        "well-documented", "confirmed by multiple", "robust evidence",
-    ]
-    for phrase in strong_phrases:
-        if phrase in lower:
-            return "strong"
-
-    moderate_phrases = [
-        "evidence suggests", "supported by", "consistent with",
-        "studies show", "has been reported", "has been observed",
-        "indicates that", "demonstrated that",
-    ]
-    for phrase in moderate_phrases:
-        if phrase in lower:
-            return "moderate"
-
-    weak_phrases = [
-        "limited evidence", "some evidence", "preliminary",
-        "few studies", "not well studied", "indirect evidence",
-    ]
-    for phrase in weak_phrases:
-        if phrase in lower:
-            return "weak"
-
-    # Default to unsupported — require positive evidence
+def _extract_verdict(raw_answer: str) -> str:
+    """Extract VERDICT classification from raw PaperQA answer text."""
+    import re
+    match = re.search(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", raw_answer, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
     return "unsupported"
 
 
@@ -2616,18 +2558,18 @@ def store_validation_results(
     """
     Store literature validation results for cell rules in the session.
 
-    IMPORTANT: Each validation dict MUST include 'raw_paperqa_answer' containing the
-    exact text returned by PaperQA's validate_rule() tool. The support level will be
-    independently verified from this raw answer to prevent fabrication.
+    Each validation dict MUST include 'raw_paperqa_answer' containing the exact
+    text returned by PaperQA's validate_rule() tool. The support level is extracted
+    directly from the VERDICT line in PaperQA's answer — the agent-provided
+    support_level field is ignored.
 
     Each validation dict should contain:
     - cell_type (str): Cell type name
     - signal (str): Signal name
     - direction (str): 'increases' or 'decreases'
     - behavior (str): Behavior name
-    - support_level (str): 'strong', 'moderate', 'weak', 'contradictory', 'unsupported'
     - raw_paperqa_answer (str, REQUIRED): Exact answer text from PaperQA validate_rule()
-    - evidence_summary (str): Summary of evidence from literature
+    - evidence_summary (str, optional): Summary of evidence from literature
     - suggested_half_max (float, optional): Literature-suggested half-max value
     - suggested_hill_power (float, optional): Literature-suggested Hill coefficient
     - key_citations (list[str], optional): Key paper citations
@@ -2645,25 +2587,18 @@ def store_validation_results(
     if not validations:
         return "**Error:** No validation results provided."
 
-    valid_levels = {"strong", "moderate", "weak", "contradictory", "unsupported"}
     stored = 0
     errors = []
-    overrides = []
 
     for v in validations:
         cell_type = v.get("cell_type", "").strip()
         signal = v.get("signal", "").strip()
         direction = v.get("direction", "").strip()
         behavior = v.get("behavior", "").strip()
-        support_level = v.get("support_level", "").strip().lower()
         raw_answer = v.get("raw_paperqa_answer", "").strip()
 
-        if not all([cell_type, signal, direction, behavior, support_level]):
+        if not all([cell_type, signal, direction, behavior]):
             errors.append("Skipped entry with missing required fields")
-            continue
-
-        if support_level not in valid_levels:
-            errors.append(f"Skipped '{cell_type}/{signal}': invalid support_level '{support_level}'")
             continue
 
         if not raw_answer:
@@ -2673,25 +2608,15 @@ def store_validation_results(
             )
             continue
 
-        # Independently verify support level from raw PaperQA answer
-        verified_level = _verify_support_level(raw_answer)
-        actual_level = support_level
-
-        # Use the MORE CONSERVATIVE level (prevent agent fabrication)
-        level_rank = {"unsupported": 0, "contradictory": 1, "weak": 2, "moderate": 3, "strong": 4}
-        if level_rank.get(support_level, 3) > level_rank.get(verified_level, 0):
-            actual_level = verified_level
-            overrides.append(
-                f"'{cell_type}/{behavior}': agent claimed '{support_level}' "
-                f"but PaperQA answer verified as '{verified_level}' — using '{verified_level}'"
-            )
+        # Extract support level from PaperQA's own VERDICT line
+        support_level = _extract_verdict(raw_answer)
 
         result = RuleValidationResult(
             cell_type=cell_type,
             signal=signal,
             direction=direction,
             behavior=behavior,
-            support_level=actual_level,
+            support_level=support_level,
             evidence_summary=v.get("evidence_summary", ""),
             raw_paperqa_answer=raw_answer,
             suggested_half_max=v.get("suggested_half_max"),
@@ -2706,12 +2631,6 @@ def store_validation_results(
 
     output = f"## Validation Results Stored\n\n"
     output += f"**Stored:** {stored} / {len(validations)} results\n\n"
-
-    if overrides:
-        output += "**Support level corrections (verified from PaperQA answer):**\n"
-        for ov in overrides:
-            output += f"- {ov}\n"
-        output += "\n"
 
     if errors:
         output += "**Warnings:**\n"
