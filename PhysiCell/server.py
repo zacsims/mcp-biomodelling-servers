@@ -2346,15 +2346,15 @@ str: Markdown-formatted export status with file details
                 f"This model has {session.rules_count} cell rules but literature validation "
                 "has not been completed. You MUST validate rules before exporting.\n\n"
                 "**Required steps:**\n"
-                "1. `create_paper_collection()` — create a paper collection\n"
-                "2. Search bioRxiv/PubMed for relevant papers, then `add_papers_by_id()`\n"
-                "3. `get_rules_for_validation()` — get the rule list\n"
-                "4. `validate_rules_batch()` — validate ALL rules\n"
-                "5. `store_validation_results()` — store results for ALL rules\n"
-                "6. `get_validation_report()` — generate the formal report\n"
-                "7. Then call `export_xml_configuration()` again\n\n"
-                "If validation was already done but interrupted by context compaction, "
-                "re-run steps 4-6 to complete it."
+                "1. `get_rules_for_validation()` — get the rule list\n"
+                "2. `validate_rules_batch()` — validate ALL rules (Edison searches 150M+ papers automatically)\n"
+                "3. `store_validation_results()` — store results for ALL rules\n"
+                "4. `get_validation_report()` — generate the formal report\n"
+                "5. Then call `export_xml_configuration()` again\n\n"
+                "**NOTE:** If validation was already done earlier in this conversation "
+                "(e.g., before context compaction or a model rebuild), answer files are "
+                "cached on disk. Steps 2-3 will reuse cached results instantly — no "
+                "duplicate Edison API calls will be made. Just re-run all 5 steps."
             )
 
         # VALIDATION GATE 2: If contradictory rules exist, they must be revised before export
@@ -2589,11 +2589,10 @@ def get_rules_for_validation() -> str:
 
     result += (
         "**Validation workflow:**\n"
-        "1. For each rule, call `suggest_search_queries()` on the LiteratureValidation server\n"
-        "2. Search PubMed with the suggested queries\n"
-        "3. Add paper abstracts to a collection with `add_papers_to_collection()`\n"
-        "4. Call `validate_rules_batch()` with the rules above\n"
-        "5. Call `store_validation_results()` to save results back here"
+        "1. Call `validate_rules_batch(name, rules)` on the LiteratureValidation MCP — Edison searches 150M+ papers automatically\n"
+        "2. Call `get_validation_summary(name)` to review results\n"
+        "3. Call `store_validation_results()` to save results back here\n"
+        "4. Call `get_validation_report()` to generate the formal report"
     )
     return result
 
@@ -2874,11 +2873,9 @@ def get_validation_report() -> str:
             "then call `store_validation_results()` to save results here.\n\n"
             "**Quick start:**\n"
             "1. `get_rules_for_validation()` — export rules\n"
-            "2. `suggest_search_queries()` — get PubMed queries (LiteratureValidation MCP)\n"
-            "3. `search_pubmed()` — find papers (PubMed MCP)\n"
-            "4. `add_papers_to_collection()` — index papers (LiteratureValidation MCP)\n"
-            "5. `validate_rules_batch()` — validate against literature\n"
-            "6. `store_validation_results()` — save results here"
+            "2. `validate_rules_batch(name, rules)` — validate against literature (LiteratureValidation MCP)\n"
+            "3. `store_validation_results()` — save results here\n"
+            "4. `get_validation_report()` — generate the formal report"
         )
 
     # Get current rules for cross-reference
@@ -5790,7 +5787,7 @@ def get_help() -> str:
 
 ### Phase 6: Literature Validation (Optional, requires LiteratureValidation MCP)
 28. **get_rules_for_validation()** - Export rules for literature validation
-29. *LiteratureValidation MCP:* suggest_search_queries() → search PubMed → add_papers_to_collection() → validate_rules_batch()
+29. *LiteratureValidation MCP:* validate_rules_batch() → get_validation_summary()
 30. **store_validation_results()** - Save validation results in session
 31. **get_validation_report()** - View full literature validation report
 

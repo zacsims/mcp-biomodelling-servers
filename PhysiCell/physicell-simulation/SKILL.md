@@ -22,7 +22,7 @@ These rules are enforced by server-side validation. Violating them will cause to
 
 2. **All MCP tools must be called via MCP tool calling** (prefix `mcp__PhysiCell__`). Do NOT run them via Bash, subprocess, or npx.
 
-3. **Never extract parameter values from raw sources.** Do NOT read papers, abstracts, or web results and manually pick out numbers for half_max, hill_power, rates, etc. PaperQA's RAG pipeline (via the LiteratureValidation MCP) does this accurately. WebSearch is allowed ONLY for finding PMIDs and DOIs — never for extracting parameter values.
+3. **Never extract parameter values from raw sources.** Do NOT read papers, abstracts, or web results and manually pick out numbers for half_max, hill_power, rates, etc. Edison's PaperQA3 API (via the LiteratureValidation MCP) does this accurately. WebSearch is allowed ONLY for finding PMIDs and DOIs — never for extracting parameter values.
 
 4. **Never fabricate validation results.** `store_validation_results()` reads PaperQA answer files directly from disk — you cannot override VERDICT or DIRECTION. If no answer file exists for a rule, the server rejects it. You MUST call `validate_rule()` via LiteratureValidation MCP first. If the LiteratureValidation MCP is unavailable, tell the user — do NOT substitute your own knowledge.
 
@@ -213,43 +213,32 @@ Validate whenever the user mentions literature, published data, or validation. T
 |---|---|---|
 | `get_full_text_article` | Dumps 50KB+ into context | `validate_rule()` via LiteratureValidation MCP |
 | `get_article_metadata` | Manual parameter extraction is unreliable | `validate_rule()` via LiteratureValidation MCP |
-| `add_papers_to_collection()` | Allows injecting your own text as "papers" → circular validation | `add_papers_by_id()` with real PMIDs/DOIs only |
-| PubMed MCP plugin (`mcp__plugin_pubmed_PubMed__*`) | Unreliable, frequently rate-limited | `WebSearch` with `allowed_domains: ["pubmed.ncbi.nlm.nih.gov"]` |
-| WebSearch/WebFetch for parameter values | Web snippets lack rigor | WebSearch for finding PMIDs/DOIs only |
+| WebSearch/WebFetch for parameter values | Web snippets lack rigor | `validate_rule()` via LiteratureValidation MCP |
 | Task tool for literature work | Subagents lack MCP access | Do all literature work in main conversation |
 
 ### Workflow
 
-**Phase 1 — Build a paper collection**
+**Phase 1 — Validate every rule (no exceptions)**
 
-1. `create_paper_collection("model_name")`
-2. `suggest_search_queries(cell_type, signal, direction, behavior)` — get optimized queries
-3. Search **bioRxiv first** (no rate limiting, 100% PDF availability): `mcp__plugin_biorxiv_bioRxiv__search_preprints(category=..., recent_days=365)` — collect DOIs
-4. Search **PubMed via WebSearch**: `WebSearch(query="...", allowed_domains=["pubmed.ncbi.nlm.nih.gov"])` — extract PMIDs from URLs (e.g., `.../35486828/` → PMID `35486828`)
-5. `add_papers_by_id(name, pmids=[...], biorxiv_dois=[...], fetch_pdfs=True)` — downloads and indexes PDFs
-6. Repeat steps 2-5 for each biological relationship
+1. `get_rules_for_validation()` — get the full rule list from your PhysiCell session
+2. `validate_rules_batch(name, rules)` — validate ALL rules from step 1. Do NOT skip any. Include `signal_units` when known (e.g., "mmHg" for oxygen). Edison automatically searches 150M+ papers — no paper collection management needed.
+3. `get_validation_summary(name)` — review support levels
 
-**Phase 2 — Validate every rule (no exceptions)**
+**Phase 2 — Store and report (mandatory)**
 
-7. `get_rules_for_validation()` — get the full rule list from your PhysiCell session
-8. `validate_rules_batch(name, rules)` — validate ALL rules from step 7. Do NOT skip any. Include `signal_units` when known (e.g., "mmHg" for oxygen).
-9. `get_validation_summary(name)` — review support levels
+4. `store_validation_results(validations)` — persist results. Each dict needs `cell_type`, `signal`, `direction`, `behavior`, and optionally `collection_name`. The server reads PaperQA answer files directly from disk — you do NOT need to pass `raw_paperqa_answer`. VERDICT and DIRECTION are extracted server-side from the authoritative files written by `validate_rule()`. Direction mismatches are auto-flagged as `contradictory`. Store ALL rules, not a subset.
+5. `get_validation_report()` — generates the formal report. **You MUST call this.** Do NOT substitute your own summary.
 
-**Phase 3 — Store and report (mandatory)**
+**Phase 3 — Revise contradictions (mandatory if any exist)**
 
-10. `store_validation_results(validations)` — persist results. Each dict needs `cell_type`, `signal`, `direction`, `behavior`, and optionally `collection_name`. The server reads PaperQA answer files directly from disk — you do NOT need to pass `raw_paperqa_answer`. VERDICT and DIRECTION are extracted server-side from the authoritative files written by `validate_rule()`. Direction mismatches are auto-flagged as `contradictory`. Store ALL rules, not a subset.
-11. `get_validation_report()` — generates the formal report. **You MUST call this.** Do NOT substitute your own summary.
-
-**Phase 4 — Revise contradictions (mandatory if any exist)**
-
-12. For each `contradictory` rule:
+6. For each `contradictory` rule:
     - **Direction mismatches** (literature says the opposite direction): Change the `direction` parameter in `add_single_cell_rule()`. The server detects these automatically from PaperQA's `DIRECTION:` verdict.
     - **Other contradictions**: Adjust half_max, hill_power, or base value based on the PaperQA evidence
     - Re-validate with `validate_rule()` or `validate_rules_batch()`
     - `store_validation_results()` to update
     - `get_validation_report()` to confirm no contradictions remain
-13. For `unsupported` rules: review evidence and apply any suggested adjustments. These do not block export but should be noted.
-14. Re-export configuration after all revisions.
+7. For `unsupported` rules: review evidence and apply any suggested adjustments. These do not block export but should be noted.
+8. Re-export configuration after all revisions.
 
 ### Signal units
 
@@ -277,7 +266,7 @@ After `run_simulation()`:
 - **`references/troubleshooting.md`** — Error diagnosis by symptom
 - **`references/uq-calibration-workflow.md`** — Sensitivity analysis and calibration
 - **`references/physiboss-integration.md`** — Boolean network (MaBoSS/PhysiBoSS) integration
-- **`references/literature-validation.md`** — PDF indexing, PaperQA, bioRxiv details
+- **`references/literature-validation.md`** — Edison PaperQA3 API integration details
 
 ## 10. Quick Start Template
 
