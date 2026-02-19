@@ -1850,6 +1850,13 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
     session.rules_count += 1
     session.mark_step_complete(WorkflowStep.RULES_CONFIGURED)
 
+    # Clear any existing validation for this rule (e.g., contradictory → revised)
+    session.rule_validations = [
+        rv for rv in session.rule_validations
+        if not (rv.cell_type == cell_type and rv.signal == signal.strip()
+                and rv.direction == direction and rv.behavior == behavior.strip())
+    ]
+
     # Ensure the ruleset is registered as enabled in XML config
     session.config.cell_rules.add_ruleset(
         "cell_rules", folder="./config", filename="cell_rules.csv", enabled=True
@@ -2332,6 +2339,55 @@ str: Markdown-formatted export status with file details
         if not cell_types and session.cell_types_count > 0:
             cell_types = [f"cell_type_{i+1}" for i in range(session.cell_types_count)]
         
+        # VALIDATION GATE 1: If rules exist, validation must be completed before export
+        if session.rules_count > 0 and not session.is_step_complete(WorkflowStep.RULES_VALIDATED):
+            return (
+                "**Error: Literature validation required before export.**\n\n"
+                f"This model has {session.rules_count} cell rules but literature validation "
+                "has not been completed. You MUST validate rules before exporting.\n\n"
+                "**Required steps:**\n"
+                "1. `create_paper_collection()` — create a paper collection\n"
+                "2. Search bioRxiv/PubMed for relevant papers, then `add_papers_by_id()`\n"
+                "3. `get_rules_for_validation()` — get the rule list\n"
+                "4. `validate_rules_batch()` — validate ALL rules\n"
+                "5. `store_validation_results()` — store results for ALL rules\n"
+                "6. `get_validation_report()` — generate the formal report\n"
+                "7. Then call `export_xml_configuration()` again\n\n"
+                "If validation was already done but interrupted by context compaction, "
+                "re-run steps 4-6 to complete it."
+            )
+
+        # VALIDATION GATE 2: If contradictory rules exist, they must be revised before export
+        if session.rule_validations:
+            contradictory = [
+                rv for rv in session.rule_validations
+                if rv.support_level == "contradictory"
+            ]
+            if contradictory:
+                msg = (
+                    "**Error: Contradictory rules must be revised before export.**\n\n"
+                    f"{len(contradictory)} rule(s) were flagged as CONTRADICTORY by literature validation. "
+                    "You MUST revise these rules before exporting.\n\n"
+                    "**Contradictory rules:**\n"
+                )
+                for rv in contradictory:
+                    msg += f"- **{rv.cell_type}** | {rv.signal} {rv.direction} {rv.behavior}\n"
+                    if rv.raw_paperqa_answer:
+                        # Show first 200 chars of evidence
+                        snippet = rv.raw_paperqa_answer[:200].replace("\n", " ")
+                        msg += f"  Evidence: {snippet}...\n"
+                msg += (
+                    "\n**Required steps:**\n"
+                    "1. Review the PaperQA evidence for each contradictory rule\n"
+                    "2. Modify the rule using `add_single_cell_rule()` — change direction, "
+                    "half_max, hill_power, or base value as the evidence suggests\n"
+                    "3. Re-validate the modified rule(s) using `validate_rule()` or `validate_rules_batch()`\n"
+                    "4. `store_validation_results()` — store updated results\n"
+                    "5. `get_validation_report()` — regenerate report\n"
+                    "6. Then call `export_xml_configuration()` again"
+                )
+                return msg
+
         # If initial cells have been placed, ensure XML config enables cells.csv
         if session.initial_cells_count > 0:
             session.config.initial_conditions.add_csv_file("cells.csv", "./config", enabled=True)
@@ -2543,12 +2599,75 @@ def get_rules_for_validation() -> str:
 
 
 def _extract_verdict(raw_answer: str) -> str:
-    """Extract VERDICT classification from raw PaperQA answer text."""
+    """Extract VERDICT classification from raw PaperQA answer text.
+
+    Uses the LAST match because the answer file contains the prompt template
+    (with all VERDICT options listed) followed by PaperQA's actual answer.
+    re.search() would match the first template option, not the real verdict.
+
+    CONTRADICTORY is no longer a valid VERDICT — directional contradictions
+    are caught by the DIRECTION check instead. If PaperQA still writes
+    CONTRADICTORY, map it to 'weak'.
+    """
     import re
-    match = re.search(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", raw_answer, re.IGNORECASE)
-    if match:
-        return match.group(1).lower()
+    matches = re.findall(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", raw_answer, re.IGNORECASE)
+    if matches:
+        level = matches[-1].lower()  # Last match = PaperQA's actual verdict
+        if level == "contradictory":
+            return "weak"
+        return level
     return "unsupported"
+
+
+def _extract_direction(raw_answer: str) -> str:
+    """Extract DIRECTION from raw PaperQA answer text.
+
+    Uses the LAST match because the answer file contains the prompt template
+    (with all DIRECTION options listed) followed by PaperQA's actual answer.
+    re.search() would match the first template option, not the real direction.
+
+    Returns 'increases', 'decreases', or 'ambiguous'.
+    """
+    import re
+    matches = re.findall(r"DIRECTION:\s*(INCREASES|DECREASES|AMBIGUOUS)", raw_answer, re.IGNORECASE)
+    if matches:
+        return matches[-1].lower()  # Last match = PaperQA's actual direction
+    return "ambiguous"
+
+
+def _find_answer_file(cell_type: str, signal: str, direction: str, behavior: str,
+                      collection_name: str | None = None) -> Path | None:
+    """Find a PaperQA answer file on disk for a given rule.
+
+    Searches LiteratureValidation answer directories for matching files.
+    Checks both direction-agnostic keys (new format) and legacy keys (with direction).
+    If collection_name is provided, only searches that collection.
+
+    Returns the Path to the answer file, or None if not found.
+    """
+    import re as _re
+    lit_val_base = Path.home() / "Documents" / "LiteratureValidation"
+    if not lit_val_base.exists():
+        return None
+
+    safe_key = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{behavior}")
+    safe_key_legacy = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{direction}_{behavior}")
+
+    # Determine which directories to search
+    if collection_name:
+        search_dirs = [lit_val_base / collection_name.strip().lower().replace(" ", "_")]
+    else:
+        try:
+            search_dirs = [d for d in lit_val_base.iterdir() if d.is_dir()]
+        except Exception:
+            return None
+
+    for collection_dir in search_dirs:
+        for key in (safe_key, safe_key_legacy):
+            candidate = collection_dir / "answers" / f"{key}.md"
+            if candidate.exists():
+                return candidate
+    return None
 
 
 @mcp.tool()
@@ -2558,17 +2677,17 @@ def store_validation_results(
     """
     Store literature validation results for cell rules in the session.
 
-    Each validation dict MUST include 'raw_paperqa_answer' containing the exact
-    text returned by PaperQA's validate_rule() tool. The support level is extracted
-    directly from the VERDICT line in PaperQA's answer — the agent-provided
-    support_level field is ignored.
+    The server reads PaperQA answer files directly from disk — the agent does NOT
+    need to pass raw answer text. VERDICT and DIRECTION are extracted server-side
+    from the authoritative answer files written by validate_rule().
 
     Each validation dict should contain:
     - cell_type (str): Cell type name
     - signal (str): Signal name
     - direction (str): 'increases' or 'decreases'
     - behavior (str): Behavior name
-    - raw_paperqa_answer (str, REQUIRED): Exact answer text from PaperQA validate_rule()
+    - collection_name (str, optional): LiteratureValidation collection name (searches all if omitted)
+    - raw_paperqa_answer (str, DEPRECATED): No longer needed — server reads from disk
     - evidence_summary (str, optional): Summary of evidence from literature
     - suggested_half_max (float, optional): Literature-suggested half-max value
     - suggested_hill_power (float, optional): Literature-suggested Hill coefficient
@@ -2595,21 +2714,47 @@ def store_validation_results(
         signal = v.get("signal", "").strip()
         direction = v.get("direction", "").strip()
         behavior = v.get("behavior", "").strip()
-        raw_answer = v.get("raw_paperqa_answer", "").strip()
+        collection_name = v.get("collection_name", "").strip() or None
 
         if not all([cell_type, signal, direction, behavior]):
             errors.append("Skipped entry with missing required fields")
             continue
 
-        if not raw_answer:
+        # Find the PaperQA answer file on disk (written by validate_rule())
+        answer_file = _find_answer_file(cell_type, signal, direction, behavior, collection_name)
+
+        if answer_file is None:
             errors.append(
-                f"Skipped '{cell_type}/{signal}/{behavior}': missing raw_paperqa_answer. "
-                "You MUST include the exact PaperQA answer text."
+                f"**REJECTED** '{cell_type}/{signal}/{behavior}': No PaperQA answer file found on disk. "
+                f"You MUST call `validate_rule()` or `validate_rules_batch()` via the "
+                f"LiteratureValidation MCP first. Do NOT skip validation."
             )
             continue
 
+        # Read the authoritative answer from disk (not from agent input)
+        try:
+            file_content = answer_file.read_text(encoding="utf-8")
+        except Exception as e:
+            errors.append(f"Failed to read answer file for '{cell_type}/{signal}/{behavior}': {e}")
+            continue
+
         # Extract support level from PaperQA's own VERDICT line
-        support_level = _extract_verdict(raw_answer)
+        support_level = _extract_verdict(file_content)
+
+        # Extract literature direction from PaperQA's DIRECTION line
+        literature_direction = _extract_direction(file_content)
+
+        # Compute direction match
+        if literature_direction == "ambiguous":
+            direction_match = None
+        elif literature_direction == direction:
+            direction_match = True
+        else:
+            direction_match = False
+
+        # Auto-flag direction mismatches as contradictory
+        if direction_match is False:
+            support_level = "contradictory"
 
         result = RuleValidationResult(
             cell_type=cell_type,
@@ -2618,15 +2763,34 @@ def store_validation_results(
             behavior=behavior,
             support_level=support_level,
             evidence_summary=v.get("evidence_summary", ""),
-            raw_paperqa_answer=raw_answer,
+            raw_paperqa_answer=file_content,
             suggested_half_max=v.get("suggested_half_max"),
             suggested_hill_power=v.get("suggested_hill_power"),
             key_citations=v.get("key_citations", []),
+            literature_direction=literature_direction,
+            direction_match=direction_match,
         )
         session.rule_validations.append(result)
         stored += 1
 
-    if stored > 0:
+    # Check if ALL rules have been validated before marking step complete
+    try:
+        current_rules = session.config.cell_rules_csv.get_rules()
+    except Exception:
+        current_rules = []
+
+    validated_keys = {
+        (rv.cell_type, rv.signal, rv.direction, rv.behavior)
+        for rv in session.rule_validations
+    }
+    all_rule_keys = {
+        (r.get("cell_type", ""), r.get("signal", ""),
+         r.get("direction", ""), r.get("behavior", ""))
+        for r in current_rules
+    }
+    missing_rules = all_rule_keys - validated_keys
+
+    if stored > 0 and not missing_rules:
         session.mark_step_complete(WorkflowStep.RULES_VALIDATED)
 
     output = f"## Validation Results Stored\n\n"
@@ -2637,6 +2801,19 @@ def store_validation_results(
         for err in errors[:5]:
             output += f"- {err}\n"
         output += "\n"
+
+    if missing_rules:
+        output += f"### Missing Validations ({len(missing_rules)} rules not yet validated)\n\n"
+        output += (
+            "**`export_xml_configuration()` is BLOCKED** until ALL rules are validated. "
+            "The following rules still need validation:\n\n"
+        )
+        for ct, sig, dir_, beh in sorted(missing_rules):
+            output += f"- {ct} | {sig} {dir_} {beh}\n"
+        output += (
+            "\nCall `validate_rules_batch()` with these rules, then "
+            "`store_validation_results()` again to complete validation.\n\n"
+        )
 
     # Summary by support level
     level_counts: dict[str, int] = {}
@@ -2732,7 +2909,21 @@ def get_validation_report() -> str:
     for i, rv in enumerate(session.rule_validations, 1):
         dir_arrow = ">" if rv.direction == "increases" else "v"
         report += f"#### {i}. {rv.cell_type} | {rv.signal} {dir_arrow} {rv.behavior}\n"
-        report += f"**Support:** {rv.support_level.upper()}\n\n"
+        report += f"**Support:** {rv.support_level.upper()}\n"
+
+        # Show direction match status
+        if rv.direction_match is False:
+            report += (
+                f"\n**DIRECTION MISMATCH** — Literature says {rv.signal} "
+                f"**{rv.literature_direction}** {rv.behavior}, but rule proposes "
+                f"{rv.signal} **{rv.direction}** {rv.behavior}. "
+                f"The rule direction must be changed.\n"
+            )
+        elif rv.direction_match is True:
+            report += f"**Direction:** Confirmed by literature ({rv.literature_direction})\n"
+        elif rv.literature_direction:
+            report += f"**Direction:** Could not be determined from literature\n"
+        report += "\n"
 
         # Show raw PaperQA answer (audit trail)
         if rv.raw_paperqa_answer:
@@ -2774,10 +2965,59 @@ def get_validation_report() -> str:
             unvalidated.append(r)
 
     if unvalidated:
-        report += "### Unvalidated Rules\n"
+        report += f"### ACTION REQUIRED: Unvalidated Rules ({len(unvalidated)} remaining)\n\n"
+        report += (
+            "**`export_xml_configuration()` is BLOCKED** until ALL rules are validated. "
+            "The following rules have not been validated:\n\n"
+        )
         for r in unvalidated:
-            report += f"- {r.get('cell_type', '?')} | {r.get('signal', '?')} -> {r.get('behavior', '?')}\n"
-        report += "\n"
+            report += f"- {r.get('cell_type', '?')} | {r.get('signal', '?')} {r.get('direction', '?')} {r.get('behavior', '?')}\n"
+        report += (
+            "\nCall `validate_rules_batch()` with these rules, then "
+            "`store_validation_results()` to complete validation.\n\n"
+        )
+
+    # Action required for contradictory rules (including direction mismatches)
+    contradictory = [rv for rv in session.rule_validations if rv.support_level == "contradictory"]
+    if contradictory:
+        direction_mismatches = [rv for rv in contradictory if rv.direction_match is False]
+        other_contradictions = [rv for rv in contradictory if rv.direction_match is not False]
+
+        report += "\n### ACTION REQUIRED: Contradictory Rules\n\n"
+        report += (
+            f"**{len(contradictory)} rule(s) are CONTRADICTORY.** These rules MUST be revised "
+            "before the model can be exported.\n\n"
+            "**`export_xml_configuration()` will REFUSE to export until all contradictory rules are resolved.**\n\n"
+        )
+
+        if direction_mismatches:
+            report += (
+                f"**Direction Mismatches ({len(direction_mismatches)}):** The literature-determined direction "
+                "contradicts the proposed rule direction. Fix by changing the `direction` parameter in "
+                "`add_single_cell_rule()`.\n\n"
+            )
+            for rv in direction_mismatches:
+                report += (
+                    f"- **{rv.cell_type}** | {rv.signal} {rv.direction} {rv.behavior} "
+                    f"— literature says **{rv.literature_direction}**\n"
+                )
+            report += "\n"
+
+        if other_contradictions:
+            report += f"**Other Contradictions ({len(other_contradictions)}):**\n"
+            for rv in other_contradictions:
+                report += f"- {rv.cell_type} | {rv.signal} {rv.direction} {rv.behavior}\n"
+            report += "\n"
+
+        report += (
+            "**Steps to resolve:**\n"
+            "1. Review the PaperQA evidence above\n"
+            "2. Modify the rule with `add_single_cell_rule()` — for direction mismatches, change the "
+            "`direction` parameter; for other contradictions, adjust half_max, hill_power, or base value\n"
+            "3. Re-validate the modified rule with `validate_rule()` or `validate_rules_batch()`\n"
+            "4. `store_validation_results()` to update the stored results\n"
+            "5. `get_validation_report()` to regenerate this report\n\n"
+        )
 
     report += f"**Progress:** {session.get_progress_percentage():.0f}%"
 

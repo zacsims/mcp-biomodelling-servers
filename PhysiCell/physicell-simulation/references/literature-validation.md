@@ -67,9 +67,9 @@ mcp__LiteratureValidation__add_papers_by_id(
 ```
 This automatically:
 - Fetches title, abstract, authors, year from NCBI
-- Converts PMIDs to PMCIDs and downloads full PDFs from PubMed Central
-- Falls back to abstract-only text when no PMC version exists (~84% of articles)
-- Indexes everything in PaperQA
+- Downloads full PDFs via metapub FindIt (68+ publishers) and Unpaywall
+- Skips papers without available PDFs (no abstract-only fallback)
+- Indexes PDFs in PaperQA
 
 **Step 5 (optional): Search bioRxiv**
 ```python
@@ -146,14 +146,11 @@ mcp__PhysiCell__store_validation_results(validations=[
         "signal": "oxygen",
         "direction": "decreases",
         "behavior": "necrosis",
-        "support_level": "strong",
-        "evidence_summary": "Well-established that hypoxia induces necrosis in solid tumors",
-        "suggested_half_max": 3.75,
-        "suggested_hill_power": 8,
-        "key_citations": ["Smith et al. 2023", "Jones et al. 2022"]
+        "collection_name": "tumor_oxygen_model"
     }
 ])
 ```
+The server reads PaperQA answer files directly from disk — VERDICT and DIRECTION are extracted server-side. Direction mismatches are auto-flagged as `contradictory`.
 
 **Step 10: Generate report**
 ```python
@@ -177,11 +174,11 @@ mcp__LiteratureValidation__add_papers_to_collection(
             "year": "2023"
         }
     ],
-    fetch_pdfs=True  # Attempt PDF download from PMC/bioRxiv
+    fetch_pdfs=True  # Download PDF; skip if unavailable
 )
 ```
 
-With `fetch_pdfs=False` (default), only the abstract text is indexed.
+Only papers with downloadable full PDFs are indexed. Papers without available PDFs are skipped entirely.
 
 ## Support Level Interpretation
 

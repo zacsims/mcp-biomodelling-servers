@@ -9,10 +9,10 @@ When building PhysiCell simulations, users define **cell rules** — relationshi
 
 This server answers that question by:
 
-1. **Generating optimized search queries** for finding relevant papers on PubMed
-2. **Indexing paper abstracts and full text** into a PaperQA2 document store
-3. **Asking focused questions** about each rule's biological plausibility
-4. **Returning evidence-based verdicts** with support levels, citations, and parameter suggestions
+1. **Generating optimized search queries** for finding relevant papers on PubMed and bioRxiv
+2. **Indexing paper abstracts and full PDFs** into a PaperQA2 document store
+3. **Asking direction-agnostic questions** about each rule's biological plausibility — PaperQA independently determines the direction of the relationship from literature, preventing leading-question bias
+4. **Returning evidence-based verdicts** with literature-determined direction (`DIRECTION`), evidence strength (`VERDICT`), citations, and parameter suggestions
 
 ### Architecture: LLM-Orchestrated Multi-Server Workflow
 
@@ -60,7 +60,7 @@ Output: Collection created with papers directory at
 
 #### `add_papers_to_collection(name, papers, fetch_pdfs=False)`
 
-Indexes papers into a collection. Each paper is a dict with `title` and `text` (abstract or full text), plus optional metadata (`pmid`, `doi`, `biorxiv_doi`, `authors`, `year`). When `fetch_pdfs=True`, attempts to download full PDFs before falling back to text-only indexing.
+Indexes papers into a collection (**PDF-only** — papers without downloadable full PDFs are skipped entirely). Each paper is a dict with `title` and `text` (abstract or full text), plus optional metadata (`pmid`, `doi`, `biorxiv_doi`, `authors`, `year`). When `fetch_pdfs=True`, attempts to download full PDFs; papers without available PDFs are skipped.
 
 ```
 Input:  name = "hypoxia_migration"
@@ -70,14 +70,14 @@ Input:  name = "hypoxia_migration"
            "pmid": "12345678", "year": "2020"}
         ]
         fetch_pdfs = True
-Output: 1 / 1 papers indexed (PDFs: 1 | Text-only: 0)
+Output: 1 / 1 papers indexed (PDFs only)
 ```
 
-The typical workflow is: search PubMed via a PubMed MCP server, collect abstracts, then pass them here for indexing.
+The typical workflow is: search PubMed via WebSearch, collect PMIDs, then use `add_papers_by_id()` to download and index PDFs.
 
 #### `add_papers_by_id(name, pmids=None, biorxiv_dois=None, fetch_pdfs=True)`
 
-Streamlined tool for adding papers when you already have PubMed IDs or bioRxiv DOIs. Automatically fetches metadata (title, abstract) and downloads full PDFs when available.
+Streamlined tool for adding papers when you already have PubMed IDs or bioRxiv DOIs. Automatically fetches metadata (title, abstract) and downloads full PDFs. **Papers without available PDFs are skipped entirely** — no abstract-only fallback.
 
 PDF discovery uses a three-layer strategy:
 1. **bioRxiv direct download** — always available for bioRxiv preprints
@@ -88,7 +88,8 @@ PDF discovery uses a three-layer strategy:
 Input:  name = "hypoxia_migration"
         pmids = ["35486828", "33264437", "28400552"]
         fetch_pdfs = True
-Output: 3 / 3 papers indexed (PDFs: 2 | Text-only: 1)
+Output: 2 / 3 papers indexed (PDFs only)
+        Skipped (no PDF): 1
 ```
 
 #### `suggest_search_queries(cell_type, signal, direction, behavior)`
@@ -109,20 +110,26 @@ Output: 5 ready-to-use PubMed query strings
 
 #### `validate_rule(name, cell_type, signal, direction, behavior, ...)`
 
-The core validation tool. Constructs a focused question about the rule's biological plausibility and asks PaperQA to answer it using the indexed literature. Returns:
+The core validation tool. Constructs a **direction-agnostic** question (e.g., "What is the effect of oxygen on migration_speed in cancer cells?") and asks PaperQA to answer it using the indexed literature. PaperQA independently determines the direction of the relationship, preventing leading-question bias. Returns:
 
-- **Support level**: `strong`, `moderate`, `weak`, `contradictory`, or `unsupported`
+- **Literature direction**: `DIRECTION: INCREASES`, `DECREASES`, or `AMBIGUOUS` — what PaperQA determined from the evidence
+- **Direction match**: Whether the literature direction agrees with the proposed rule direction. Mismatches are prominently flagged.
+- **Support level**: `VERDICT: STRONG`, `MODERATE`, `WEAK`, or `UNSUPPORTED` — evidence strength
 - **Evidence summary**: PaperQA's narrative answer with reasoning
 - **References**: Cited papers from the collection
 
-Optional parameters `half_max` and `hill_power` trigger additional checks on whether the proposed parameter values are consistent with published dose-response data.
+Optional parameters `half_max` and `hill_power` are mentioned "for reference" in the question without stating the proposed direction.
+
+The full PaperQA answer is saved to an answer file on disk at `~/Documents/LiteratureValidation/{collection}/answers/{cell_type}_{signal}_{behavior}.md`. The PhysiCell MCP server's `store_validation_results()` reads these files directly to extract verdicts, ensuring the agent cannot fabricate or alter results.
 
 ```
 Input:  name = "hypoxia_migration"
         cell_type = "cancer", signal = "oxygen",
         direction = "decreases", behavior = "migration_speed",
         half_max = 10.0, hill_power = 4.0
-Output: Support Level: STRONG
+Output: Literature Direction: decreases
+        Direction: Confirmed by literature
+        Support Level: STRONG
         Evidence: "Hypoxia-induced migration is well established..."
         References: [Smith et al. 2020, Jones et al. 2019, ...]
 ```
@@ -148,15 +155,24 @@ Returns a summary of all validations performed on a collection: support level di
 
 ### Support Levels
 
+PaperQA returns two verdicts per rule:
+
+**DIRECTION** — what the literature says about the relationship direction:
+| Direction | Meaning |
+|-----------|---------|
+| **increases** | Literature indicates increasing signal increases the behavior |
+| **decreases** | Literature indicates increasing signal decreases the behavior |
+| **ambiguous** | Evidence is mixed or insufficient to determine direction |
+
+**VERDICT** — evidence strength (independent of direction):
 | Level | Meaning |
 |-------|---------|
-| **strong** | Well-established in literature with extensive evidence |
-| **moderate** | Supported by multiple studies, consistent with evidence |
+| **strong** | Well-established in literature with extensive quantitative evidence |
+| **moderate** | Supported by multiple studies, consistent qualitative evidence |
 | **weak** | Limited or preliminary evidence, few studies |
-| **contradictory** | Conflicting evidence in the literature |
-| **unsupported** | No evidence found, or evidence contradicts the rule |
+| **unsupported** | No relevant evidence found |
 
-Support levels are determined by analyzing PaperQA's answer text for characteristic phrases. Rules flagged as `unsupported` or `contradictory` should be reviewed and potentially revised before running simulations.
+Support levels are extracted from the `VERDICT:` line in PaperQA's structured answer. A fifth level, **contradictory**, is auto-assigned by the PhysiCell MCP server when the literature direction disagrees with the proposed rule direction (e.g., rule says "increases" but literature says "decreases"). Rules flagged as `unsupported` or `contradictory` should be reviewed and potentially revised before running simulations.
 
 ### Complete Validation Workflow
 
@@ -198,12 +214,20 @@ LitValidation:  validate_rules_batch("tumor_model_v1", rules)
 LitValidation:  get_validation_summary("tumor_model_v1")
 
 # Step 9: Store results back in the PhysiCell session
-PhysiCell MCP:  store_validation_results(validation_results)
+#          Server reads answer files from disk — just pass rule identifiers
+PhysiCell MCP:  store_validation_results([
+                  {"cell_type": "cancer", "signal": "oxygen",
+                   "direction": "decreases", "behavior": "migration_speed",
+                   "collection_name": "tumor_model_v1"},
+                  ...
+                ])
+                → VERDICT and DIRECTION extracted server-side
+                → Direction mismatches auto-flagged as contradictory
 
 # Step 10: View the full report
 PhysiCell MCP:  get_validation_report()
-                → Comprehensive report with all validations,
-                  parameter suggestions, and unvalidated rules
+                → Comprehensive report with direction match status,
+                  support levels, evidence, and unvalidated rules
 ```
 
 ### Example: Validating a Hypoxia-Migration Rule
@@ -221,11 +245,12 @@ The LLM would:
 
 3. Search PubMed and collect 15 relevant abstracts
 
-4. Call `add_papers_to_collection("hypoxia_migration", papers)` — indexes all 15
+4. Call `add_papers_by_id("hypoxia_migration", pmids=["35486828", ...], fetch_pdfs=True)` — downloads and indexes PDFs
 
-5. Call `validate_rule("hypoxia_migration", "cancer", "oxygen", "decreases", "migration_speed", half_max=10, hill_power=4)`
+5. Call `validate_rule("hypoxia_migration", "cancer", "oxygen", "decreases", "migration_speed", half_max=10, hill_power=4, signal_units="mmHg")`
 
 6. Gets back:
+   > **Literature Direction: DECREASES** (confirmed by literature)
    > **Support Level: STRONG**
    >
    > Hypoxia-induced cancer cell migration is well established in the literature. Multiple studies demonstrate that low oxygen environments activate HIF-1alpha signaling, which upregulates migration-associated genes. The proposed half-max of 10 mmHg is consistent with published EC50 values for hypoxia-responsive migration in breast cancer cells (8-15 mmHg range). A Hill coefficient of 4 suggests a moderately switch-like response, which is reasonable for HIF-1alpha-mediated transcriptional programs.
@@ -310,8 +335,8 @@ or call `suggest_search_queries()` with a test rule to confirm the server is res
 
 The server configures PaperQA with:
 
-- **LLM**: `gpt-4o` via litellm (main reasoning)
-- **Summary LLM**: `gpt-4o-mini` via litellm (document summarization)
+- **LLM**: `o4-mini` via litellm (main reasoning, temperature=1 as required by reasoning models)
+- **Summary LLM**: `o4-mini` via litellm (document summarization)
 - **Embeddings**: `text-embedding-3-small` via litellm
 - **Evidence retrieval**: Top 10 chunks, max 5 sources per answer
 
@@ -323,15 +348,23 @@ Papers and collections are stored under `LITERATURE_VALIDATION_DIR`:
 ~/Documents/LiteratureValidation/
   hypoxia_migration/
     papers/
-      a1b2c3d4e5f6.pdf    # Full PDF (when available)
-      b2c3d4e5f6a1.txt    # Abstract text (fallback)
+      a1b2c3d4e5f6.pdf    # Full PDF
+      c3d4e5f6a1b2.pdf    # Full PDF
+      ...
+    answers/
+      cancer_oxygen_migration_speed.md   # PaperQA answer file
+      cancer_pressure_cycle_entry.md     # (direction-agnostic filename)
       ...
   tumor_immune/
     papers/
       ...
+    answers/
+      ...
 ```
 
-PDF files are downloaded from PubMed Central, publisher sites (via metapub), or preprint repositories (via Unpaywall). Text files contain metadata headers (title, authors, year, PMID, DOI) followed by the abstract.
+Only full PDFs are indexed — papers without downloadable PDFs are skipped entirely. PDF files are downloaded from PubMed Central, publisher sites (via metapub FindIt), bioRxiv/medRxiv (direct download), or open-access repositories (via Unpaywall).
+
+Answer files are written by `validate_rule()` and contain the full PaperQA response including `DIRECTION:` and `VERDICT:` lines. The PhysiCell MCP server's `store_validation_results()` reads these files directly from disk as the authoritative source of truth — this prevents the agent from fabricating or altering validation results.
 
 ### Dependencies
 
@@ -352,10 +385,10 @@ The PhysiCell MCP server provides three companion tools for the validation workf
 | Tool | Purpose |
 |------|---------|
 | `get_rules_for_validation()` | Exports current rules as structured JSON for validation |
-| `store_validation_results(validations)` | Persists validation results in the PhysiCell session state |
-| `get_validation_report()` | Generates a comprehensive report with support levels, evidence, citations, and parameter suggestions |
+| `store_validation_results(validations)` | Reads PaperQA answer files from disk and persists results in the PhysiCell session. Each validation dict needs `cell_type`, `signal`, `direction`, `behavior`, and optionally `collection_name`. VERDICT and DIRECTION are extracted server-side from the authoritative answer files — the agent cannot override them. Direction mismatches are auto-flagged as `contradictory`. |
+| `get_validation_report()` | Generates a comprehensive report with support levels, direction match status, evidence, citations, and parameter suggestions |
 
-Validation results stored in the PhysiCell session include per-rule support levels, evidence summaries, suggested parameter adjustments, and key citations. These persist alongside the simulation configuration and appear in `get_simulation_summary()`.
+Validation results stored in the PhysiCell session include per-rule support levels, literature direction, direction match status, evidence summaries, and key citations. These persist alongside the simulation configuration and appear in `get_simulation_summary()`. The `export_xml_configuration()` tool is gated on validation — it refuses to export if rules exist but validation is incomplete, or if any rules are flagged `contradictory`.
 
 ### Learn More
 
