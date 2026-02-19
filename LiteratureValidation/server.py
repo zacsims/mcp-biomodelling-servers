@@ -255,15 +255,19 @@ def _build_validation_question(cell_type: str, signal: str, direction: str,
                                 behavior: str, half_max: float | None = None,
                                 hill_power: float | None = None,
                                 signal_units: str | None = None) -> str:
-    """Build a focused question for PaperQA to answer about a cell rule."""
+    """Build a direction-agnostic question for PaperQA to answer about a cell rule.
+
+    The question does NOT state the proposed direction, so PaperQA independently
+    determines the direction from literature. This prevents leading-question bias.
+    """
     # Auto-detect units if not provided
     if signal_units is None:
         signal_units = _SIGNAL_UNITS.get(signal.lower())
 
-    dir_word = "increase" if direction == "increases" else "decrease"
     units_note = f" (measured in {signal_units})" if signal_units else ""
     question = (
-        f"Does {signal}{units_note} {dir_word} {behavior} in {cell_type} cells? "
+        f"What is the effect of {signal}{units_note} on {behavior} in {cell_type} cells? "
+        f"Does increasing {signal} concentration lead to increased or decreased {behavior}? "
         f"What is the experimental evidence for this relationship? "
         f"If quantitative data exists, what signal concentration causes "
         f"a half-maximal response (EC50/half-max)? "
@@ -272,33 +276,62 @@ def _build_validation_question(cell_type: str, signal: str, direction: str,
     if half_max is not None:
         units_str = f" {signal_units}" if signal_units else ""
         question += (
-            f" The proposed model uses a half-max of {half_max}{units_str}. "
+            f" For reference, a proposed model uses a half-max of {half_max}{units_str}. "
             f"Is this consistent with published data?"
         )
     if hill_power is not None:
         question += (
-            f" The proposed Hill coefficient is {hill_power}. "
+            f" For reference, a proposed Hill coefficient is {hill_power}. "
             f"Is this consistent with published data?"
         )
     question += (
-        " Conclude your answer with exactly one of the following verdict lines:\n"
-        "VERDICT: STRONG — extensive, well-documented experimental support\n"
-        "VERDICT: MODERATE — evidence supports the relationship but specific parameters lack quantitative validation\n"
+        "\n\nConclude your answer with BOTH of the following verdict lines:\n\n"
+        "First, state the direction of the relationship:\n"
+        "DIRECTION: INCREASES — increasing signal concentration increases the behavior\n"
+        "DIRECTION: DECREASES — increasing signal concentration decreases the behavior\n"
+        "DIRECTION: AMBIGUOUS — evidence is mixed or insufficient to determine direction\n\n"
+        "Then, state the strength of evidence:\n"
+        "VERDICT: STRONG — extensive quantitative experimental support for the relationship\n"
+        "VERDICT: MODERATE — qualitative evidence supports it but quantitative parameterization lacking\n"
         "VERDICT: WEAK — limited or indirect evidence only\n"
-        "VERDICT: CONTRADICTORY — evidence contradicts the proposed relationship or parameters\n"
         "VERDICT: UNSUPPORTED — no relevant experimental evidence found"
     )
     return question
 
 
 def _parse_support_level(answer_text: str) -> str:
-    """Extract VERDICT classification from PaperQA answer text."""
-    import re
-    valid = {"strong", "moderate", "weak", "contradictory", "unsupported"}
-    match = re.search(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", answer_text, re.IGNORECASE)
-    if match:
-        return match.group(1).lower()
+    """Extract VERDICT classification from PaperQA answer text.
+
+    Uses the LAST match because the answer file contains the prompt template
+    (with all VERDICT options listed) followed by PaperQA's actual answer.
+    re.search() would match the first template option, not the real verdict.
+
+    CONTRADICTORY is no longer a valid VERDICT — directional contradictions
+    are caught by the DIRECTION check instead. If PaperQA still writes
+    CONTRADICTORY, map it to 'weak' (evidence exists but contradicts).
+    """
+    matches = re.findall(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", answer_text, re.IGNORECASE)
+    if matches:
+        level = matches[-1].lower()  # Last match = PaperQA's actual verdict
+        if level == "contradictory":
+            return "weak"
+        return level
     return "unsupported"
+
+
+def _parse_direction(answer_text: str) -> str:
+    """Extract DIRECTION from PaperQA answer.
+
+    Uses the LAST match because the answer file contains the prompt template
+    (with all DIRECTION options listed) followed by PaperQA's actual answer.
+    re.search() would match the first template option, not the real direction.
+
+    Returns 'increases', 'decreases', or 'ambiguous'.
+    """
+    matches = re.findall(r"DIRECTION:\s*(INCREASES|DECREASES|AMBIGUOUS)", answer_text, re.IGNORECASE)
+    if matches:
+        return matches[-1].lower()  # Last match = PaperQA's actual direction
+    return "ambiguous"
 
 
 # ============================================================================
@@ -378,7 +411,10 @@ async def add_papers_to_collection(
     fetch_pdfs: bool = False,
 ) -> str:
     """
-    Add papers (abstracts or full text) to a collection for indexing by PaperQA.
+    Add papers to a collection for indexing by PaperQA (PDF-only).
+
+    Only papers with downloadable full PDFs are indexed. Papers without
+    available PDFs are skipped entirely (no abstract-only fallback).
 
     Each paper dict should have:
     - "title": Paper title
@@ -392,8 +428,8 @@ async def add_papers_to_collection(
     Args:
         name: Collection name (must exist)
         papers: List of paper dicts with at minimum "title" and "text"
-        fetch_pdfs: If True, attempt to download full PDFs from PMC/bioRxiv
-                    before falling back to text-only indexing (default: False)
+        fetch_pdfs: If True, attempt to download full PDFs from PMC/bioRxiv.
+                    Papers without PDFs are skipped. (default: False)
 
     Returns:
         str: Summary of papers added and indexed
@@ -417,8 +453,7 @@ async def add_papers_to_collection(
 
     settings = _get_paperqa_settings()
     added_count = 0
-    pdf_count = 0
-    txt_count = 0
+    skipped_no_pdf = 0
     errors = []
 
     for paper in papers:
@@ -430,39 +465,21 @@ async def add_papers_to_collection(
             continue
 
         paper_file = None
-        used_pdf = False
 
-        # Try PDF download if requested
+        # Try PDF download
         if fetch_pdfs:
             try:
                 pdf_path = await _try_fetch_pdf(paper, papers_path)
                 if pdf_path:
                     paper_file = pdf_path
-                    used_pdf = True
             except Exception:
-                pass  # Fall through to text
+                pass
 
-        # Fall back to text file
+        # Skip papers without full PDF
         if paper_file is None:
-            meta_lines = [f"Title: {title}"]
-            if paper.get("authors"):
-                meta_lines.append(f"Authors: {paper['authors']}")
-            if paper.get("year"):
-                meta_lines.append(f"Year: {paper['year']}")
-            if paper.get("pmid"):
-                meta_lines.append(f"PMID: {paper['pmid']}")
-            if paper.get("doi"):
-                meta_lines.append(f"DOI: {paper['doi']}")
-            if paper.get("biorxiv_doi"):
-                meta_lines.append(f"DOI: {paper['biorxiv_doi']}")
-            meta_lines.append("")  # blank line before content
-            meta_lines.append(text)
-
-            full_text = "\n".join(meta_lines)
-
-            safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
-            paper_file = papers_path / f"{safe_name}.txt"
-            paper_file.write_text(full_text, encoding="utf-8")
+            skipped_no_pdf += 1
+            errors.append(f"Skipped '{title[:60]}' — no full PDF available")
+            continue
 
         # Add to PaperQA Docs
         try:
@@ -473,17 +490,13 @@ async def add_papers_to_collection(
                 settings=settings,
             )
             added_count += 1
-            if used_pdf:
-                pdf_count += 1
-            else:
-                txt_count += 1
         except Exception as e:
             errors.append(f"Failed to index '{title[:40]}...': {e}")
 
     result = f"## Papers Added to `{name}`\n\n"
-    result += f"**Indexed:** {added_count} / {len(papers)} papers\n"
-    if fetch_pdfs:
-        result += f"**PDFs:** {pdf_count} | **Text-only:** {txt_count}\n"
+    result += f"**Indexed:** {added_count} / {len(papers)} papers (PDFs only)\n"
+    if skipped_no_pdf > 0:
+        result += f"**Skipped (no PDF):** {skipped_no_pdf}\n"
     result += f"**Papers directory:** `{papers_path}`\n"
 
     if errors:
@@ -508,17 +521,18 @@ async def add_papers_by_id(
     fetch_pdfs: bool = True,
 ) -> str:
     """
-    Add papers by PubMed ID or bioRxiv DOI to a collection.
+    Add papers by PubMed ID or bioRxiv DOI to a collection (PDF-only).
 
-    Automatically fetches metadata (title, abstract) and optionally full PDFs.
-    For PubMed papers, PDFs are fetched from PubMed Central when available.
+    Automatically fetches metadata (title, abstract) and downloads full PDFs.
+    Papers without available PDFs are skipped entirely (no abstract-only fallback).
+    For PubMed papers, PDFs are fetched via metapub FindIt and Unpaywall.
     For bioRxiv preprints, PDFs are always available and fetched by default.
 
     Args:
         name: Collection name (must exist)
         pmids: List of PubMed IDs (e.g., ["35486828", "33264437"])
         biorxiv_dois: List of bioRxiv DOIs (e.g., ["10.1101/2024.01.15.123456"])
-        fetch_pdfs: If True, download full PDFs when available (default: True)
+        fetch_pdfs: If True, download full PDFs. Papers without PDFs are skipped. (default: True)
 
     Returns:
         str: Summary of papers added
@@ -541,8 +555,7 @@ async def add_papers_by_id(
 
     settings = _get_paperqa_settings()
     added_count = 0
-    pdf_count = 0
-    txt_count = 0
+    skipped_no_pdf = 0
     errors = []
 
     # Process PubMed IDs
@@ -621,33 +634,20 @@ async def add_papers_by_id(
                 }
 
                 paper_file = None
-                used_pdf = False
 
                 if fetch_pdfs:
                     try:
                         pdf_path = await _try_fetch_pdf(paper, papers_path)
                         if pdf_path:
                             paper_file = pdf_path
-                            used_pdf = True
                     except Exception:
                         pass
 
-                # Fall back to text
+                # Skip papers without full PDF
                 if paper_file is None:
-                    meta_lines = [f"Title: {title}"]
-                    if authors:
-                        meta_lines.append(f"Authors: {authors}")
-                    if year:
-                        meta_lines.append(f"Year: {year}")
-                    meta_lines.append(f"PMID: {pmid}")
-                    if doi:
-                        meta_lines.append(f"DOI: {doi}")
-                    meta_lines.append("")
-                    meta_lines.append(abstract)
-
-                    safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
-                    paper_file = papers_path / f"{safe_name}.txt"
-                    paper_file.write_text("\n".join(meta_lines), encoding="utf-8")
+                    skipped_no_pdf += 1
+                    errors.append(f"Skipped PMID {pmid} — no full PDF available")
+                    continue
 
                 try:
                     await docs.aadd(
@@ -657,10 +657,6 @@ async def add_papers_by_id(
                         settings=settings,
                     )
                     added_count += 1
-                    if used_pdf:
-                        pdf_count += 1
-                    else:
-                        txt_count += 1
                 except Exception as e:
                     errors.append(f"Failed to index PMID {pmid}: {e}")
 
@@ -711,7 +707,6 @@ async def add_papers_by_id(
             }
 
             paper_file = None
-            used_pdf = False
 
             if fetch_pdfs:
                 # bioRxiv PDFs use the version number
@@ -721,24 +716,14 @@ async def add_papers_by_id(
                 try:
                     if await _download_pdf(pdf_url, pdf_path):
                         paper_file = pdf_path
-                        used_pdf = True
                 except Exception:
                     pass
 
-            # Fall back to text
+            # Skip papers without full PDF
             if paper_file is None:
-                meta_lines = [f"Title: {title}"]
-                if authors:
-                    meta_lines.append(f"Authors: {authors}")
-                if year:
-                    meta_lines.append(f"Year: {year}")
-                meta_lines.append(f"DOI: {biorxiv_doi}")
-                meta_lines.append("")
-                meta_lines.append(abstract)
-
-                safe_name = hashlib.md5(title.encode()).hexdigest()[:12]
-                paper_file = papers_path / f"{safe_name}.txt"
-                paper_file.write_text("\n".join(meta_lines), encoding="utf-8")
+                skipped_no_pdf += 1
+                errors.append(f"Skipped bioRxiv {biorxiv_doi} — no full PDF available")
+                continue
 
             try:
                 await docs.aadd(
@@ -748,17 +733,14 @@ async def add_papers_by_id(
                     settings=settings,
                 )
                 added_count += 1
-                if used_pdf:
-                    pdf_count += 1
-                else:
-                    txt_count += 1
             except Exception as e:
                 errors.append(f"Failed to index bioRxiv {biorxiv_doi}: {e}")
 
     total_requested = len(pmids or []) + len(biorxiv_dois or [])
     result = f"## Papers Added to `{name}`\n\n"
-    result += f"**Indexed:** {added_count} / {total_requested} papers\n"
-    result += f"**PDFs:** {pdf_count} | **Text-only:** {txt_count}\n"
+    result += f"**Indexed:** {added_count} / {total_requested} papers (PDFs only)\n"
+    if skipped_no_pdf > 0:
+        result += f"**Skipped (no PDF):** {skipped_no_pdf}\n"
     result += f"**Papers directory:** `{papers_path}`\n"
 
     if errors:
@@ -825,9 +807,9 @@ async def validate_rule(
     except RuntimeError as e:
         return f"**Error:** {e}"
 
-    # Check that the collection has papers
+    # Check that the collection has papers (PDFs only)
     papers_path = _papers_dir(name)
-    paper_files = list(papers_path.glob("*.txt")) + list(papers_path.glob("*.pdf"))
+    paper_files = list(papers_path.glob("*.pdf"))
     if not paper_files:
         return (
             f"**Error:** Collection `{name}` has no papers indexed.\n"
@@ -848,15 +830,24 @@ async def validate_rule(
     except Exception as e:
         return f"**Error querying PaperQA:** {e}"
 
-    # Save full PaperQA answer to output file
+    # Save full PaperQA answer to output file (direction-agnostic key)
     answers_dir = _collection_dir(name) / "answers"
     answers_dir.mkdir(parents=True, exist_ok=True)
-    safe_key = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{direction}_{behavior}")
+    safe_key = re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{behavior}")
     answer_file = answers_dir / f"{safe_key}.md"
     answer_file.write_text(formatted_answer, encoding="utf-8")
 
-    # Determine support level
+    # Determine support level and literature direction
     support_level = _parse_support_level(answer_text)
+    literature_direction = _parse_direction(answer_text)
+
+    # Compare literature direction against proposed direction
+    if literature_direction == "ambiguous":
+        direction_match = None
+    elif literature_direction == direction:
+        direction_match = True
+    else:
+        direction_match = False
 
     # Store result
     validation = {
@@ -870,6 +861,8 @@ async def validate_rule(
         "evidence_summary": answer_text,
         "references": references,
         "answer_file": str(answer_file),
+        "literature_direction": literature_direction,
+        "direction_match": direction_match,
     }
     if name not in _validation_results:
         _validation_results[name] = []
@@ -877,16 +870,33 @@ async def validate_rule(
 
     # Format result
     dir_arrow = "↑" if direction == "increases" else "↓"
-    support_emoji = {
+    support_labels = {
         "strong": "**STRONG**",
         "moderate": "**MODERATE**",
         "weak": "**WEAK**",
-        "contradictory": "**CONTRADICTORY**",
         "unsupported": "**UNSUPPORTED**",
     }
 
     result = f"## Rule Validation: {cell_type} | {signal} {dir_arrow} {behavior}\n\n"
-    result += f"**Support Level:** {support_emoji.get(support_level, support_level)}\n\n"
+
+    # Show direction mismatch warning prominently
+    if direction_match is False:
+        result += (
+            f"### DIRECTION MISMATCH\n\n"
+            f"Literature says {signal} **{literature_direction}** {behavior}, "
+            f"but rule proposes {signal} **{direction}** {behavior}.\n\n"
+        )
+
+    result += f"**Support Level:** {support_labels.get(support_level, support_level)}\n"
+    result += f"**Literature Direction:** {literature_direction}\n"
+    if direction_match is True:
+        result += f"**Direction:** Confirmed by literature\n"
+    elif direction_match is False:
+        result += f"**Direction:** MISMATCH — proposed '{direction}', literature says '{literature_direction}'\n"
+    else:
+        result += f"**Direction:** Could not be determined from literature\n"
+    result += "\n"
+
     result += f"### Evidence Summary\n{answer_text}\n\n"
 
     if references:

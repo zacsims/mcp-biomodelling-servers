@@ -73,6 +73,8 @@ class RuleValidationResult:
     suggested_half_max: Optional[float] = None
     suggested_hill_power: Optional[float] = None
     key_citations: List[str] = field(default_factory=list)
+    literature_direction: str = ""  # 'increases', 'decreases', or 'ambiguous'
+    direction_match: Optional[bool] = None  # True=match, False=mismatch, None=ambiguous
 
 @dataclass
 class UQContext:
@@ -307,6 +309,8 @@ class SessionState:
                     'suggested_half_max': rv.suggested_half_max,
                     'suggested_hill_power': rv.suggested_hill_power,
                     'key_citations': rv.key_citations,
+                    'literature_direction': rv.literature_direction,
+                    'direction_match': rv.direction_match,
                 }
                 for rv in self.rule_validations
             ]
