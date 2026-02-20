@@ -18,9 +18,15 @@ from pathlib import Path
 from typing import Optional
 #from hatch_mcp_server import HatchMCP
 
-# Add the physicell_config package to Python path  
+# Add the physicell_config package to Python path
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
+
+# Make repo root importable for shared artifact_manager
+sys.path.insert(0, str(current_dir.parent))
+from artifact_manager import get_artifact_dir, list_artifacts, clean_artifacts
+
+_SERVER_ROOT = current_dir
 
 from physicell_config import PhysiCellConfig
 from physicell_config.config.embedded_signals_behaviors import (
@@ -1644,15 +1650,17 @@ str: Markdown-formatted export status with file details
         if not cell_types and session.cell_types_count > 0:
             cell_types = [f"cell_type_{i+1}" for i in range(session.cell_types_count)]
         
-        # Export XML configuration
+        # Export XML configuration to session artifact directory
+        art_dir = get_artifact_dir(_SERVER_ROOT, session.session_id)
+        out_path = str(art_dir / filename)
         xml_content = session.config.generate_xml()
-        with open(filename, 'w') as f:
+        with open(out_path, 'w') as f:
             f.write(xml_content)
-        
+
         xml_size = len(xml_content) // 1024
-        
+
         result = f"## XML Configuration Exported\n\n"
-        result += f"**File:** {filename} ({xml_size}KB)\n"
+        result += f"**File:** {out_path} ({xml_size}KB)\n"
         
         # Show XML modification info if loaded from XML
         if session.loaded_from_xml and session.original_xml_path:
@@ -1717,12 +1725,13 @@ str: Markdown-formatted export status with file details
         if rule_count == 0:
             return "**No cell rules to export**\n\nUse add_single_cell_rule() to create signal-behavior relationships first."
         
-        # For now, export using the legacy CSV API (since that's what PhysiCell expects)
-        # TODO: If new API rules exist, we might need to convert them to legacy format
-        rules.generate_csv(filename)
-        
+        # Export using the legacy CSV API to the session artifact directory
+        art_dir = get_artifact_dir(_SERVER_ROOT, session.session_id)
+        out_path = str(art_dir / filename)
+        rules.generate_csv(out_path)
+
         result = f"## Cell Rules CSV Exported\n\n"
-        result += f"**File:** {filename}\n"
+        result += f"**File:** {out_path}\n"
         result += f"**Rules:** {rule_count}\n"
         result += f"**Progress:** {session.get_progress_percentage():.0f}%\n\n"
         result += f"**Next step:** Copy to PhysiCell project directory alongside XML configuration"
@@ -1748,66 +1757,66 @@ def clean_for_markdown(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 @mcp.tool()
-def list_generated_files(folder_path: str = ".") -> str:
-    """
-When the user asks to see generated files or check what files have been created,
-this function lists PhysiCell-related files in the specified folder.
+def list_generated_files(session_id: Optional[str] = None) -> str:
+    """List PhysiCell-related artifact files (XML/CSV) for the active session.
 
 Args:
-folder_path (str): Path to the folder to search (default: current directory)
+session_id (str): Session to query. If omitted, uses the active/default session.
+                  Pass 'all' to list files across every session.
 
 Returns:
-str: List of PhysiCell-related files found
+str: List of PhysiCell-related files found in the session artifact directory.
     """
-    xml_files = glob.glob(os.path.join(folder_path, "*.xml"))
-    csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
-    
-    result = f"## Generated Files in {folder_path}\n\n"
-    
+    if session_id == "all":
+        files = list_artifacts(_SERVER_ROOT, session_id=None)
+    else:
+        session = get_current_session()
+        if session is None:
+            return "**No active session.** Use `create_session()` first."
+        files = list_artifacts(_SERVER_ROOT, session_id=session.session_id)
+
+    xml_files = [f for f in files if str(f).endswith(".xml")]
+    csv_files = [f for f in files if str(f).endswith(".csv")]
+
+    result = "## Generated Artifact Files\n\n"
+
     if xml_files:
-        result += f"**XML files:**\n"
+        result += "**XML files:**\n"
         for f in xml_files:
-            result += f"- {os.path.basename(f)}\n"
+            result += f"- {f}\n"
         result += "\n"
-    
+
     if csv_files:
-        result += f"**CSV files:**\n"
+        result += "**CSV files:**\n"
         for f in csv_files:
-            result += f"- {os.path.basename(f)}\n"
+            result += f"- {f}\n"
         result += "\n"
-    
+
     if not xml_files and not csv_files:
-        result += "No PhysiCell files found."
-    
+        result += "No PhysiCell artifact files found."
+
     return result
 
+
 @mcp.tool()
-def clean_generated_files(folder_path: str = ".") -> str:
-    """
-When the user asks to clean up generated files or remove old configurations,
-this function removes PhysiCell XML and CSV files from the specified folder.
+def clean_generated_files(session_id: Optional[str] = None) -> str:
+    """Remove all artifact files (XML, CSV, etc.) for the active session.
 
 Args:
-folder_path (str): Path to the folder to clean (default: current directory)
+session_id (str): Session to clean. If omitted, uses the active/default session.
 
 Returns:
-str: Status message indicating cleaned files
+str: Status message indicating how many files were removed.
     """
-    xml_files = glob.glob(os.path.join(folder_path, "PhysiCell_*.xml"))
-    csv_files = glob.glob(os.path.join(folder_path, "*_rules.csv"))
-    
-    all_files = xml_files + csv_files
-    
-    if not all_files:
-        return f"No PhysiCell files found to clean in {folder_path}."
-    
-    for file_path in all_files:
-        try:
-            os.remove(file_path)
-        except OSError as e:
-            return f"Error removing {file_path}: {str(e)}"
-    
-    return f"**Cleaned {len(all_files)} PhysiCell files** from {folder_path}:\n" + "\n".join([f"- {os.path.basename(f)}" for f in all_files])
+    session = get_current_session()
+    if session is None:
+        return "**No active session.** Use `create_session()` first."
+
+    try:
+        count = clean_artifacts(_SERVER_ROOT, session.session_id)
+        return f"**Cleaned {count} artifact file(s)** for session {session.session_id[:8]}..."
+    except Exception as e:
+        return f"Error during cleanup: {str(e)}"
 
 @mcp.resource(
     uri="docs://tools/index",

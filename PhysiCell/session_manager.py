@@ -9,8 +9,8 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from threading import Lock
-from typing import Dict, List, Optional, Set
+from threading import RLock
+from typing import Any, Dict, List, Optional, Set
 import logging
 
 # Configure logging
@@ -185,7 +185,7 @@ class SessionState:
     
     def to_dict(self) -> dict:
         """Convert session state to dictionary for serialization."""
-        result = {
+        result: Dict[str, Any] = {
             'session_id': self.session_id,
             'session_name': self.session_name,
             'scenario_context': self.scenario_context,
@@ -221,10 +221,10 @@ class SessionManager:
     
     def __init__(self, max_sessions: int = 10, auto_cleanup_hours: float = 24.0):
         self._sessions: Dict[str, SessionState] = {}
-        self._lock = Lock()
+        self._lock = RLock()  # RLock allows re-entry (e.g. set_maboss_context -> get_session)
         self._max_sessions = max_sessions
         self._auto_cleanup_hours = auto_cleanup_hours
-        self._default_session_id = None
+        self._default_session_id: Optional[str] = None
         
     def create_session(self, set_as_default: bool = True, session_name: Optional[str] = None) -> str:
         """Create a new simulation session."""
@@ -294,15 +294,15 @@ class SessionManager:
                 return True
             return False
     
-    def cleanup_old_sessions(self, max_age_hours: float = None) -> int:
+    def cleanup_old_sessions(self, max_age_hours: Optional[float] = None) -> int:
         """Clean up sessions older than specified hours."""
         if max_age_hours is None:
             max_age_hours = self._auto_cleanup_hours
-            
+
         with self._lock:
             return self._cleanup_old_sessions(max_age_hours * 3600)
-    
-    def _cleanup_old_sessions(self, max_age_seconds: float = None) -> int:
+
+    def _cleanup_old_sessions(self, max_age_seconds: Optional[float] = None) -> int:
         """Internal cleanup method (assumes lock is held)."""
         if max_age_seconds is None:
             max_age_seconds = self._auto_cleanup_hours * 3600
@@ -404,6 +404,7 @@ def ensure_session() -> SessionState:
     if session is None:
         session_id = session_manager.create_session()
         session = session_manager.get_session(session_id)
+        assert session is not None
     return session
 
 def analyze_and_update_session_from_config(session: SessionState, config):
@@ -416,10 +417,10 @@ def analyze_and_update_session_from_config(session: SessionState, config):
                 session.loaded_substrates = list(config.substrates.substrate_list.keys())
             elif hasattr(config.substrates, 'get_substrates'):
                 session.loaded_substrates = list(config.substrates.get_substrates().keys())
-    except:
+    except Exception:
         pass
     session.substrates_count = len(session.loaded_substrates)
-    
+
     # Extract cell types
     session.loaded_cell_types = []
     try:
@@ -428,29 +429,29 @@ def analyze_and_update_session_from_config(session: SessionState, config):
                 session.loaded_cell_types = list(config.cell_types.cell_type_list.keys())
             elif hasattr(config.cell_types, 'get_cell_types'):
                 session.loaded_cell_types = list(config.cell_types.get_cell_types().keys())
-    except:
+    except Exception:
         pass
     session.cell_types_count = len(session.loaded_cell_types)
-    
+
     # Extract PhysiBoSS models
     session.loaded_physiboss_models = []
     for cell_type_name in session.loaded_cell_types:
         try:
             cell_type = config.cell_types.get_cell_type(cell_type_name)
-            if (cell_type and hasattr(cell_type, 'phenotype') and 
-                hasattr(cell_type.phenotype, 'intracellular') and 
+            if (cell_type and hasattr(cell_type, 'phenotype') and
+                hasattr(cell_type.phenotype, 'intracellular') and
                 cell_type.phenotype.intracellular):
                 session.loaded_physiboss_models.append(cell_type_name)
-        except:
+        except Exception:
             pass
     session.physiboss_models_count = len(session.loaded_physiboss_models)
-    
+
     # Check for existing rules
     session.has_existing_rules = False
     try:
         if hasattr(config, 'cell_rules') and hasattr(config.cell_rules, 'rulesets'):
             session.has_existing_rules = len(config.cell_rules.rulesets) > 0
-    except:
+    except Exception:
         pass
     
     # Mark appropriate steps complete based on loaded content
