@@ -43,6 +43,12 @@ from neko.core.tools import is_connected
 
 from utils import *
 from session_manager import session_manager, ensure_session, normalize_verbosity, DEFAULT_VERBOSITY
+
+# Make the repo root importable so we can use the shared artifact_manager
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifact_manager import get_artifact_dir, safe_artifact_path, list_artifacts, clean_artifacts
+
+_SERVER_ROOT = Path(__file__).parent
 from neko.core.strategies import (
     connect_as_atopo,
     connect_component as strategy_connect_component,
@@ -84,10 +90,17 @@ def _short_table(df, max_rows=25):
         truncated = True
     return clean_for_markdown(df).to_markdown(index=False, tablefmt="plain"), truncated
 
-def _export_dir() -> Path:
-    # Anchor exports to the directory of this server file to avoid writing to $HOME when CWD differs
-    base = Path(__file__).parent
-    d = base / "exports"
+def _export_dir(session_id: Optional[str] = None) -> Path:
+    """Return (and create) the per-session artifact directory for NeKo exports.
+
+    If session_id is None the caller must have already called ensure_session()
+    and should pass sess.session_id directly.  Falls back to a shared 'exports'
+    directory for backwards compatibility when no session is available.
+    """
+    if session_id:
+        return get_artifact_dir(_SERVER_ROOT, session_id)
+    # Legacy fallback – should not normally be reached in current code
+    d = _SERVER_ROOT / "exports"
     d.mkdir(exist_ok=True)
     return d
 
@@ -447,7 +460,7 @@ def export_network(format: str = "sif", session_id: Optional[str] = None, verbos
 
     # 1) Handle SIF export
     if format.lower() == "sif":
-        out_dir = _export_dir()
+        out_dir = _export_dir(sess.session_id)
         out_path = str(out_dir / "Network.sif")
         try:
             exporter.export_sif(out_path)
@@ -475,7 +488,7 @@ def export_network(format: str = "sif", session_id: Optional[str] = None, verbos
 
         # Export
         try:
-            out_dir = _export_dir()
+            out_dir = _export_dir(sess.session_id)
             exporter.export_bnet(str(out_dir / "Network"))
             clean_bnet_headers(str(out_dir))
         except Exception as e:
@@ -680,29 +693,21 @@ def reset_network(session_id: Optional[str] = None) -> str:
     return f"Session {sess.session_id} network reset."
 
 @mcp.tool()
-def clean_generated_files(folder_path: str = "exports") -> str:
-    """
-    When the user asks to clean up generated files,
-    or asks to remove .bnet files,
-    or asks to delete all .bnet files,
-    this function removes all .bnet files from the specified folder.
-    If no .bnet files are found, it returns a message indicating that no files were found to clean.
-    If the folder path is not specified, it defaults to the current directory.
-    If the files are cleaned successfully, it returns a status message indicating how many files were cleaned.
-    If an error occurs during file deletion, it returns an error message.
+def clean_generated_files(session_id: Optional[str] = None) -> str:
+    """Remove all artifact files (SIF, BNET, etc.) for the active session.
+
     Args:
-        folder_path (str): Path to the folder to clean. Defaults to current directory.
+        session_id: Session to clean (default: active session).
+
     Returns:
-        str: Status message indicating cleaned files.
+        str: Status message indicating how many files were removed.
     """
-    bnet_files = glob.glob(os.path.join(folder_path, "*.bnet"))
-    if not bnet_files:
-        return "No .bnet files found to clean."
-
-    for file_path in bnet_files:
-        os.remove(file_path)
-
-    return f"Cleaned {len(bnet_files)} .bnet files from {folder_path}."
+    sess = ensure_session(session_id)
+    try:
+        count = clean_artifacts(_SERVER_ROOT, sess.session_id)
+        return f"Cleaned {count} artifact file(s) from session {sess.session_id}."
+    except Exception as e:
+        return f"Error during cleanup: {str(e)}"
 
 @mcp.tool()
 def get_help() -> str:
@@ -825,16 +830,18 @@ def remove_undefined_interactions(session_id: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def list_bnet_files(folder_path: str = "exports") -> list:
-    """
-    List all .bnet files in the specified folder.
+def list_bnet_files(session_id: Optional[str] = None) -> list:
+    """List all .bnet files in the session artifact directory.
+
     Args:
-        folder_path (str): Path to the folder to search for .bnet files. Defaults to current directory.
+        session_id: Session to query (default: active session).
+
     Returns:
-        list: List of .bnet file names found in the folder.
+        list: List of .bnet file names found in the session artifact directory.
     """
-    bnet_files = [os.path.basename(f) for f in glob.glob(os.path.join(folder_path, "*.bnet"))]
-    return bnet_files
+    sess = ensure_session(session_id)
+    art_dir = get_artifact_dir(_SERVER_ROOT, sess.session_id)
+    return [f.name for f in art_dir.glob("*.bnet")]
 
 def download_signor_database():
     """
@@ -876,29 +883,23 @@ def clean_bnet_headers(folder_path: str = ".") -> str:
         return "No .bnet files needed cleaning."
     
 @mcp.tool()
-def check_bnet_files_names(folder_path: str = "exports") -> str:
-    """
-    When the user asks to check for .bnet files,
-    or asks for the names of .bnet files in a specific folder,
-    or simply asks to list .bnet files,
-    this function checks for .bnet files in the specified folder.
-    If the folder path is not specified, it defaults to the current directory.
-    If the user asks for .bnet files, it returns a list of their names.
-    If the user asks for the existence of .bnet files, it checks if any .bnet files exist in the folder.
-    If no .bnet files are found, it returns a message indicating that no files were found.
-    If .bnet files are found, it returns their names.
-    If an error occurs during the check, it returns an error message.
-    Args:
-        folder_path (str): Path to the folder to check for .bnet files. Defaults to current directory.
-    Returns:
-        str: Names of .bnet files or a message indicating no files found.
-    """
-    bnet_files = glob.glob(os.path.join(folder_path, "*.bnet"))
-    
-    if not bnet_files:
-        return "No .bnet files found in the specified folder."
+def check_bnet_files_names(session_id: Optional[str] = None) -> str:
+    """Check for .bnet files in the session artifact directory and return their names.
 
-    file_list = [os.path.basename(f) for f in bnet_files]
+    Args:
+        session_id: Session to check (default: active session).
+
+    Returns:
+        str: Names of .bnet files found, or a message if none exist.
+    """
+    sess = ensure_session(session_id)
+    art_dir = get_artifact_dir(_SERVER_ROOT, sess.session_id)
+    bnet_files = list(art_dir.glob("*.bnet"))
+
+    if not bnet_files:
+        return f"No .bnet files found in session {sess.session_id} artifact directory ({art_dir})."
+
+    file_list = [f.name for f in bnet_files]
     return "Found .bnet files:\n" + "\n".join(file_list)
 
 @mcp.tool()
@@ -1239,8 +1240,8 @@ def apply_strategy(strategy: str,
                    nodes_to_connect: Optional[List[str]] = None,
                    depth: int = 1,
                    rank: int = 1,
-                   comp_a: Optional[int] = None,
-                   comp_b: Optional[int] = None,
+                   comp_a: Optional[List[str]] = None,
+                   comp_b: Optional[List[str]] = None,
                    subgroup: Optional[List[str]] = None,
                    mode: str = 'OUT') -> str:
     """Apply a NeKo connection/completion strategy to the current network.

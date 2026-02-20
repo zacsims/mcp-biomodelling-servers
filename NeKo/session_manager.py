@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Dict, Optional, Literal
+from typing import Any, Dict, Optional, Literal, cast
 import time
 
 # Verbosity levels
@@ -54,7 +54,6 @@ class NeKoSession:
         self.touch()
 
     def get_completion_params(self):
-        keys = ["max_len", "algorithm", "only_signed", "connect_with_bias", "consensus"]
         # Map max_len to maxlen argument expected by Network.complete_connection
         params = self.default_params.copy()
         return dict(
@@ -113,8 +112,8 @@ class NeKoSessionManager:
     def list_sessions(self) -> Dict[str, dict]:
         with self._lock:
             return {sid: {"has_network": s.network is not None,
-                          "nodes": len(s.network.nodes) if s.network else 0,
-                          "edges": len(s.network.edges) if s.network else 0,
+                          "nodes": len(cast(Any, s.network).nodes) if s.network else 0,
+                          "edges": len(cast(Any, s.network).edges) if s.network else 0,
                           "last_accessed": s.last_accessed,
                           "created_at": s.created_at} for sid, s in self._sessions.items()}
 
@@ -144,7 +143,9 @@ def ensure_session(session_id: Optional[str]) -> NeKoSession:
     if sess is None:
         # Auto-create a default if none exists yet
         new_id = session_manager.create_session(set_as_default=True)
-        return session_manager.get_session(new_id)
+        result = session_manager.get_session(new_id)
+        assert result is not None
+        return result
     return sess
 
 # Helper for verbosity validation
@@ -153,4 +154,6 @@ def normalize_verbosity(v: Optional[str]) -> Verbosity:
     if not v:
         return DEFAULT_VERBOSITY
     v_lower = v.lower()
-    return v_lower if v_lower in ALLOWED_VERBOSITY else DEFAULT_VERBOSITY
+    if v_lower in ALLOWED_VERBOSITY:
+        return cast(Verbosity, v_lower)
+    return DEFAULT_VERBOSITY
