@@ -32,14 +32,15 @@ MABOSS_AGENT_MANUAL = """
 1. **Session:** `create_session()` — returns a session_id
 2. **Convert:** `bnet_to_bnd_and_cfg(bnet_path)` — BNET → BND + CFG
 3. **Load:** `build_simulation()` — loads BND/CFG into session
-4. **Inspect:** read `maboss://session/{id}/parameters` — review defaults
-5. **Tune:** `update_maboss_parameters({"sample_count": 1000, "thread_count": 4})`
-6. **Reduce output nodes (IMPORTANT):** `set_maboss_output_nodes(["Apoptosis", "Proliferation"])` — restricts the result to only the nodes you care about. Without this, MaBoSS enumerates ALL 2^N Boolean states, which becomes exponentially expensive for large networks (>20 nodes). Always set output nodes to the smallest biologically meaningful subset before running.
-7. **Configure (optional):** `set_maboss_initial_state(...)` if non-default probabilities are needed.
-8. **Run:** `run_simulation()` — executes the simulation
-8. **Analyse:** read `maboss://session/{id}/result` — state probability table
-9. **Visualise:** `visualize_network_trajectories()` — saves a PNG artifact
-10. **Mutate:** `simulate_mutation(nodes, state)` — runs a one-off mutant copy
+4. **Inspect nodes (MANDATORY):** `get_maboss_nodes()` — list ALL valid node names; always do this before any configuration step to avoid referencing non-existent nodes
+5. **Inspect parameters:** `update_maboss_parameters()` (no args) — review current defaults
+6. **Tune:** `update_maboss_parameters({"sample_count": 1000, "thread_count": 4})`
+7. **Reduce output nodes (IMPORTANT):** `set_maboss_output_nodes(["Apoptosis", "Proliferation"])` — restricts the result to only the nodes you care about. Without this, MaBoSS enumerates ALL 2^N Boolean states, which becomes exponentially expensive for large networks (>20 nodes). Always set output nodes to the smallest biologically meaningful subset before running.
+8. **Configure (optional):** `get_maboss_initial_state()` to inspect current state, then `set_maboss_initial_state(...)` if non-default probabilities are needed. Only use node names returned by `get_maboss_nodes()`.
+9. **Run:** `run_simulation()` — executes the simulation and saves `result.csv` to the artifact directory
+10. **Analyse:** `get_simulation_result()` — returns the state probability table as a Markdown table
+11. **Visualise:** `visualize_network_trajectories()` — saves a PNG artifact
+12. **Mutate:** `simulate_mutation(nodes, state)` — runs a one-off mutant copy
 
 > **State space warning:** A network with N nodes produces up to 2^N possible Boolean states.
 > Always call `set_maboss_output_nodes` to restrict outputs before `run_simulation`.
@@ -49,19 +50,10 @@ MABOSS_AGENT_MANUAL = """
 ## 2. Tool Categories
 * **Session management:** `create_session`, `list_sessions`, `set_default_session`, `delete_session`
 * **Pipeline:** `bnet_to_bnd_and_cfg`, `build_simulation`, `run_simulation`
+* **Inspection (read, no side effects):** `get_maboss_nodes`, `get_maboss_initial_state`, `get_maboss_logical_rules`, `get_maboss_mutations`, `update_maboss_parameters` (no args)
 * **Configuration:** `update_maboss_parameters`, `set_maboss_output_nodes`, `set_maboss_initial_state`
-* **Analysis:** `simulate_mutation`, `visualize_network_trajectories`
+* **Analysis:** `get_simulation_result`, `simulate_mutation`, `visualize_network_trajectories`
 * **Housekeeping:** `list_generated_files`, `clean_generated_files`
-
-## 3. Read-Only Resources (no side effects)
-All session state can be read without calling tools:
-* `maboss://session/{id}/nodes` — network node names
-* `maboss://session/{id}/parameters` — current simulation parameters
-* `maboss://session/{id}/initial_state` — initial state probabilities
-* `maboss://session/{id}/logical_rules` — Boolean rules
-* `maboss://session/{id}/mutations` — applied mutations
-* `maboss://session/{id}/result` — post-run state probability table
-* `maboss://session/{id}/files` — artifact files for the session
 
 ## 4. Key Parameters for `update_maboss_parameters`
 | Parameter      | Type  | Description                                  |
@@ -384,7 +376,11 @@ async def build_simulation(
         sess.set_simulation(loaded_sim, bnd_path, cfg_path)
         await ctx.info("MaBoSS simulation loaded successfully.")
         parameters_str = "\n".join(f"{k}: {v}" for k, v in loaded_sim.param.items())
-        return f"MaBoSS simulation loaded successfully.\n{parameters_str}"
+        return (
+            f"MaBoSS simulation loaded successfully.\n{parameters_str}\n\n"
+            f"NEXT STEP: call get_maboss_nodes() to retrieve the list of valid node "
+            f"names before calling set_maboss_output_nodes() or set_maboss_initial_state()."
+        )
     else:
         await ctx.error("maboss.load returned None.")
         return "Error: maboss.load returned None. Check the BND and CFG files."
@@ -415,15 +411,107 @@ async def run_simulation(
         await ctx.info("Running MaBoSS simulation...")
         run_result = sess.sim.run()
         sess.set_result(run_result)
+
+        # Persist the result table to disk so list_generated_files shows it
+        try:
+            art_dir = get_artifact_dir(_SERVER_ROOT, sess.session_id)
+            csv_path = safe_artifact_path(art_dir, "result.csv")
+            df_result = run_result.get_last_states_probtraj()
+            if not df_result.empty:
+                df_result.to_csv(csv_path, index=False)
+                await ctx.info(f"Result saved to {csv_path}")
+        except Exception as csv_err:
+            await ctx.warning(f"Could not save result CSV: {csv_err}")
+
         await ctx.report_progress(2, 2)
         await ctx.info("MaBoSS simulation completed successfully.")
         return (
             f"MaBoSS simulation completed successfully.\n"
-            f"Read the result at: maboss://session/{sess.session_id}/result"
+            f"Call `get_simulation_result()` to read the state probability table.\n"
+            f"The result is also saved to the session artifact directory as result.csv."
         )
     except Exception as e:
         await ctx.error(f"Error during MaBoSS simulation run: {str(e)}")
         return f"Error during MaBoSS simulation run: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Inspection tools (read-only, no side effects)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_maboss_nodes(
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session to query. Omit to use the active default session.",
+    ),
+) -> str:
+    """Return the list of node names in the loaded MaBoSS network.
+
+    Always call this after build_simulation() and before set_maboss_output_nodes()
+    or set_maboss_initial_state() to avoid referencing non-existent nodes.
+    """
+    sess = ensure_session(session_id)
+    if sess.sim is None:
+        return "No simulation loaded. Call bnet_to_bnd_and_cfg then build_simulation first."
+    nodes_list = list(sess.sim.network.keys())
+    if not nodes_list:
+        return "No nodes found in the MaBoSS network."
+    return "Network nodes:\n" + "\n".join(f"- {n}" for n in nodes_list)
+
+
+@mcp.tool()
+def get_maboss_initial_state(
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session to query. Omit to use the active default session.",
+    ),
+) -> str:
+    """Return the current initial state probability configuration of the MaBoSS simulation.
+
+    Use this to inspect the state before calling set_maboss_initial_state().
+    """
+    sess = ensure_session(session_id)
+    if sess.sim is None:
+        return "No simulation loaded. Call bnet_to_bnd_and_cfg then build_simulation first."
+    try:
+        return f"Initial state:\n{sess.sim.network.get_istate()}"
+    except Exception as e:
+        return f"Error retrieving initial state: {e}"
+
+
+@mcp.tool()
+def get_maboss_logical_rules(
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session to query. Omit to use the active default session.",
+    ),
+) -> str:
+    """Return the Boolean logical rules of the loaded MaBoSS network."""
+    sess = ensure_session(session_id)
+    if sess.sim is None:
+        return "No simulation loaded. Call bnet_to_bnd_and_cfg then build_simulation first."
+    try:
+        return str(sess.sim.get_logical_rules())
+    except Exception as e:
+        return f"Error retrieving logical rules: {e}"
+
+
+@mcp.tool()
+def get_maboss_mutations(
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session to query. Omit to use the active default session.",
+    ),
+) -> str:
+    """Return the mutation settings currently applied to the MaBoSS network."""
+    sess = ensure_session(session_id)
+    if sess.sim is None:
+        return "No simulation loaded. Call bnet_to_bnd_and_cfg then build_simulation first."
+    try:
+        return str(sess.sim.get_mutations())
+    except Exception as e:
+        return f"Error retrieving mutations: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +582,7 @@ async def set_maboss_output_nodes(
 ) -> str:
     """Set which nodes are treated as outputs in the MaBoSS simulation.
 
+    Call get_maboss_nodes() first to obtain the exact valid node names.
     Limiting outputs reduces result size and speeds up large simulations.
     """
     sess = ensure_session(session_id)
@@ -532,6 +621,9 @@ async def set_maboss_initial_state(
     ),
 ) -> str:
     """Set initial state probabilities for one or more nodes in the MaBoSS simulation.
+
+    Call get_maboss_nodes() first to obtain the exact valid node names.
+    Call get_maboss_initial_state() to inspect the current state before modifying it.
 
     Examples:
         set_maboss_initial_state('node1', [0.3, 0.7])
@@ -684,6 +776,37 @@ async def visualize_network_trajectories(
     except Exception as e:
         await ctx.error(f"Error saving trajectory plot: {str(e)}")
         return [f"Error saving trajectory plot: {str(e)}"]
+
+
+@mcp.tool()
+def get_simulation_result(
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Session to query. Omit to use the active default session.",
+    ),
+) -> str:
+    """Return the last simulation result as a Markdown table of state probabilities.
+
+    Columns = distinct Boolean states (sets of ON nodes joined by '--').
+    The single row is the final timepoint snapshot; values sum to ~1.
+    Call run_simulation() first.
+    """
+    sess = ensure_session(session_id)
+    if sess.result is None:
+        return "No simulation has been run yet. Call run_simulation() first."
+    try:
+        df_prob = sess.result.get_last_states_probtraj()
+        if df_prob.empty:
+            return "_Simulation completed but returned no trajectory data._"
+        df_prob = clean_for_markdown(df_prob)
+        md_table = df_prob.to_markdown(index=False, tablefmt="plain")
+        return "\n".join([
+            "**MaBoSS Simulation: State Probability Trajectory**",
+            "",
+            md_table,
+        ])
+    except Exception as e:
+        return f"**Error retrieving simulation result:** {e}"
 
 
 # ---------------------------------------------------------------------------
