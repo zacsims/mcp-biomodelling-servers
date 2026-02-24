@@ -1,6 +1,6 @@
 """
 Session Management for PhysiCell MCP Server
-Maintains compatibility with HatchMCP while adding robust state management.
+Thread-safe, session-based state management for multi-hypothesis workflows.
 """
 
 import json
@@ -394,16 +394,16 @@ class SessionManager:
 # Global session manager instance
 session_manager = SessionManager()
 
-def get_current_session() -> Optional[SessionState]:
-    """Convenience function to get current session."""
-    return session_manager.get_session()
+def get_current_session(session_id: Optional[str] = None) -> Optional[SessionState]:
+    """Convenience function to get a session by ID, or the current default session."""
+    return session_manager.get_session(session_id)
 
-def ensure_session() -> SessionState:
-    """Ensure there's an active session, create one if needed."""
-    session = session_manager.get_session()
+def ensure_session(session_id: Optional[str] = None) -> SessionState:
+    """Return the requested session, the default session, or create one if none exists."""
+    session = session_manager.get_session(session_id)
     if session is None:
-        session_id = session_manager.create_session()
-        session = session_manager.get_session(session_id)
+        new_id = session_manager.create_session()
+        session = session_manager.get_session(new_id)
         assert session is not None
     return session
 
