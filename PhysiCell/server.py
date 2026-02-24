@@ -1090,9 +1090,8 @@ def configure_physiboss_settings(
     session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
 ) -> str:
     """Configure timing, stochasticity, and inheritance parameters for a PhysiBoSS model.
-
     Must be called after `add_physiboss_model()`. Repeat for each cell type.
-
+    Checked with `list_all_available_signals()` and `list_all_available_behaviors()` the available signals and behaviors to use in `add_physiboss_input_link()` and `add_physiboss_output_link()`.
     Returns:
         str: Confirmation with the configured settings and next step.
     """
@@ -1142,10 +1141,8 @@ def add_physiboss_input_link(
     session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
 ) -> str:
     """Create an input link from a PhysiCell signal to a MaBoSS boolean node.
-
     Requires a PhysiBoSS model already attached to the cell type.
     Call `add_physiboss_output_link()` after all input links are defined.
-
     Returns:
         str: Confirmation with link details and next step.
     """
@@ -1194,10 +1191,8 @@ def add_physiboss_output_link(
     session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
 ) -> str:
     """Create an output link from a MaBoSS boolean node to a PhysiCell cell behaviour.
-
     Requires a PhysiBoSS model already attached to the cell type.
     Use `apply_physiboss_mutation()` afterward for genetic perturbations.
-
     Returns:
         str: Confirmation with link details and next step.
     """
