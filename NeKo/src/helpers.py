@@ -174,30 +174,98 @@ def download_signor_database() -> str:
         return f"Error downloading SIGNOR database: {str(e)}"
 
 
-def clean_bnet_headers(folder_path: str = ".") -> str:
-    """Remove boilerplate headers from every ``.bnet`` file in *folder_path*.
+def sanitize_bnet_file(path: str) -> dict:
+    """Strip the BoolNet header, clean node names, and deduplicate rows in-place.
 
-    Strips the first two lines when they match::
+    Performs three passes over a single ``.bnet`` file:
 
-        # model in BoolNet format
-        targets, factors
+    1. **Header strip** — removes the ``# model in BoolNet format`` /
+       ``targets, factors`` preamble written by NeKo's exporter.
+    2. **Name cleaning** — replaces any character outside ``[A-Za-z0-9_]``
+       with ``_`` in both the LHS gene column and every reference to that
+       gene inside the RHS Boolean expression.
+    3. **Deduplication** — when two Uniprot IDs map to the same gene symbol
+       (e.g. isoforms), NeKo writes two rows with the same cleaned LHS name.
+       Only the first rule is kept; subsequent duplicates are silently dropped
+       because a valid BNET file must have unique targets.
+
+    Args:
+        path: Absolute path to the ``.bnet`` file to sanitize (modified in-place).
+
+    Returns:
+        dict with keys:
+            ``cleaned_names`` (set[str]) — original names that were renamed.
+            ``duplicates_removed`` (list[str]) — cleaned names whose extra rows were dropped.
     """
-    cleaned_files = []
-    for file_path in glob.glob(os.path.join(folder_path, "*.bnet")):
-        with open(file_path, "r") as fh:
-            lines = fh.readlines()
-        if (
-            len(lines) >= 2
-            and lines[0].strip() == "# model in BoolNet format"
-            and lines[1].strip() == "targets, factors"
-        ):
-            with open(file_path, "w") as fh:
-                fh.writelines(lines[2:])
-            cleaned_files.append(os.path.basename(file_path))
+    _clean = lambda name: re.sub(r"[^A-Za-z0-9_]", "_", name)
 
-    if cleaned_files:
-        return f"Cleaned headers from: {', '.join(cleaned_files)}"
-    return "No .bnet files needed cleaning."
+    with open(path, "r") as fh:
+        raw_lines = fh.readlines()
+
+    # 1. Strip header
+    lines = raw_lines
+    if (
+        len(lines) >= 2
+        and lines[0].strip() == "# model in BoolNet format"
+        and lines[1].strip() == "targets, factors"
+    ):
+        lines = lines[2:]
+
+    # 2. Build name map (original -> cleaned) from LHS column
+    name_map: dict = {}
+    cleaned_names: set = set()
+    for line in lines:
+        if "," not in line:
+            continue
+        gene = line.split(",", 1)[0].strip()
+        gene_clean = _clean(gene)
+        name_map[gene] = gene_clean
+        if gene_clean != gene:
+            cleaned_names.add(gene)
+
+    # 3. Rewrite with cleaned names and deduplicate LHS
+    seen_lhs: set = set()
+    duplicates_removed: list = []
+    new_lines: list = []
+    for line in lines:
+        if "," not in line:
+            new_lines.append(line)
+            continue
+        gene, expr = line.split(",", 1)
+        gene_clean = name_map.get(gene.strip(), gene.strip())
+
+        if gene_clean in seen_lhs:
+            duplicates_removed.append(gene_clean)
+            continue
+        seen_lhs.add(gene_clean)
+
+        # Rename all references inside the Boolean expression too
+        expr_clean = expr
+        for orig, clean in name_map.items():
+            if orig != clean:
+                expr_clean = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(orig)}(?![A-Za-z0-9_])",
+                    clean,
+                    expr_clean,
+                )
+        new_lines.append(f"{gene_clean},{expr_clean}")
+
+    with open(path, "w") as fh:
+        fh.writelines(new_lines)
+
+    return {"cleaned_names": cleaned_names, "duplicates_removed": duplicates_removed}
+
+
+# Keep the old name as a thin alias so existing callers don't break immediately.
+def clean_bnet_headers(folder_path: str = ".") -> str:  # pragma: no cover
+    """Deprecated — use sanitize_bnet_file() instead."""
+    import warnings
+    warnings.warn("clean_bnet_headers is deprecated; use sanitize_bnet_file.", DeprecationWarning)
+    results = []
+    for fp in glob.glob(os.path.join(folder_path, "*.bnet")):
+        r = sanitize_bnet_file(fp)
+        results.append(os.path.basename(fp))
+    return f"Sanitized: {', '.join(results)}" if results else "No .bnet files found."
 
 def _get_translators(network):
     """Builds fast, two-way translation dictionaries for the network."""

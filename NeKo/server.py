@@ -27,7 +27,7 @@ from src.helpers import (
     E_NO_NET, SUMMARY_HINT, _SERVER_ROOT,
     _short_table, _export_dir, _session_network, _invalidate,
     _compute_components, requires_network,
-    clean_bnet_headers, _get_translators
+    sanitize_bnet_file, _get_translators
 )
 from neko.core.strategies import (
     connect_as_atopo,
@@ -308,146 +308,79 @@ def export_network(
     """Export the current network to SIF or BNET format.
 
     After BNET export, hand the file path to the MaBoSS server via bnet_to_bnd_and_cfg().
-    BNET export fails if the network is not fully connected - run check_disconnected_nodes() first.
+    BNET export fails if the network is not fully connected — run check_disconnected_nodes() first.
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
     if network is None:
         return format_no_network_guidance()
     exporter = Exports(network)
+    out_dir = _export_dir(sess.session_id)
 
-    # Helper to read & preview first 100 lines, returning Markdown
-    def _preview_file(path: str, sep: str, cols: list[str]) -> str:
-        """
-        Try to read up to 100 rows of `path` (with pandas) using sep and columns list.
-        If successful, return as Markdown table. Otherwise, return first 10
-        raw lines in a fenced code block.
-        """
-        if not os.path.exists(path):
-            return f"_File `{path}` not found._"
-
-        # First, attempt to load with pandas and produce a Markdown table
-        try:
-            df_preview = pd.read_csv(path, sep=sep, header=None, names=cols, nrows=100, dtype=str)
-            # Drop any fully-NaN rows (sometimes trailing newlines)
-            df_preview.dropna(how="all", inplace=True)
-            return clean_for_markdown(df_preview).to_markdown(index=False, tablefmt="plain")
-        except Exception:
-            # Fallback: just show the first 100 lines as-is
-            lines = []
-            with open(path, "r") as f:
-                for _ in range(100):
-                    line = f.readline()
-                    if not line:
-                        break
-                    lines.append(line.rstrip("\n"))
-            if not lines:
-                return "_File is empty or could not be read._"
-
-            code_block = ["```"] + lines + ["```"]
-            return "\n".join(code_block)
-
-    # 1) Handle SIF export
+    # ── SIF export ────────────────────────────────────────────────────────────
     if format.lower() == "sif":
-        out_dir = _export_dir(sess.session_id)
         out_path = str(out_dir / "Network.sif")
         try:
             exporter.export_sif(out_path)
         except Exception as e:
-            return f"**Error exporting SIF:** {str(e)}"
-
-        # Now build a Markdown snippet showing the path + preview
+            return f"**Error exporting SIF:** {e}"
         if verbosity == "summary":
             return f"SIF exported: {out_path}. {SUMMARY_HINT}"
-        md_lines = [f"Exported to `{out_path}`", "Preview (first 100 lines):", ""]
-        # SIF format is: source<TAB>interaction<TAB>target
-        preview_md = _preview_file(out_path, sep="\t", cols=["source", "interaction", "target"])
-        md_lines.append(preview_md)
-        return "\n".join(md_lines)
+        try:
+            df_prev = pd.read_csv(out_path, sep="\t", header=None,
+                                  names=["source", "interaction", "target"],
+                                  nrows=100, dtype=str).dropna(how="all")
+            preview_md = _short_table(df_prev, max_rows=100)[0]
+        except Exception:
+            preview_md = "_Preview unavailable._"
+        return f"SIF exported: `{out_path}`\n\nPreview (first 100 rows):\n{preview_md}"
 
-    # 2) Handle BNET export
+    # ── BNET export ───────────────────────────────────────────────────────────
     elif format.lower() == "bnet":
-        def clean_node_name(name: str) -> str:
-            return re.sub(r"[^A-Za-z0-9_]", "_", name)
-
-        # Check connectivity first with enhanced guidance
         if not is_connected(network):
             return format_connectivity_guidance()
-
-        # Export
         try:
-            out_dir = _export_dir(sess.session_id)
             exporter.export_bnet(str(out_dir / "Network"))
-            clean_bnet_headers(str(out_dir))
         except Exception as e:
-            return f"**Error exporting BNET:** {str(e)}"
+            return f"**Error exporting BNET:** {e}"
 
-        # Find all .bnet files in the exports directory
-        bnet_files = [os.path.basename(f) for f in glob.glob(str(out_dir / "*.bnet"))]
+        bnet_files = sorted(out_dir.glob("*.bnet"))
         if not bnet_files:
             return "**Error:** No .bnet files were generated."
-        out_path = str(out_dir / bnet_files[0])
+        out_path = str(bnet_files[0])
 
-        # Clean node names in the BNET file (both columns)
-        cleaned_names = set()
         try:
-            # First pass: build mapping of original -> cleaned names
-            with open(out_path, "r") as f:
-                lines = f.readlines()
-            name_map = {}
-            for line in lines:
-                if "," in line:
-                    gene, _ = line.split(",", 1)
-                    gene_clean = clean_node_name(gene.strip())
-                    if gene_clean != gene.strip():
-                        cleaned_names.add(gene.strip())
-                    name_map[gene.strip()] = gene_clean
-            # Second pass: rewrite lines with cleaned names in both columns
-            new_lines = []
-            for line in lines:
-                if "," in line:
-                    gene, expr = line.split(",", 1)
-                    gene_clean = name_map.get(gene.strip(), gene.strip())
-                    expr_clean = expr
-                    for orig, clean in name_map.items():
-                        if orig != clean:
-                            expr_clean = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(orig)}(?![A-Za-z0-9_])', clean, expr_clean)
-                    new_lines.append(f"{gene_clean},{expr_clean}")
-                else:
-                    new_lines.append(line)
-            with open(out_path, "w") as f:
-                f.writelines(new_lines)
+            result = sanitize_bnet_file(out_path)
         except Exception as e:
-            return f"**Error cleaning BNET gene names:** {str(e)}"
-
-        # Check for special characters in gene/node names in the bnet file (should be clean now)
-        special_char_issues = []
-        try:
-            with open(out_path, "r") as f:
-                for i, line in enumerate(f):
-                    if i >= 1000:
-                        break
-                    if "," in line:
-                        gene = line.split(",", 1)[0].strip()
-                        if re.search(r"[^A-Za-z0-9_]", gene):
-                            special_char_issues.append(gene)
-        except Exception as e:
-            return f"**Error reading BNET file for gene name check:** {str(e)}"
+            return f"**Error sanitizing BNET:** {e}"
 
         if verbosity == "summary":
             return f"BNET exported: {out_path}. {SUMMARY_HINT}"
-        md_lines = [f"Exported to `{out_path}`", "Preview (first 100 lines):", ""]
-        preview_md = _preview_file(out_path, sep=",", cols=["gene", "expression"])
-        md_lines.append(preview_md)
-        if len(bnet_files) > 1:
-            md_lines.append(f"\n_Warning: More than one .bnet file was found ({', '.join(bnet_files)}). Previewing only the first one._")
-        if cleaned_names:
-            md_lines.append(f"\n**Warning:** The following gene/node names were modified to remove special characters: {', '.join(sorted(cleaned_names))}")
-        if special_char_issues:
-            md_lines.append(f"\n**Warning:** The following gene/node names still contain special characters and may not be compatible: {', '.join(sorted(set(special_char_issues)))}")
+
+        try:
+            df_prev = pd.read_csv(out_path, sep=",", header=None,
+                                  names=["gene", "expression"],
+                                  nrows=100, dtype=str).dropna(how="all")
+            preview_md = _short_table(df_prev, max_rows=100)[0]
+        except Exception:
+            preview_md = "_Preview unavailable._"
+
+        md_lines = [
+            f"BNET exported: `{out_path}`",
+            f"Next: call `bnet_to_bnd_and_cfg('{out_path}')` in the MaBoSS server.",
+            "",
+            "Preview (first 100 rows):",
+            preview_md,
+        ]
+        if result["cleaned_names"]:
+            md_lines.append(f"\n**Note:** Renamed to remove special characters: "
+                            f"{', '.join(sorted(result['cleaned_names']))}")
+        if result["duplicates_removed"]:
+            md_lines.append(f"\n**Note:** Removed duplicate rules for (isoforms collapsed to first): "
+                            f"{', '.join(sorted(set(result['duplicates_removed'])))}")
         return "\n".join(md_lines)
 
-    # 3) Unsupported format - provide guidance
+    # ── Unsupported format ────────────────────────────────────────────────────
     else:
         return format_unsupported_format_guidance(format)
 
