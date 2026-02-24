@@ -206,7 +206,7 @@ def clean_for_markdown(df: pd.DataFrame) -> pd.DataFrame:
     df_str = df.astype(str)
 
     # 2) Strip leading/trailing whitespace, then collapse any run of whitespace/newlines to a single space
-    df_str = df_str.applymap(lambda val: " ".join(val.split()))
+    df_str = df_str.map(lambda val: " ".join(val.split()))
 
     # 3) Replace the literal string 'nan' (that pandas sometimes shows for NaNs) with an actual empty string
     df_str = df_str.replace("nan", "", regex=False)
