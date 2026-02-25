@@ -6,6 +6,7 @@ Future extensions: TTL cleanup, persistence, concurrent locks per session.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Dict, Optional, Literal, cast
@@ -83,7 +84,6 @@ class NeKoSessionManager:
         self._default_session_id: Optional[str] = None
         self._lock = Lock()
         self._max_sessions = max_sessions
-        self._counter = 0  # simple incremental id for readability
 
     def create_session(self, set_as_default: bool = True) -> str:
         with self._lock:
@@ -91,8 +91,7 @@ class NeKoSessionManager:
                 # Remove oldest
                 oldest = min(self._sessions.values(), key=lambda s: s.last_accessed)
                 del self._sessions[oldest.session_id]
-            self._counter += 1
-            sid = f"session_{self._counter}"
+            sid = str(uuid.uuid4())
             self._sessions[sid] = NeKoSession(session_id=sid)
             if set_as_default or self._default_session_id is None:
                 self._default_session_id = sid

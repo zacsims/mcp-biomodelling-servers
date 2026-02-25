@@ -12,6 +12,7 @@ Each session stores:
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Dict, Optional
@@ -68,7 +69,6 @@ class MaBoSSSessionManager:
         self._default_session_id: Optional[str] = None
         self._lock = Lock()
         self._max_sessions = max_sessions
-        self._counter = 0
 
     # -- CRUD ----------------------------------------------------------
 
@@ -78,8 +78,7 @@ class MaBoSSSessionManager:
                 # Evict least-recently-used session
                 oldest = min(self._sessions.values(), key=lambda s: s.last_accessed)
                 del self._sessions[oldest.session_id]
-            self._counter += 1
-            sid = f"session_{self._counter}"
+            sid = str(uuid.uuid4())
             self._sessions[sid] = MaBoSSSession(session_id=sid)
             if set_as_default or self._default_session_id is None:
                 self._default_session_id = sid

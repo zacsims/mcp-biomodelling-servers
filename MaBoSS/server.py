@@ -14,7 +14,7 @@ from pydantic import Field
 
 from mcp.server.fastmcp import Context, FastMCP, Image
 from session_manager import session_manager, ensure_session, MaBoSSSession
-from artifact_manager import get_artifact_dir, safe_artifact_path, list_artifacts, clean_artifacts
+from artifact_manager import get_artifact_dir, safe_artifact_path, list_artifacts, clean_artifacts, write_session_meta, list_artifact_sessions as _list_artifact_sessions_on_disk
 
 mcp = FastMCP("MaBoSS")
 
@@ -233,14 +233,20 @@ def create_session(
         default=True,
         description="When True (default), the new session becomes the active default for subsequent calls.",
     ),
+    label: Optional[str] = Field(
+        default=None,
+        description="Optional human-readable label (e.g. 'TP53-MYC Boolean run'). Stored on disk so the session can be rediscovered after a server restart.",
+    ),
 ) -> str:
     """Create a new MaBoSS session.
 
-    Returns the session ID that must be passed to pipeline tools when running
+    Returns the session ID (UUID) that must be passed to pipeline tools when running
     multiple independent simulations in parallel.
     """
     sid = session_manager.create_session(set_as_default=set_as_default)
-    return f"Session created: {sid}" + (" (set as default)" if set_as_default else "")
+    write_session_meta(_SERVER_ROOT, sid, server_name="MaBoSS", label=label)
+    label_info = f" ({label})" if label else ""
+    return f"Session created: {sid}{label_info}" + (" (set as default)" if set_as_default else "")
 
 
 @mcp.tool()
@@ -257,6 +263,37 @@ def list_sessions() -> str:
         lines.append(
             f"- **{sid}**{default_marker}: sim={has_sim}  result={has_res}  bnd={info['bnd_path'] or '—'}"
         )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_artifact_sessions() -> str:
+    """List all MaBoSS sessions that have artifact files on disk (including past server runs).
+
+    Unlike list_sessions() which only shows in-memory sessions, this scans the
+    artifacts/ directory and reads session_meta.json files, so previously created
+    sessions are visible even after a server restart.
+
+    Use the returned session_id and file paths to resume earlier work, e.g.:
+      build_simulation(bnd_path='/path/to/artifacts/<uuid>/output.bnd',
+                       cfg_path='/path/to/artifacts/<uuid>/output.cfg')
+    """
+    sessions = _list_artifact_sessions_on_disk(_SERVER_ROOT, server_name="MaBoSS")
+    if not sessions:
+        return "No artifact sessions found on disk."
+    lines = ["## MaBoSS Artifact Sessions (on disk)\n"]
+    for s in sessions:
+        sid = s["session_id"]
+        label = s.get("label") or ""
+        created = s.get("created_at", "")[:19].replace("T", " ")
+        files = s.get("files", [])
+        lines.append(f"- **{sid}**" + (f" ({label})" if label else ""))
+        if created:
+            lines.append(f"  Created: {created} UTC")
+        if files:
+            lines.append(f"  Files: {', '.join(files)}")
+        else:
+            lines.append("  Files: (none)")
     return "\n".join(lines)
 
 

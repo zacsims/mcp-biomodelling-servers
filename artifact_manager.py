@@ -24,8 +24,12 @@ Usage (inside any server.py):
 """
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+METADATA_FILENAME = "session_meta.json"
 
 
 def get_artifact_dir(server_root: Path, session_id: str) -> Path:
@@ -128,4 +132,107 @@ def clean_artifacts(server_root: Path, session_id: str) -> int:
     except OSError:
         pass
     return count
+
+
+# ---------------------------------------------------------------------------
+# Session metadata helpers
+# ---------------------------------------------------------------------------
+
+def write_session_meta(
+    server_root: Path,
+    session_id: str,
+    server_name: str,
+    label: Optional[str] = None,
+) -> None:
+    """Write a ``session_meta.json`` file into the session artifact directory.
+
+    This is called once at session-creation time so that the artifact directory
+    can be identified even after the server process has restarted.
+
+    Args:
+        server_root: Server directory (``Path(__file__).parent`` in server code).
+        session_id:  UUID session identifier.
+        server_name: Human-readable server name, e.g. ``"NeKo"``.
+        label:       Optional free-text label supplied by the user/LLM.
+    """
+    art_dir = get_artifact_dir(server_root, session_id)
+    meta: Dict[str, Any] = {
+        "session_id": session_id,
+        "server": server_name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "label": label or "",
+    }
+    meta_path = art_dir / METADATA_FILENAME
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+
+def read_session_meta(server_root: Path, session_id: str) -> Optional[Dict[str, Any]]:
+    """Read the metadata dict for *session_id*, or ``None`` if not found.
+
+    Args:
+        server_root: Server directory.
+        session_id:  Session whose metadata to read.
+
+    Returns:
+        Parsed JSON dict, or ``None`` if the file does not exist / is invalid.
+    """
+    meta_path = server_root / "artifacts" / session_id / METADATA_FILENAME
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text())
+    except Exception:
+        return None
+
+
+def list_artifact_sessions(
+    server_root: Path,
+    server_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Scan the artifacts directory and return metadata for every session found on disk.
+
+    Sessions that have a ``session_meta.json`` are returned with full metadata;
+    orphan directories (no metadata file) are included with minimal info so they
+    remain discoverable.
+
+    Args:
+        server_root:  Server directory.
+        server_name:  When set, only sessions whose metadata ``server`` field
+                      matches this name are returned.  Pass ``None`` to return all.
+
+    Returns:
+        List of dicts, each containing at minimum:
+        ``session_id``, ``server``, ``created_at``, ``label``, ``files``.
+        Sorted newest-first by ``created_at``.
+    """
+    base = server_root / "artifacts"
+    if not base.exists():
+        return []
+
+    results: List[Dict[str, Any]] = []
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        meta = read_session_meta(server_root, entry.name)
+        if meta is None:
+            meta = {
+                "session_id": entry.name,
+                "server": "unknown",
+                "created_at": "",
+                "label": "",
+            }
+        # Filter by server name when requested
+        if server_name and meta.get("server", "unknown") not in (server_name, "unknown"):
+            continue
+        # Attach non-metadata file listing (skip the meta file itself)
+        files = sorted(
+            f.name for f in entry.iterdir()
+            if f.is_file() and f.name != METADATA_FILENAME
+        )
+        meta["files"] = files
+        results.append(meta)
+
+    # Sort newest-first (empty created_at sorts to the end)
+    results.sort(key=lambda m: m.get("created_at") or "", reverse=True)
+    return results
 

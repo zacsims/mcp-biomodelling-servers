@@ -21,7 +21,7 @@ from session_manager import session_manager, ensure_session, normalize_verbosity
 
 # Make the repo root importable so we can use the shared artifact_manager
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from artifact_manager import get_artifact_dir, safe_artifact_path, list_artifacts, clean_artifacts
+from artifact_manager import get_artifact_dir, safe_artifact_path, list_artifacts, clean_artifacts, write_session_meta, list_artifact_sessions as _list_artifact_sessions_on_disk
 
 from src.helpers import (
     E_NO_NET, SUMMARY_HINT, _SERVER_ROOT,
@@ -698,14 +698,18 @@ def filter_interactions(
     return table + (" (truncated)" if truncated else "")
 
 @mcp.tool()
-def create_session() -> str:
+def create_session(
+        label: Optional[str] = Field(None, description="Optional human-readable label for this session (e.g. 'TP53-MYC cancer'). Stored on disk so the session can be rediscovered after a server restart.")) -> str:
     """Create a new isolated modelling session (always call before create_network).
 
     Each session holds its own Network object and default completion parameters.
     Prevents accidental reuse of a previous network when starting a new hypothesis.
+    A unique UUID is assigned — use it in all subsequent tool calls.
     """
     sid = session_manager.create_session(set_as_default=False)
-    return f"Created session: {sid}"
+    write_session_meta(_SERVER_ROOT, sid, server_name="NeKo", label=label)
+    label_info = f" ({label})" if label else ""
+    return f"Created session: {sid}{label_info}"
 
 @mcp.tool()
 def list_sessions() -> str:
@@ -716,6 +720,35 @@ def list_sessions() -> str:
     lines = ["Sessions:"]
     for sid, meta in data.items():
         lines.append(f"- {sid}: has_network={meta['has_network']} nodes={meta['nodes']} edges={meta['edges']}")
+    return "\n".join(lines)
+
+@mcp.tool()
+def list_artifact_sessions() -> str:
+    """List all NeKo sessions that have artifact files on disk (including past server runs).
+
+    Unlike list_sessions() which only shows in-memory sessions, this scans the
+    artifacts/ directory and reads session_meta.json files, so previously created
+    sessions are visible even after a server restart.
+
+    Use the returned session_id and file paths to resume earlier work, e.g.:
+      create_network(sif_file='/path/to/artifacts/<uuid>/Network.sif')
+    """
+    sessions = _list_artifact_sessions_on_disk(_SERVER_ROOT, server_name="NeKo")
+    if not sessions:
+        return "No artifact sessions found on disk."
+    lines = ["## NeKo Artifact Sessions (on disk)\n"]
+    for s in sessions:
+        sid = s["session_id"]
+        label = s.get("label") or ""
+        created = s.get("created_at", "")[:19].replace("T", " ")  # trim to YYYY-MM-DD HH:MM:SS
+        files = s.get("files", [])
+        lines.append(f"- **{sid}**" + (f" ({label})" if label else ""))
+        if created:
+            lines.append(f"  Created: {created} UTC")
+        if files:
+            lines.append(f"  Files: {', '.join(files)}")
+        else:
+            lines.append("  Files: (none)")
     return "\n".join(lines)
 
 @mcp.tool()

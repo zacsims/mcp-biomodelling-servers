@@ -24,7 +24,7 @@ sys.path.insert(0, str(current_dir))
 
 # Make repo root importable for shared artifact_manager
 sys.path.insert(0, str(current_dir.parent))
-from artifact_manager import get_artifact_dir, list_artifacts, clean_artifacts
+from artifact_manager import get_artifact_dir, list_artifacts, clean_artifacts, write_session_meta, list_artifact_sessions as _list_artifact_sessions_on_disk
 
 _SERVER_ROOT = current_dir
 
@@ -74,7 +74,8 @@ def create_session(
         str: Session ID and instructions.
     """
     session_id = session_manager.create_session(set_as_default, session_name)
-    
+    write_session_meta(_SERVER_ROOT, session_id, server_name="PhysiCell", label=session_name)
+
     result = f"**Session created:** {session_id[:8]}..."
     if session_name:
         result += f" ({session_name})"
@@ -122,6 +123,36 @@ def list_sessions() -> str:
     result += "Use `set_default_session(session_id)` to switch between sessions."
     
     return result
+
+@mcp.tool()
+def list_artifact_sessions() -> str:
+    """List all PhysiCell sessions that have artifact files on disk (including past server runs).
+
+    Unlike list_sessions() which only shows in-memory sessions, this scans the
+    artifacts/ directory and reads session_meta.json files, so previously created
+    sessions are visible even after a server restart.
+
+    Use the returned session_id and file paths to resume earlier work, e.g.:
+      load_xml_configuration(xml_path='/path/to/artifacts/<uuid>/PhysiCell_settings.xml')
+    """
+    sessions = _list_artifact_sessions_on_disk(_SERVER_ROOT, server_name="PhysiCell")
+    if not sessions:
+        return "No artifact sessions found on disk."
+    lines = ["## PhysiCell Artifact Sessions (on disk)\n"]
+    for s in sessions:
+        sid = s["session_id"]
+        label = s.get("label") or ""
+        created = s.get("created_at", "")[:19].replace("T", " ")
+        files = s.get("files", [])
+        lines.append(f"- **{sid[:8]}...**" + (f" ({label})" if label else ""))
+        lines.append(f"  Full ID: `{sid}`")
+        if created:
+            lines.append(f"  Created: {created} UTC")
+        if files:
+            lines.append(f"  Files: {', '.join(files)}")
+        else:
+            lines.append("  Files: (none)")
+    return "\n".join(lines)
 
 @mcp.tool()
 def set_default_session(
