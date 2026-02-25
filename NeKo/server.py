@@ -501,6 +501,7 @@ def remove_bimodal_interactions(
         return "No 'Effect' column found in network.edges."
     before = len(network.edges)
     network.remove_bimodal_interactions()
+    _invalidate(sess)
     after = len(network.edges)
     removed = before - after
     return f"Removed {removed} bimodal interactions from the network."
@@ -520,6 +521,7 @@ def remove_undefined_interactions(
         return "No 'Effect' column found in network.edges."
     before = len(network.edges)
     network.remove_undefined_interactions()
+    _invalidate(sess)
     after = len(network.edges)
     removed = before - after
     return f"Removed {removed} undefined interactions from the network."
