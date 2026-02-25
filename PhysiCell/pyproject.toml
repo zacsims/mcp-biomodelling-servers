@@ -10,6 +10,7 @@ dependencies = [
     "cairosvg>=2.7.0",
     "pillow>=10.0.0",
     "uq-physicell>=1.2.4",
+    "pcdl>=4.0.0",
 ]
 
 [project.optional-dependencies]

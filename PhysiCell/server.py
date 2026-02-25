@@ -6,6 +6,7 @@
 #   "cairosvg>=2.7.0",
 #   "pillow>=10.0.0",
 #   "uq-physicell>=1.2.4",
+#   "pcdl>=4.0.0",
 # ]
 # ///
 """
@@ -138,6 +139,29 @@ def _ensure_uq_imports():
         UQ_ABC_AVAILABLE = True
     except ImportError:
         UQ_ABC_AVAILABLE = False
+
+# Lazy-load pcdl (PhysiCell data loader) for post-simulation analysis
+_pcdl_imports_checked = False
+PCDL_AVAILABLE = False
+pcdl_TimeStep = None
+pcdl_TimeSeries = None
+
+def _ensure_pcdl_imports():
+    """Lazy-load pcdl modules on first use. Called by analysis tool functions."""
+    global _pcdl_imports_checked, PCDL_AVAILABLE, pcdl_TimeStep, pcdl_TimeSeries
+
+    if _pcdl_imports_checked:
+        return
+
+    _pcdl_imports_checked = True
+
+    try:
+        from pcdl import TimeStep as _TS, TimeSeries as _TSeries
+        pcdl_TimeStep = _TS
+        pcdl_TimeSeries = _TSeries
+        PCDL_AVAILABLE = True
+    except ImportError:
+        PCDL_AVAILABLE = False
 
 from mcp.server.fastmcp import Context, FastMCP
 from fastmcp.utilities.types import Image
@@ -2339,55 +2363,6 @@ str: Markdown-formatted export status with file details
         if not cell_types and session.cell_types_count > 0:
             cell_types = [f"cell_type_{i+1}" for i in range(session.cell_types_count)]
         
-        # VALIDATION GATE 1: If rules exist, validation must be completed before export
-        if session.rules_count > 0 and not session.is_step_complete(WorkflowStep.RULES_VALIDATED):
-            return (
-                "**Error: Literature validation required before export.**\n\n"
-                f"This model has {session.rules_count} cell rules but literature validation "
-                "has not been completed. You MUST validate rules before exporting.\n\n"
-                "**Required steps:**\n"
-                "1. `get_rules_for_validation()` — get the rule list\n"
-                "2. `validate_rules_batch()` — validate ALL rules (Edison searches 150M+ papers automatically)\n"
-                "3. `store_validation_results()` — store results for ALL rules\n"
-                "4. `get_validation_report()` — generate the formal report\n"
-                "5. Then call `export_xml_configuration()` again\n\n"
-                "**NOTE:** If validation was already done earlier in this conversation "
-                "(e.g., before context compaction or a model rebuild), answer files are "
-                "cached on disk. Steps 2-3 will reuse cached results instantly — no "
-                "duplicate Edison API calls will be made. Just re-run all 5 steps."
-            )
-
-        # VALIDATION GATE 2: If contradictory rules exist, they must be revised before export
-        if session.rule_validations:
-            contradictory = [
-                rv for rv in session.rule_validations
-                if rv.support_level == "contradictory"
-            ]
-            if contradictory:
-                msg = (
-                    "**Error: Contradictory rules must be revised before export.**\n\n"
-                    f"{len(contradictory)} rule(s) were flagged as CONTRADICTORY by literature validation. "
-                    "You MUST revise these rules before exporting.\n\n"
-                    "**Contradictory rules:**\n"
-                )
-                for rv in contradictory:
-                    msg += f"- **{rv.cell_type}** | {rv.signal} {rv.direction} {rv.behavior}\n"
-                    if rv.raw_paperqa_answer:
-                        # Show first 200 chars of evidence
-                        snippet = rv.raw_paperqa_answer[:200].replace("\n", " ")
-                        msg += f"  Evidence: {snippet}...\n"
-                msg += (
-                    "\n**Required steps:**\n"
-                    "1. Review the PaperQA evidence for each contradictory rule\n"
-                    "2. Modify the rule using `add_single_cell_rule()` — change direction, "
-                    "half_max, hill_power, or base value as the evidence suggests\n"
-                    "3. Re-validate the modified rule(s) using `validate_rule()` or `validate_rules_batch()`\n"
-                    "4. `store_validation_results()` — store updated results\n"
-                    "5. `get_validation_report()` — regenerate report\n"
-                    "6. Then call `export_xml_configuration()` again"
-                )
-                return msg
-
         # If initial cells have been placed, ensure XML config enables cells.csv
         if session.initial_cells_count > 0:
             session.config.initial_conditions.add_csv_file("cells.csv", "./config", enabled=True)
@@ -2803,10 +2778,7 @@ def store_validation_results(
 
     if missing_rules:
         output += f"### Missing Validations ({len(missing_rules)} rules not yet validated)\n\n"
-        output += (
-            "**`export_xml_configuration()` is BLOCKED** until ALL rules are validated. "
-            "The following rules still need validation:\n\n"
-        )
+        output += "The following rules have not been validated yet:\n\n"
         for ct, sig, dir_, beh in sorted(missing_rules):
             output += f"- {ct} | {sig} {dir_} {beh}\n"
         output += (
@@ -2962,11 +2934,8 @@ def get_validation_report() -> str:
             unvalidated.append(r)
 
     if unvalidated:
-        report += f"### ACTION REQUIRED: Unvalidated Rules ({len(unvalidated)} remaining)\n\n"
-        report += (
-            "**`export_xml_configuration()` is BLOCKED** until ALL rules are validated. "
-            "The following rules have not been validated:\n\n"
-        )
+        report += f"### Unvalidated Rules ({len(unvalidated)} remaining)\n\n"
+        report += "The following rules have not been validated:\n\n"
         for r in unvalidated:
             report += f"- {r.get('cell_type', '?')} | {r.get('signal', '?')} {r.get('direction', '?')} {r.get('behavior', '?')}\n"
         report += (
@@ -2980,11 +2949,10 @@ def get_validation_report() -> str:
         direction_mismatches = [rv for rv in contradictory if rv.direction_match is False]
         other_contradictions = [rv for rv in contradictory if rv.direction_match is not False]
 
-        report += "\n### ACTION REQUIRED: Contradictory Rules\n\n"
+        report += "\n### Contradictory Rules\n\n"
         report += (
-            f"**{len(contradictory)} rule(s) are CONTRADICTORY.** These rules MUST be revised "
-            "before the model can be exported.\n\n"
-            "**`export_xml_configuration()` will REFUSE to export until all contradictory rules are resolved.**\n\n"
+            f"**{len(contradictory)} rule(s) are CONTRADICTORY.** Consider revising "
+            "these rules based on the literature evidence.\n\n"
         )
 
         if direction_mismatches:
@@ -3382,6 +3350,31 @@ def export_cells_csv(filename: str = "cells.csv") -> str:
 # ============================================================================
 # HELPER FUNCTIONS (inspired by NeKo)
 # ============================================================================
+
+def _resolve_output_folder(simulation_id: Optional[str] = None,
+                           output_folder: Optional[str] = None) -> tuple:
+    """Resolve simulation output folder from simulation_id or explicit path.
+
+    Returns:
+        (Path, Optional[str]): (folder_path, error_message).
+        If error_message is not None, folder_path should not be used.
+    """
+    if simulation_id:
+        with simulations_lock:
+            if simulation_id not in running_simulations:
+                return None, f"Error: Simulation '{simulation_id}' not found."
+            sim = running_simulations[simulation_id]
+            folder = Path(sim.output_folder)
+    elif output_folder:
+        folder = Path(output_folder)
+    else:
+        folder = PHYSICELL_ROOT / "output"
+
+    if not folder.exists():
+        return None, f"Error: Output folder not found: {folder}"
+
+    return folder, None
+
 
 def clean_for_markdown(text: str) -> str:
     """
@@ -4222,6 +4215,787 @@ def get_simulation_output_files(simulation_id: Optional[str] = None,
     result += f"**Total:** {total_files} files, {total_size / (1024*1024):.2f} MB\n"
 
     return result
+
+# ============================================================================
+# SIMULATION DATA ANALYSIS (pcdl)
+# ============================================================================
+
+@mcp.tool()
+def get_simulation_analysis_overview(simulation_id: Optional[str] = None,
+                                     output_folder: Optional[str] = None) -> str:
+    """
+    Get an executive summary of a completed simulation.
+    One-shot overview of cell populations, spatial extent, and substrate state.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly (e.g., /Users/simsz/PhysiCell/output)
+
+    Returns:
+        str: Markdown-formatted simulation overview with suggested next tools
+    """
+    _ensure_pcdl_imports()
+    if not PCDL_AVAILABLE:
+        return "Error: pcdl package not installed. Install with: `pip install pcdl`"
+
+    folder, err = _resolve_output_folder(simulation_id, output_folder)
+    if err:
+        return err
+
+    # Check for output XML files
+    xml_files = sorted(folder.glob("output*.xml"))
+    if not xml_files:
+        return f"Error: No PhysiCell output XML files found in {folder}"
+
+    try:
+        # Load first, middle, and last timesteps for population snapshots
+        sample_indices = [0, len(xml_files) // 2, len(xml_files) - 1]
+        sample_indices = sorted(set(sample_indices))  # deduplicate if few files
+
+        result = "## Simulation Analysis Overview\n\n"
+        result += f"**Output folder:** {folder}\n"
+        result += f"**Total timesteps:** {len(xml_files)}\n\n"
+
+        snapshots = []
+        for idx in sample_indices:
+            xml_name = xml_files[idx].name
+            ts = pcdl_TimeStep(xml_name, output_path=str(folder),
+                               microenv=False, graph=False, verbose=False)
+            df = ts.get_cell_df()
+            time_val = ts.get_time()
+
+            # Count cells by type and status
+            type_counts = df['cell_type'].value_counts().to_dict()
+            total = len(df)
+
+            # Separate live vs dead
+            live_phases = {'Ki67_negative', 'Ki67_positive', 'S', 'G0G1', 'G0', 'G1',
+                          'G1a', 'G1b', 'G1c', 'G2', 'G2M', 'M', 'live'}
+            dead_phases = {'apoptotic', 'necrotic_swelling', 'necrotic_lysed', 'debris'}
+            n_live = len(df[df['current_phase'].isin(live_phases)])
+            n_dead = total - n_live
+
+            # Spatial extent
+            x_range = (df['position_x'].min(), df['position_x'].max())
+            y_range = (df['position_y'].min(), df['position_y'].max())
+
+            snapshots.append({
+                'time': time_val, 'type_counts': type_counts,
+                'total': total, 'live': n_live, 'dead': n_dead,
+                'x_range': x_range, 'y_range': y_range
+            })
+
+        # Duration
+        result += f"**Simulation time:** {snapshots[0]['time']:.1f} to {snapshots[-1]['time']:.1f} min"
+        duration_hours = (snapshots[-1]['time'] - snapshots[0]['time']) / 60
+        if duration_hours > 0:
+            result += f" ({duration_hours:.1f} hours)"
+        result += "\n\n"
+
+        # Population summary table
+        result += "### Cell Population Over Time\n\n"
+        result += "| Time (min) | Total | Live | Dead |"
+        all_types = set()
+        for s in snapshots:
+            all_types.update(s['type_counts'].keys())
+        all_types = sorted(all_types)
+        for t in all_types:
+            result += f" {t} |"
+        result += "\n"
+        result += "|---|---|---|---|"
+        for _ in all_types:
+            result += "---|"
+        result += "\n"
+
+        for s in snapshots:
+            result += f"| {s['time']:.0f} | {s['total']} | {s['live']} | {s['dead']} |"
+            for t in all_types:
+                result += f" {s['type_counts'].get(t, 0)} |"
+            result += "\n"
+
+        result += "\n"
+
+        # Growth/decline analysis
+        if len(snapshots) >= 2:
+            first, last = snapshots[0], snapshots[-1]
+            result += "### Population Changes\n\n"
+            for t in all_types:
+                n0 = first['type_counts'].get(t, 0)
+                nf = last['type_counts'].get(t, 0)
+                if n0 > 0:
+                    change_pct = ((nf - n0) / n0) * 100
+                    arrow = "+" if change_pct >= 0 else ""
+                    result += f"- **{t}**: {n0} → {nf} ({arrow}{change_pct:.1f}%)\n"
+                elif nf > 0:
+                    result += f"- **{t}**: 0 → {nf} (new)\n"
+            result += "\n"
+
+            # Spatial expansion
+            result += "### Spatial Extent\n\n"
+            result += f"- **Initial:** x=[{first['x_range'][0]:.0f}, {first['x_range'][1]:.0f}] "
+            result += f"y=[{first['y_range'][0]:.0f}, {first['y_range'][1]:.0f}]\n"
+            result += f"- **Final:** x=[{last['x_range'][0]:.0f}, {last['x_range'][1]:.0f}] "
+            result += f"y=[{last['y_range'][0]:.0f}, {last['y_range'][1]:.0f}]\n\n"
+
+        # Substrate state from final timestep
+        try:
+            final_xml = xml_files[-1].name
+            ts_final = pcdl_TimeStep(final_xml, output_path=str(folder),
+                                     microenv=True, graph=False, verbose=False)
+            substrates = ts_final.get_substrate_list()
+            if substrates:
+                conc_df = ts_final.get_conc_df()
+                result += "### Final Substrate State\n\n"
+                result += "| Substrate | Mean | Std | Min | Max |\n"
+                result += "|---|---|---|---|---|\n"
+                for sub in substrates:
+                    if sub in conc_df.columns:
+                        vals = conc_df[sub]
+                        result += f"| {sub} | {vals.mean():.4g} | {vals.std():.4g} | {vals.min():.4g} | {vals.max():.4g} |\n"
+                result += "\n"
+        except Exception:
+            pass  # Substrate analysis is optional
+
+        # Suggest next tools
+        result += "### Suggested Next Steps\n\n"
+        result += "- `get_population_timeseries()` — detailed growth curves across all timesteps\n"
+        result += "- `get_timestep_summary(timestep=N)` — drill into a specific timepoint\n"
+        result += "- `get_substrate_summary()` — substrate concentration details\n"
+        result += "- `get_cell_data()` — detailed cell attributes with filtering\n"
+        result += "- `generate_analysis_plot()` — save visualizations to disk\n"
+        result += "- `generate_simulation_gif()` — spatial animation from SVG snapshots\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error analyzing simulation: {str(e)}"
+
+
+@mcp.tool()
+def get_timestep_summary(simulation_id: Optional[str] = None,
+                         output_folder: Optional[str] = None,
+                         timestep: int = -1) -> str:
+    """
+    Get a quantitative snapshot of cell populations and spatial extent at one timestep.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly
+        timestep: Timestep index (0-based). Use -1 for latest (default: -1)
+
+    Returns:
+        str: Markdown-formatted timestep summary
+    """
+    _ensure_pcdl_imports()
+    if not PCDL_AVAILABLE:
+        return "Error: pcdl package not installed. Install with: `pip install pcdl`"
+
+    folder, err = _resolve_output_folder(simulation_id, output_folder)
+    if err:
+        return err
+
+    xml_files = sorted(folder.glob("output*.xml"))
+    if not xml_files:
+        return f"Error: No PhysiCell output XML files found in {folder}"
+
+    # Resolve timestep index
+    if timestep < 0:
+        timestep = len(xml_files) + timestep
+    if timestep < 0 or timestep >= len(xml_files):
+        return f"Error: Timestep {timestep} out of range (0-{len(xml_files)-1})"
+
+    try:
+        xml_name = xml_files[timestep].name
+        ts = pcdl_TimeStep(xml_name, output_path=str(folder),
+                           microenv=False, graph=False, verbose=False)
+        df = ts.get_cell_df()
+        time_val = ts.get_time()
+
+        result = f"## Timestep Summary\n\n"
+        result += f"**File:** {xml_name}\n"
+        result += f"**Time:** {time_val:.1f} min ({time_val/60:.1f} hours)\n"
+        result += f"**Timestep index:** {timestep} of {len(xml_files)-1}\n"
+        result += f"**Total cells:** {len(df)}\n\n"
+
+        # Cell counts by type and phase
+        result += "### Cell Counts by Type and Phase\n\n"
+        result += "| Cell Type | Total | Live | Apoptotic | Necrotic |\n"
+        result += "|---|---|---|---|---|\n"
+
+        for ct in sorted(df['cell_type'].unique()):
+            ct_df = df[df['cell_type'] == ct]
+            total = len(ct_df)
+            phases = ct_df['current_phase'].value_counts().to_dict()
+
+            # Categorize phases
+            apoptotic = phases.get('apoptotic', 0)
+            necrotic = sum(v for k, v in phases.items()
+                         if 'necrotic' in str(k).lower() or 'debris' in str(k).lower())
+            live = total - apoptotic - necrotic
+
+            result += f"| {ct} | {total} | {live} | {apoptotic} | {necrotic} |\n"
+
+        result += "\n"
+
+        # Phase breakdown
+        result += "### Phase Distribution\n\n"
+        phase_counts = df['current_phase'].value_counts()
+        for phase, count in phase_counts.items():
+            pct = (count / len(df)) * 100
+            result += f"- **{phase}**: {count} ({pct:.1f}%)\n"
+        result += "\n"
+
+        # Spatial extent
+        result += "### Spatial Extent\n\n"
+        result += f"- **X range:** [{df['position_x'].min():.1f}, {df['position_x'].max():.1f}] μm\n"
+        result += f"- **Y range:** [{df['position_y'].min():.1f}, {df['position_y'].max():.1f}] μm\n"
+        result += f"- **Z range:** [{df['position_z'].min():.1f}, {df['position_z'].max():.1f}] μm\n\n"
+
+        # Volume stats
+        if 'total_volume' in df.columns:
+            result += "### Volume Statistics\n\n"
+            result += f"- **Mean volume:** {df['total_volume'].mean():.1f} μm³\n"
+            result += f"- **Std volume:** {df['total_volume'].std():.1f} μm³\n"
+            result += f"- **Range:** [{df['total_volume'].min():.1f}, {df['total_volume'].max():.1f}] μm³\n\n"
+
+        # List available attributes for deeper analysis
+        result += "### Available Attributes\n\n"
+        result += f"Total columns: {len(df.columns)}\n\n"
+        # Show a curated selection of useful columns
+        useful_cols = [c for c in df.columns if any(k in c.lower() for k in
+                       ['position', 'volume', 'speed', 'pressure', 'damage',
+                        'cycle', 'death', 'oxygen', 'phase', 'type'])]
+        if useful_cols:
+            result += "Key columns: " + ", ".join(sorted(useful_cols)[:20]) + "\n\n"
+
+        result += "Use `get_cell_data(columns='col1,col2')` to inspect specific attributes.\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error reading timestep: {str(e)}"
+
+
+@mcp.tool()
+def get_population_timeseries(simulation_id: Optional[str] = None,
+                              output_folder: Optional[str] = None,
+                              max_timesteps: int = 200) -> str:
+    """
+    Get cell population counts by type across all timesteps (growth curve data).
+    Subsamples if more timesteps than max_timesteps.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly
+        max_timesteps: Maximum number of timesteps to include (default: 200)
+
+    Returns:
+        str: Markdown-formatted population timeseries with growth rates
+    """
+    _ensure_pcdl_imports()
+    if not PCDL_AVAILABLE:
+        return "Error: pcdl package not installed. Install with: `pip install pcdl`"
+
+    folder, err = _resolve_output_folder(simulation_id, output_folder)
+    if err:
+        return err
+
+    xml_files = sorted(folder.glob("output*.xml"))
+    if not xml_files:
+        return f"Error: No PhysiCell output XML files found in {folder}"
+
+    try:
+        # Subsample if needed
+        if len(xml_files) > max_timesteps:
+            step = len(xml_files) / max_timesteps
+            indices = [int(i * step) for i in range(max_timesteps)]
+            # Always include last
+            if indices[-1] != len(xml_files) - 1:
+                indices[-1] = len(xml_files) - 1
+            selected_files = [xml_files[i] for i in indices]
+        else:
+            selected_files = xml_files
+
+        # Collect population data
+        rows = []
+        all_types = set()
+
+        for xml_file in selected_files:
+            ts = pcdl_TimeStep(xml_file.name, output_path=str(folder),
+                               microenv=False, graph=False, verbose=False)
+            df = ts.get_cell_df()
+            time_val = ts.get_time()
+
+            type_counts = df['cell_type'].value_counts().to_dict()
+            all_types.update(type_counts.keys())
+
+            # Count live vs dead
+            live_phases = {'Ki67_negative', 'Ki67_positive', 'S', 'G0G1', 'G0', 'G1',
+                          'G1a', 'G1b', 'G1c', 'G2', 'G2M', 'M', 'live'}
+            n_live = len(df[df['current_phase'].isin(live_phases)])
+            n_dead = len(df) - n_live
+
+            rows.append({
+                'time': time_val, 'total': len(df),
+                'live': n_live, 'dead': n_dead,
+                **type_counts
+            })
+
+        all_types = sorted(all_types)
+
+        result = "## Population Timeseries\n\n"
+        result += f"**Timesteps:** {len(rows)} (of {len(xml_files)} total)\n"
+        result += f"**Duration:** {rows[0]['time']:.0f} to {rows[-1]['time']:.0f} min "
+        result += f"({(rows[-1]['time'] - rows[0]['time'])/60:.1f} hours)\n"
+        result += f"**Cell types:** {', '.join(all_types)}\n\n"
+
+        # Data table
+        result += "### Population Table\n\n"
+        result += "| Time (min) | Total | Live | Dead |"
+        for t in all_types:
+            result += f" {t} |"
+        result += "\n"
+        result += "|---|---|---|---|"
+        for _ in all_types:
+            result += "---|"
+        result += "\n"
+
+        for row in rows:
+            result += f"| {row['time']:.0f} | {row['total']} | {row['live']} | {row['dead']} |"
+            for t in all_types:
+                result += f" {row.get(t, 0)} |"
+            result += "\n"
+
+        result += "\n"
+
+        # Growth rate analysis
+        if len(rows) >= 2:
+            result += "### Growth Analysis\n\n"
+            first, last = rows[0], rows[-1]
+            dt_hours = (last['time'] - first['time']) / 60
+
+            for t in all_types:
+                n0 = first.get(t, 0)
+                nf = last.get(t, 0)
+                if n0 > 0 and nf > 0 and dt_hours > 0:
+                    # Net growth rate
+                    import math as _math
+                    growth_rate = _math.log(nf / n0) / dt_hours if nf != n0 else 0
+                    if growth_rate > 0:
+                        doubling_time = _math.log(2) / growth_rate
+                        result += f"- **{t}**: {n0} → {nf}, "
+                        result += f"growth rate = {growth_rate:.4f}/hr, "
+                        result += f"doubling time ≈ {doubling_time:.1f} hr\n"
+                    elif growth_rate < 0:
+                        half_life = -_math.log(2) / growth_rate
+                        result += f"- **{t}**: {n0} → {nf}, "
+                        result += f"decline rate = {growth_rate:.4f}/hr, "
+                        result += f"half-life ≈ {half_life:.1f} hr\n"
+                    else:
+                        result += f"- **{t}**: {n0} → {nf} (stable)\n"
+                elif n0 == 0 and nf > 0:
+                    result += f"- **{t}**: 0 → {nf} (appeared during simulation)\n"
+                elif n0 > 0 and nf == 0:
+                    result += f"- **{t}**: {n0} → 0 (eliminated)\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error generating population timeseries: {str(e)}"
+
+
+@mcp.tool()
+def get_substrate_summary(simulation_id: Optional[str] = None,
+                          output_folder: Optional[str] = None,
+                          timestep: int = -1) -> str:
+    """
+    Get substrate concentration statistics at one timestep.
+    Shows mean/std/min/max per substrate and center-vs-edge gradient.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly
+        timestep: Timestep index (0-based). Use -1 for latest (default: -1)
+
+    Returns:
+        str: Markdown-formatted substrate statistics
+    """
+    _ensure_pcdl_imports()
+    if not PCDL_AVAILABLE:
+        return "Error: pcdl package not installed. Install with: `pip install pcdl`"
+
+    folder, err = _resolve_output_folder(simulation_id, output_folder)
+    if err:
+        return err
+
+    xml_files = sorted(folder.glob("output*.xml"))
+    if not xml_files:
+        return f"Error: No PhysiCell output XML files found in {folder}"
+
+    # Resolve timestep index
+    if timestep < 0:
+        timestep = len(xml_files) + timestep
+    if timestep < 0 or timestep >= len(xml_files):
+        return f"Error: Timestep {timestep} out of range (0-{len(xml_files)-1})"
+
+    try:
+        xml_name = xml_files[timestep].name
+        ts = pcdl_TimeStep(xml_name, output_path=str(folder),
+                           microenv=True, graph=False, verbose=False)
+        time_val = ts.get_time()
+        substrates = ts.get_substrate_list()
+
+        if not substrates:
+            return "No substrates found in the simulation output."
+
+        conc_df = ts.get_conc_df()
+
+        result = f"## Substrate Summary\n\n"
+        result += f"**File:** {xml_name}\n"
+        result += f"**Time:** {time_val:.1f} min ({time_val/60:.1f} hours)\n"
+        result += f"**Substrates:** {', '.join(substrates)}\n"
+        result += f"**Voxels:** {len(conc_df)}\n\n"
+
+        # Statistics table
+        result += "### Concentration Statistics\n\n"
+        result += "| Substrate | Mean | Std | Min | Max | Nonzero % |\n"
+        result += "|---|---|---|---|---|---|\n"
+
+        for sub in substrates:
+            if sub in conc_df.columns:
+                vals = conc_df[sub]
+                nonzero_pct = (vals > 1e-10).sum() / len(vals) * 100
+                result += f"| {sub} | {vals.mean():.4g} | {vals.std():.4g} "
+                result += f"| {vals.min():.4g} | {vals.max():.4g} | {nonzero_pct:.1f}% |\n"
+
+        result += "\n"
+
+        # Center vs edge gradient analysis
+        if 'mesh_center_m' in conc_df.columns and 'mesh_center_n' in conc_df.columns:
+            result += "### Center vs Edge Gradient\n\n"
+
+            m_vals = conc_df['mesh_center_m']
+            n_vals = conc_df['mesh_center_n']
+            m_center = (m_vals.max() + m_vals.min()) / 2
+            n_center = (n_vals.max() + n_vals.min()) / 2
+            m_range = m_vals.max() - m_vals.min()
+
+            # Define center (inner 25% of domain) and edge (outer 25%)
+            dist = ((m_vals - m_center)**2 + (n_vals - n_center)**2)**0.5
+            center_thresh = m_range * 0.25
+            edge_thresh = m_range * 0.40
+
+            center_mask = dist <= center_thresh
+            edge_mask = dist >= edge_thresh
+
+            if center_mask.sum() > 0 and edge_mask.sum() > 0:
+                result += "| Substrate | Center Mean | Edge Mean | Gradient |\n"
+                result += "|---|---|---|---|\n"
+
+                for sub in substrates:
+                    if sub in conc_df.columns:
+                        center_mean = conc_df.loc[center_mask, sub].mean()
+                        edge_mean = conc_df.loc[edge_mask, sub].mean()
+                        if edge_mean > 1e-10:
+                            gradient = (edge_mean - center_mean) / edge_mean * 100
+                            result += f"| {sub} | {center_mean:.4g} | {edge_mean:.4g} | {gradient:+.1f}% |\n"
+                        else:
+                            result += f"| {sub} | {center_mean:.4g} | {edge_mean:.4g} | N/A |\n"
+
+                result += "\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error reading substrate data: {str(e)}"
+
+
+@mcp.tool()
+def get_cell_data(simulation_id: Optional[str] = None,
+                  output_folder: Optional[str] = None,
+                  timestep: int = -1,
+                  cell_type: Optional[str] = None,
+                  columns: Optional[str] = None,
+                  sort_by: Optional[str] = None,
+                  max_rows: int = 50) -> str:
+    """
+    Get detailed cell data with filtering and column selection.
+    Returns a markdown table plus column statistics for the full population.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly
+        timestep: Timestep index (0-based). Use -1 for latest (default: -1)
+        cell_type: Filter to a specific cell type (default: all)
+        columns: Comma-separated list of columns to include (default: essential columns)
+        sort_by: Column to sort by (default: no sorting)
+        max_rows: Maximum rows in the table (default: 50)
+
+    Returns:
+        str: Markdown-formatted cell data table and statistics
+    """
+    _ensure_pcdl_imports()
+    if not PCDL_AVAILABLE:
+        return "Error: pcdl package not installed. Install with: `pip install pcdl`"
+
+    folder, err = _resolve_output_folder(simulation_id, output_folder)
+    if err:
+        return err
+
+    xml_files = sorted(folder.glob("output*.xml"))
+    if not xml_files:
+        return f"Error: No PhysiCell output XML files found in {folder}"
+
+    # Resolve timestep index
+    if timestep < 0:
+        timestep = len(xml_files) + timestep
+    if timestep < 0 or timestep >= len(xml_files):
+        return f"Error: Timestep {timestep} out of range (0-{len(xml_files)-1})"
+
+    try:
+        xml_name = xml_files[timestep].name
+        ts = pcdl_TimeStep(xml_name, output_path=str(folder),
+                           microenv=False, graph=False, verbose=False)
+        df = ts.get_cell_df()
+        time_val = ts.get_time()
+
+        # Filter by cell type
+        if cell_type:
+            available_types = df['cell_type'].unique().tolist()
+            if cell_type not in available_types:
+                return f"Error: Cell type '{cell_type}' not found. Available: {', '.join(available_types)}"
+            df = df[df['cell_type'] == cell_type]
+
+        result = f"## Cell Data\n\n"
+        result += f"**Time:** {time_val:.1f} min | "
+        result += f"**Cells:** {len(df)}"
+        if cell_type:
+            result += f" (type: {cell_type})"
+        result += "\n\n"
+
+        # Determine columns to show
+        essential = ['cell_type', 'position_x', 'position_y']
+        if columns:
+            requested = [c.strip() for c in columns.split(',')]
+            # Always include essentials at front, then requested
+            show_cols = []
+            for c in essential:
+                if c in df.columns:
+                    show_cols.append(c)
+            for c in requested:
+                if c in df.columns and c not in show_cols:
+                    show_cols.append(c)
+                elif c not in df.columns:
+                    result += f"*Warning: column '{c}' not found*\n"
+        else:
+            # Default: essential + key attributes
+            default_extra = ['position_z', 'total_volume', 'current_phase',
+                           'pressure', 'total_attack_time']
+            show_cols = [c for c in essential if c in df.columns]
+            show_cols += [c for c in default_extra if c in df.columns]
+
+        # Cap at 10 columns to prevent overflow
+        if len(show_cols) > 10:
+            show_cols = show_cols[:10]
+            result += f"*Showing 10 of {len(show_cols)} requested columns*\n\n"
+
+        # Sort if requested
+        if sort_by:
+            if sort_by in df.columns:
+                df = df.sort_values(sort_by, ascending=False)
+            else:
+                result += f"*Warning: sort column '{sort_by}' not found*\n"
+
+        # Build table (capped at max_rows)
+        display_df = df.head(max_rows)
+
+        result += "### Data Table\n\n"
+        if len(df) > max_rows:
+            result += f"*Showing {max_rows} of {len(df)} cells*\n\n"
+
+        # Header
+        result += "| " + " | ".join(show_cols) + " |\n"
+        result += "|" + "|".join(["---"] * len(show_cols)) + "|\n"
+
+        # Rows
+        for _, row in display_df.iterrows():
+            vals = []
+            for c in show_cols:
+                v = row.get(c, 'N/A')
+                if isinstance(v, float):
+                    vals.append(f"{v:.4g}")
+                else:
+                    vals.append(str(v))
+            result += "| " + " | ".join(vals) + " |\n"
+
+        result += "\n"
+
+        # Column statistics for numeric columns (full population, not just displayed rows)
+        numeric_cols = [c for c in show_cols if c in df.columns and
+                       df[c].dtype in ('float64', 'float32', 'int64', 'int32')]
+        if numeric_cols:
+            result += "### Column Statistics (full population)\n\n"
+            result += "| Column | Mean | Std | Min | Max |\n"
+            result += "|---|---|---|---|---|\n"
+            for c in numeric_cols:
+                vals = df[c]
+                result += f"| {c} | {vals.mean():.4g} | {vals.std():.4g} "
+                result += f"| {vals.min():.4g} | {vals.max():.4g} |\n"
+            result += "\n"
+
+        return result
+
+    except Exception as e:
+        return f"Error reading cell data: {str(e)}"
+
+
+@mcp.tool()
+def generate_analysis_plot(simulation_id: Optional[str] = None,
+                           output_folder: Optional[str] = None,
+                           plot_type: str = "population_timeseries",
+                           timestep: int = -1) -> str:
+    """
+    Generate and save an analysis plot to disk.
+
+    Args:
+        simulation_id: Use output folder from this simulation ID
+        output_folder: Or specify output folder directly
+        plot_type: Plot type - "population_timeseries", "cell_scatter", or "substrate_contour"
+        timestep: Timestep index for scatter/contour plots (default: -1 for latest)
+
+    Returns:
+        str: Path to saved plot file
+    """
+    _ensure_pcdl_imports()
+    if not PCDL_AVAILABLE:
+        return "Error: pcdl package not installed. Install with: `pip install pcdl`"
+
+    folder, err = _resolve_output_folder(simulation_id, output_folder)
+    if err:
+        return err
+
+    xml_files = sorted(folder.glob("output*.xml"))
+    if not xml_files:
+        return f"Error: No PhysiCell output XML files found in {folder}"
+
+    # Create output directory for plots
+    plots_dir = MCP_OUTPUT_DIR / "analysis_plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend
+        import matplotlib.pyplot as plt
+
+        if plot_type == "population_timeseries":
+            # Load all timesteps and count cells by type
+            # Subsample if many timesteps
+            if len(xml_files) > 200:
+                step = len(xml_files) / 200
+                indices = [int(i * step) for i in range(200)]
+                if indices[-1] != len(xml_files) - 1:
+                    indices[-1] = len(xml_files) - 1
+                selected = [xml_files[i] for i in indices]
+            else:
+                selected = xml_files
+
+            times = []
+            type_data = {}
+
+            for xml_file in selected:
+                ts = pcdl_TimeStep(xml_file.name, output_path=str(folder),
+                                   microenv=False, graph=False, verbose=False)
+                df = ts.get_cell_df()
+                time_val = ts.get_time()
+                times.append(time_val / 60)  # Convert to hours
+
+                counts = df['cell_type'].value_counts().to_dict()
+                for ct, n in counts.items():
+                    if ct not in type_data:
+                        type_data[ct] = []
+                # Ensure all types have entries
+                for ct in type_data:
+                    type_data[ct].append(counts.get(ct, 0))
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for ct, counts in sorted(type_data.items()):
+                ax.plot(times, counts, label=ct, linewidth=2)
+            ax.set_xlabel('Time (hours)')
+            ax.set_ylabel('Cell Count')
+            ax.set_title('Cell Population Over Time')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            plot_path = plots_dir / "population_timeseries.png"
+            fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            return (f"## Population Timeseries Plot\n\n"
+                    f"**Saved to:** {plot_path}\n"
+                    f"**Timesteps plotted:** {len(times)}\n"
+                    f"**Cell types:** {', '.join(sorted(type_data.keys()))}\n")
+
+        elif plot_type == "cell_scatter":
+            # Resolve timestep
+            if timestep < 0:
+                timestep = len(xml_files) + timestep
+            if timestep < 0 or timestep >= len(xml_files):
+                return f"Error: Timestep {timestep} out of range (0-{len(xml_files)-1})"
+
+            xml_name = xml_files[timestep].name
+            ts = pcdl_TimeStep(xml_name, output_path=str(folder),
+                               microenv=False, graph=False, verbose=False)
+            time_val = ts.get_time()
+
+            fig = ts.plot_scatter(focus='cell_type', ext=None)
+
+            plot_path = plots_dir / f"cell_scatter_t{timestep}.png"
+            fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            return (f"## Cell Scatter Plot\n\n"
+                    f"**Saved to:** {plot_path}\n"
+                    f"**Timestep:** {timestep} (time={time_val:.0f} min)\n")
+
+        elif plot_type == "substrate_contour":
+            # Resolve timestep
+            if timestep < 0:
+                timestep = len(xml_files) + timestep
+            if timestep < 0 or timestep >= len(xml_files):
+                return f"Error: Timestep {timestep} out of range (0-{len(xml_files)-1})"
+
+            xml_name = xml_files[timestep].name
+            ts = pcdl_TimeStep(xml_name, output_path=str(folder),
+                               microenv=True, graph=False, verbose=False)
+            time_val = ts.get_time()
+            substrates = ts.get_substrate_list()
+
+            if not substrates:
+                return "Error: No substrates found in the simulation output."
+
+            # Plot first substrate (most commonly oxygen)
+            focus_sub = substrates[0]
+            fig = ts.plot_contour(focus=focus_sub, ext=None)
+
+            plot_path = plots_dir / f"substrate_{focus_sub}_t{timestep}.png"
+            fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            return (f"## Substrate Contour Plot\n\n"
+                    f"**Saved to:** {plot_path}\n"
+                    f"**Substrate:** {focus_sub}\n"
+                    f"**Timestep:** {timestep} (time={time_val:.0f} min)\n"
+                    f"**All substrates:** {', '.join(substrates)}\n")
+
+        else:
+            return (f"Error: Unknown plot_type '{plot_type}'. "
+                    f"Choose from: population_timeseries, cell_scatter, substrate_contour")
+
+    except ImportError:
+        return "Error: matplotlib is required for plotting. Install with: `pip install matplotlib`"
+    except Exception as e:
+        return f"Error generating plot: {str(e)}"
+
 
 # ============================================================================
 # UNCERTAINTY QUANTIFICATION (UQ) TOOLS
@@ -5770,6 +6544,14 @@ def get_help() -> str:
 13. **get_simulation_status()** - Check simulation progress
 14. **generate_simulation_gif()** - Create GIF visualization when complete
 
+### Phase 4b: Data Analysis (after simulation completes)
+15. **get_simulation_analysis_overview()** - One-shot executive summary
+16. **get_population_timeseries()** - Cell counts over time (growth curves)
+17. **get_timestep_summary()** - Detailed snapshot at one timepoint
+18. **get_substrate_summary()** - Substrate concentration statistics
+19. **get_cell_data()** - Filtered cell attributes with statistics
+20. **generate_analysis_plot()** - Save plots (population, scatter, contour)
+
 ### Phase 5: Uncertainty Quantification & Calibration (Optional)
 15. **setup_uq_analysis()** - Initialize UQ for a compiled project
 16. **get_uq_parameter_suggestions()** - See calibratable parameters
@@ -5800,6 +6582,8 @@ def get_help() -> str:
 - **list_simulations()** - See all running/completed simulations
 - **stop_simulation()** - Stop a running simulation
 - **get_simulation_output_files()** - List output files
+- **get_simulation_analysis_overview()** - Quick simulation summary
+- **get_cell_data()** - Detailed cell data with filtering
 - **list_uq_runs()** - See all UQ analysis runs
 - **get_validation_report()** - View literature validation results
 

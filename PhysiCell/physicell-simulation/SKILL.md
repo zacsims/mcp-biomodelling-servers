@@ -22,13 +22,9 @@ These rules are enforced by server-side validation. Violating them will cause to
 
 2. **All MCP tools must be called via MCP tool calling** (prefix `mcp__PhysiCell__`). Do NOT run them via Bash, subprocess, or npx.
 
-3. **Never extract parameter values from raw sources.** Do NOT read papers, abstracts, or web results and manually pick out numbers for half_max, hill_power, rates, etc. Edison's PaperQA3 API (via the LiteratureValidation MCP) does this accurately. WebSearch is allowed ONLY for finding PMIDs and DOIs — never for extracting parameter values.
+3. **Never extract parameter values from raw sources.** Do NOT read papers, abstracts, or web results and manually pick out numbers for half_max, hill_power, rates, etc. Use literature search tools or the LiteratureValidation MCP (if available) for evidence-based parameter guidance.
 
-4. **Never fabricate validation results.** `store_validation_results()` reads PaperQA answer files directly from disk — you cannot override VERDICT or DIRECTION. If no answer file exists for a rule, the server rejects it. You MUST call `validate_rule()` via LiteratureValidation MCP first. If the LiteratureValidation MCP is unavailable, tell the user — do NOT substitute your own knowledge.
-
-5. **Never delegate literature work to subagents.** Subagents (Task tool) do NOT have MCP access. They will fall back to WebSearch and produce unreliable results.
-
-6. **Validation must complete before export.** `export_xml_configuration()` is server-gated: it REFUSES to export if (a) rules exist but validation is incomplete, or (b) any rules are flagged `contradictory`. Build the model first, validate ALL rules, revise contradictions, then export.
+4. **Literature validation is optional.** If the LiteratureValidation MCP is available, use it to validate rules against published literature. If it is not available, proceed with export directly after adding rules. The validation tools (`get_rules_for_validation`, `store_validation_results`, `get_validation_report`) remain available for when validation is desired.
 
 ## 1. Tool Ordering
 
@@ -45,15 +41,21 @@ create_session
   → [setter tools as needed]          (see Section 2 — set nonzero defaults BEFORE rules)
   → add_single_cell_rule              (repeat per rule — see Section 2)
   → place_initial_cells               (repeat per placement)
-  → LITERATURE VALIDATION             (see Section 7 — MANDATORY, server-enforced)
-  → export_xml_configuration          (BLOCKED until validation passes)
+  → [LITERATURE VALIDATION]           (optional — see Section 7)
+  → export_xml_configuration
   → export_cell_rules_csv
   → export_cells_csv                  (if cells were placed)
   → create_physicell_project
   → compile_physicell_project
   → run_simulation
   → get_simulation_status             (poll every 60s until done)
-  → generate_simulation_gif
+  → get_simulation_analysis_overview   (first look at results)
+  → get_population_timeseries          (growth curves)
+  → get_timestep_summary              (drill into specific timepoints)
+  → get_substrate_summary             (substrate concentrations)
+  → get_cell_data                     (detailed cell attributes)
+  → generate_analysis_plot            (save visualizations)
+  → generate_simulation_gif           (spatial animation)
 ```
 
 ## 2. Hill Function Rules
@@ -162,6 +164,7 @@ add_single_cell_rule(
 | 8 | `increases`/`decreases` swapped | "increases" = more signal → more behavior |
 | 9 | Not polling simulation status | Call `get_simulation_status()` after `run_simulation()` |
 | 10 | Forgot `compile_physicell_project` | Must compile before running |
+| 11 | Reading binary output files directly | Use `get_simulation_analysis_overview()` or `get_cell_data()` — never `Read` .mat/.xml output files |
 
 ## 4. Substrate Defaults
 
@@ -201,11 +204,11 @@ set_substrate_interaction(cell_type="tumor", substrate="chemokine", secretion_ra
 
 Typical oxygen uptake: 10.0 (tumor), 5.0 (normal). Glucose: 0.5-2.0. Drug: 0.01-0.1.
 
-## 7. Literature Validation
+## 7. Literature Validation (Optional)
 
 ### When to validate
 
-Validate whenever the user mentions literature, published data, or validation. This is mandatory when requested and is enforced server-side — export is blocked until validation passes.
+Validate when the user explicitly requests literature validation or when the LiteratureValidation MCP server is available and the user wants evidence-based parameter guidance. Validation is not required for export.
 
 ### Prohibited tools and actions
 
@@ -250,14 +253,21 @@ Pass `signal_units` when validating to prevent unit confusion:
 
 **Support levels:** strong, moderate, weak, unsupported (from PaperQA VERDICT). `contradictory` is auto-assigned by the server when a direction mismatch is detected.
 
-## 8. Post-Simulation
+## 8. Post-Simulation Analysis
 
 After `run_simulation()`:
 1. Poll `get_simulation_status()` every 60 seconds until complete/failed
-2. `generate_simulation_gif()` to visualize
-3. `get_simulation_output_files()` to list outputs
-4. Verify cell counts change over time (not static)
-5. If rules seem inactive, check `detailed_rules.txt` for "from X towards Y" values
+2. `get_simulation_analysis_overview()` — one-shot executive summary (start here)
+3. `get_population_timeseries()` — cell counts over time, growth rates, doubling times
+4. `get_timestep_summary(timestep=N)` — drill into a specific timepoint
+5. `get_substrate_summary()` — substrate concentration statistics with gradients
+6. `get_cell_data(cell_type="X", columns="col1,col2")` — filtered cell attributes
+7. `generate_analysis_plot(plot_type="population_timeseries")` — save plots to disk
+8. `generate_simulation_gif()` — spatial animation from SVG snapshots
+
+**Do NOT** use `Read` to open binary output files (.mat, .xml output, .gif). These will crash with buffer overflow. Always use the analysis tools above.
+
+If rules seem inactive, check `detailed_rules.txt` for "from X towards Y" values.
 
 ## 9. Reference Files
 
@@ -290,5 +300,8 @@ Basic tumor growth simulation (no literature validation):
 15. compile_physicell_project("tumor_growth")
 16. run_simulation("tumor_growth")
 17. get_simulation_status(simulation_id)   # poll until complete
-18. generate_simulation_gif(simulation_id)
+18. get_simulation_analysis_overview(simulation_id)
+19. get_population_timeseries(simulation_id)
+20. generate_analysis_plot(simulation_id, plot_type="population_timeseries")
+21. generate_simulation_gif(simulation_id)
 ```
