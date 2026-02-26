@@ -1412,6 +1412,124 @@ str: Success message with configured parameters
     return f"**Cell integrity configured for {cell_type}:**\n" + "\n".join(changes)
 
 
+@mcp.tool()
+def set_chemotaxis(cell_type: str, substrate: str, enabled: bool = True,
+                   direction: int = 1) -> str:
+    """
+When the user asks to set chemotaxis, enable chemotactic migration, or direct cells toward a substrate,
+this function configures basic chemotaxis for a cell type.
+This sets cells to follow (or flee from) a single substrate gradient.
+For multi-substrate chemotaxis with per-substrate sensitivity values, use set_advanced_chemotaxis() instead.
+
+Input parameters:
+cell_type (str): Name of existing cell type
+substrate (str): Name of existing substrate to chemotax toward/away from (e.g., 'oxygen')
+enabled (bool): Whether chemotaxis is active (default: True)
+direction (int): 1 for attraction (up gradient), -1 for repulsion (down gradient) (default: 1)
+
+Returns:
+str: Success message with chemotaxis configuration
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    if direction not in (1, -1):
+        return "Error: direction must be 1 (attraction, up gradient) or -1 (repulsion, down gradient)"
+
+    try:
+        session.config.cell_types.set_chemotaxis(cell_type, substrate,
+                                                  enabled=enabled, direction=direction)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    dir_label = "up gradient (attraction)" if direction == 1 else "down gradient (repulsion)"
+    return (f"**Chemotaxis configured for {cell_type}:**\n"
+            f"- substrate: {substrate}\n"
+            f"- enabled: {enabled}\n"
+            f"- direction: {direction} ({dir_label})\n\n"
+            f"Note: This sets basic chemotaxis. Motility must also be enabled "
+            f"(use configure_cell_parameters with motility_speed > 0).")
+
+
+@mcp.tool()
+def set_advanced_chemotaxis(cell_type: str, substrate: str, sensitivity: float,
+                            enabled: bool = True,
+                            normalize_each_gradient: bool = False) -> str:
+    """
+When the user asks to set chemotactic sensitivity, configure multi-substrate chemotaxis,
+or set how strongly cells respond to a gradient, this function configures advanced chemotaxis.
+Unlike basic chemotaxis (single substrate), advanced chemotaxis allows per-substrate sensitivity
+values and supports simultaneous response to multiple substrate gradients.
+
+Call this BEFORE adding rules that target 'chemotactic response to <substrate>' behaviors,
+because the XML default chemotactic sensitivity is 0 and rules interpolate toward the XML default.
+To set sensitivity for multiple substrates, call this function once per substrate.
+
+Input parameters:
+cell_type (str): Name of existing cell type
+substrate (str): Name of existing substrate (e.g., 'oxygen')
+sensitivity (float): Chemotactic sensitivity value. Positive = attraction, negative = repulsion.
+    Typical range: -1.0 to 1.0, but larger values are allowed.
+enabled (bool): Whether advanced chemotaxis is active (default: True)
+normalize_each_gradient (bool): Whether to normalize each substrate gradient independently (default: False)
+
+Returns:
+str: Success message with advanced chemotaxis configuration
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    motility = cell_types_dict[cell_type]['phenotype']['motility']
+
+    # Get existing advanced_chemotaxis settings to preserve other substrates
+    adv = motility.get('advanced_chemotaxis', {})
+    existing_sensitivities = adv.get('chemotactic_sensitivities', {})
+
+    # Remove placeholder if present
+    existing_sensitivities.pop('substrate', None)
+
+    # Update the target substrate's sensitivity
+    existing_sensitivities[substrate] = sensitivity
+
+    try:
+        session.config.cell_types.set_advanced_chemotaxis(
+            cell_type, existing_sensitivities,
+            enabled=enabled, normalize_each_gradient=normalize_each_gradient)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    # Build summary of all current sensitivities
+    current = motility.get('advanced_chemotaxis', {}).get('chemotactic_sensitivities', {})
+    sens_lines = [f"- {sub}: {val}" for sub, val in current.items() if sub != 'substrate']
+
+    return (f"**Advanced chemotaxis configured for {cell_type}:**\n"
+            f"- enabled: {enabled}\n"
+            f"- normalize_each_gradient: {normalize_each_gradient}\n"
+            f"- chemotactic sensitivities:\n" + "\n".join(sens_lines) + "\n\n"
+            f"Note: Motility must also be enabled "
+            f"(use configure_cell_parameters with motility_speed > 0).")
+
+
 # ============================================================================
 # PARAMETER DISCOVERY AND DEFAULTS
 # ============================================================================
@@ -1675,6 +1793,14 @@ def _get_behavior_default_from_config(session, cell_type: str, behavior: str) ->
         if behavior == "damage repair rate":
             return integrity.get('damage_repair_rate', 0.0)
 
+        # --- Chemotaxis ---
+        # "chemotactic response to X" behavior maps to advanced_chemotaxis sensitivity
+        if behavior.startswith("chemotactic response to "):
+            substrate = behavior[len("chemotactic response to "):]
+            adv = phenotype.get('motility', {}).get('advanced_chemotaxis', {})
+            sensitivities = adv.get('chemotactic_sensitivities', {})
+            return sensitivities.get(substrate, 0.0)
+
     except (KeyError, TypeError, IndexError):
         return None
 
@@ -1808,6 +1934,14 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
             fix = (
                 f"Call `configure_cell_integrity(cell_type=\"{ct}\", "
                 f"{param}=0.001)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        # Chemotaxis: "chemotactic response to X"
+        elif b.startswith("chemotactic response to "):
+            substrate = b[len("chemotactic response to "):]
+            fix = (
+                f"Call `set_advanced_chemotaxis(cell_type=\"{ct}\", "
+                f"substrate=\"{substrate}\", sensitivity=0.5)` first, "
                 f"then re-add this rule with `min_signal=0`."
             )
 
@@ -6527,6 +6661,7 @@ def get_help() -> str:
 4. **add_single_substrate()** - Add oxygen, nutrients, drugs, etc.
 5. **add_single_cell_type()** - Add cancer cells, immune cells, etc.
 6. **configure_cell_parameters()** - Set cell volumes, motility, death rates
+6b. **set_chemotaxis()** / **set_advanced_chemotaxis()** - Configure chemotactic migration
 7. **add_single_cell_rule()** - Create realistic cell responses
 7b. **place_initial_cells()** - (Optional) Place cells spatially for initial conditions
 
