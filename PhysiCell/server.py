@@ -72,7 +72,7 @@ except ImportError:
 # Import session management
 from session_manager import (
     session_manager, SessionState, WorkflowStep, MaBoSSContext,
-    UQContext, UQParameterDef, RuleValidationResult,
+    UQContext, UQParameterDef, RuleJustification,
     get_current_session, ensure_session, analyze_and_update_session_from_config
 )
 
@@ -910,18 +910,21 @@ def add_single_cell_type(
 @mcp.tool()
 def configure_cell_parameters(
     cell_type: Annotated[str, Field(description="Name of an existing cell type to configure.")],
-    volume_total: float = Field(default=2500.0, description="Total cell volume in μm³."),
-    volume_nuclear: float = Field(default=500.0, description="Nuclear volume in μm³."),
-    fluid_fraction: float = Field(default=0.75, description="Cytoplasmic fluid fraction (0–1)."),
-    motility_speed: float = Field(default=0.5, description="Cell migration speed in μm/min."),
-    persistence_time: float = Field(default=5.0, description="Directional persistence time in minutes."),
-    apoptosis_rate: float = Field(default=0.0001, description="Spontaneous apoptosis rate in 1/min."),
-    necrosis_rate: float = Field(default=0.0001, description="Spontaneous necrosis rate in 1/min."),
+    volume_total: Optional[float] = Field(default=None, description="Total cell volume in μm³ (default: 2494)."),
+    volume_nuclear: Optional[float] = Field(default=None, description="Nuclear volume in μm³ (default: 540)."),
+    fluid_fraction: Optional[float] = Field(default=None, description="Cytoplasmic fluid fraction 0–1 (default: 0.75)."),
+    motility_speed: Optional[float] = Field(default=None, description="Cell migration speed in μm/min (default: 1.0)."),
+    persistence_time: Optional[float] = Field(default=None, description="Directional persistence time in minutes (default: 1.0)."),
+    migration_bias: Optional[float] = Field(default=None, description="Migration bias 0=random, 1=fully directed (default: 0.5)."),
+    apoptosis_rate: Optional[float] = Field(default=None, description="Spontaneous apoptosis rate in 1/min."),
+    necrosis_rate: Optional[float] = Field(default=None, description="Spontaneous necrosis rate in 1/min."),
     session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
 ) -> str:
     """Modify volume, motility, and death-rate parameters for an existing cell type.
 
-    The cell type must already exist (created by `add_single_cell_type()`).
+    Only parameters that are explicitly provided will be modified; omitted
+    parameters keep their current values. The cell type must already exist
+    (created by `add_single_cell_type()`).
     Call repeatedly to configure multiple cell types.
 
     Returns:
@@ -930,29 +933,56 @@ def configure_cell_parameters(
     session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
-    
+
     try:
-        # Set volume parameters
-        session.config.cell_types.set_volume_parameters(cell_type, total=volume_total,
-                                                        nuclear=volume_nuclear, fluid_fraction=fluid_fraction)
+        changes = []
 
-        # Set motility parameters
-        session.config.cell_types.set_motility(cell_type, speed=motility_speed,
-                                               persistence_time=persistence_time, enabled=True)
+        # Set volume parameters (only those provided)
+        if volume_total is not None or volume_nuclear is not None or fluid_fraction is not None:
+            session.config.cell_types.set_volume_parameters(
+                cell_type, total=volume_total, nuclear=volume_nuclear,
+                fluid_fraction=fluid_fraction)
+            parts = []
+            if volume_total is not None:
+                parts.append(f"total={volume_total:g} μm³")
+            if volume_nuclear is not None:
+                parts.append(f"nuclear={volume_nuclear:g} μm³")
+            if fluid_fraction is not None:
+                parts.append(f"fluid_fraction={fluid_fraction:g}")
+            changes.append(f"- **Volume:** {', '.join(parts)}")
 
-        # Set death rates
-        session.config.cell_types.set_death_rate(cell_type, 'apoptosis', apoptosis_rate)
-        session.config.cell_types.set_death_rate(cell_type, 'necrosis', necrosis_rate)
+        # Set motility parameters (only those provided)
+        if motility_speed is not None or persistence_time is not None or migration_bias is not None:
+            # Auto-enable motility when speed is set to a positive value
+            enable = True if (motility_speed is not None and motility_speed > 0) else None
+            session.config.cell_types.set_motility(
+                cell_type, speed=motility_speed, persistence_time=persistence_time,
+                migration_bias=migration_bias, enabled=enable)
+            parts = []
+            if motility_speed is not None:
+                parts.append(f"speed={motility_speed:g} μm/min")
+            if persistence_time is not None:
+                parts.append(f"persistence={persistence_time:g} min")
+            if migration_bias is not None:
+                parts.append(f"bias={migration_bias:g}")
+            changes.append(f"- **Motility:** {', '.join(parts)}")
+
+        # Set death rates (only those provided)
+        if apoptosis_rate is not None:
+            session.config.cell_types.set_death_rate(cell_type, 'apoptosis', apoptosis_rate)
+            changes.append(f"- **Apoptosis rate:** {apoptosis_rate:g} min⁻¹")
+        if necrosis_rate is not None:
+            session.config.cell_types.set_death_rate(cell_type, 'necrosis', necrosis_rate)
+            changes.append(f"- **Necrosis rate:** {necrosis_rate:g} min⁻¹")
+
+        if not changes:
+            return "Error: No parameters provided. Specify at least one parameter to set."
 
         # Track modification if loaded from XML
         if session.loaded_from_xml:
             session.mark_xml_modification()
 
-        result = f"**Configured parameters for {cell_type}:**\n"
-        result += f"- **Volume:** {volume_total:g} μm³ (nuclear: {volume_nuclear:g} μm³)\n"
-        result += f"- **Motility:** {motility_speed:g} μm/min (persistence: {persistence_time:g} min)\n"
-        result += f"- **Death rates:** apoptosis {apoptosis_rate:g}, necrosis {necrosis_rate:g} min⁻¹"
-        
+        result = f"**Configured parameters for {cell_type}:**\n" + "\n".join(changes)
         return result
     except Exception as e:
         return f"Error configuring cell type '{cell_type}': {str(e)}"
@@ -962,7 +992,9 @@ def set_substrate_interaction(
     cell_type: Annotated[str, Field(description="Name of an existing cell type.")],
     substrate: Annotated[str, Field(description="Name of an existing substrate (must match a name passed to add_single_substrate()).")],
     secretion_rate: float = Field(default=0.0, description="Rate at which the cell secretes the substrate (1/min)."),
+    secretion_target: float = Field(default=1.0, description="Target substrate density for secretion (dimensionless). Cells secrete until local concentration reaches this value."),
     uptake_rate: float = Field(default=0.0, description="Rate at which the cell consumes the substrate (1/min). Typical oxygen uptake: 10."),
+    net_export_rate: float = Field(default=0.0, description="Net export rate (amount/min). Alternative to secretion_rate; positive = export, negative = import. Typically 0."),
     session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
 ) -> str:
     """Define how a cell type interacts with a substrate via secretion and uptake rates.
@@ -980,13 +1012,21 @@ def set_substrate_interaction(
     try:
         session.config.cell_types.add_secretion(cell_type, substrate,
                                                 secretion_rate=secretion_rate,
-                                                uptake_rate=uptake_rate)
+                                                secretion_target=secretion_target,
+                                                uptake_rate=uptake_rate,
+                                                net_export_rate=net_export_rate)
 
         # Track modification if loaded from XML
         if session.loaded_from_xml:
             session.mark_xml_modification()
-        
-        return f"**Substrate interaction set:** {cell_type} ↔ {substrate} (secretion: {secretion_rate:g}, uptake: {uptake_rate:g} min⁻¹)"
+
+        parts = [f"secretion: {secretion_rate:g}"]
+        if secretion_target != 1.0:
+            parts.append(f"target: {secretion_target:g}")
+        parts.append(f"uptake: {uptake_rate:g}")
+        if net_export_rate != 0.0:
+            parts.append(f"net_export: {net_export_rate:g}")
+        return f"**Substrate interaction set:** {cell_type} ↔ {substrate} ({', '.join(parts)} min⁻¹)"
     except Exception as e:
         return f"Error setting substrate interaction: {str(e)}"
 
@@ -1398,6 +1438,68 @@ str: Success message with advanced chemotaxis configuration
             f"- chemotactic sensitivities:\n" + "\n".join(sens_lines) + "\n\n"
             f"Note: Motility must also be enabled "
             f"(use configure_cell_parameters with motility_speed > 0).")
+
+
+@mcp.tool()
+def set_cycle_transition_rate(cell_type: str, rate: float,
+                              from_phase: int = 0, to_phase: int = 1) -> str:
+    """
+When the user asks to set proliferation rate, cycle entry rate, division rate,
+or modify how fast cells divide, this function sets a specific cycle phase
+transition rate in the XML config.
+
+For most models (Ki67_basic, live), the default transition is phase 0 → 1
+which controls cycle entry / proliferation speed. Call this BEFORE adding
+rules that target 'cycle entry' or 'exit from cycle phase N' behaviors,
+because the XML default rate may be 0 and rules interpolate toward the XML default.
+
+To set different proliferation rates for different cell types (e.g., go-or-grow
+hypothesis where motile cells proliferate slower), call this once per cell type
+with the appropriate rate.
+
+Input parameters:
+cell_type (str): Name of existing cell type
+rate (float): Transition rate in 1/min (e.g., 0.00072 ≈ 24h doubling time)
+from_phase (int): Source phase index (default: 0)
+to_phase (int): Target phase index (default: 1)
+
+Returns:
+str: Success message with configured transition rate
+    """
+    session = get_current_session()
+    if not session or not session.config:
+        return "Error: Create simulation domain first using create_simulation_domain()"
+
+    cell_types_dict = session.config.cell_types.cell_types
+    if cell_type not in cell_types_dict:
+        available = list(cell_types_dict.keys())
+        return f"Error: Cell type '{cell_type}' not found. Available: {available}"
+
+    if rate < 0:
+        return "Error: Transition rate must be non-negative"
+
+    try:
+        session.config.cell_types.set_cycle_transition_rate(
+            cell_type, from_phase, to_phase, rate)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    _set_legacy_config(session.config)
+    if session.loaded_from_xml:
+        session.mark_xml_modification()
+
+    # Estimate doubling time for context
+    if rate > 0:
+        doubling_time_min = 1.0 / rate
+        doubling_time_hr = doubling_time_min / 60.0
+        time_str = f" (≈ {doubling_time_hr:.1f}h doubling time)" if doubling_time_hr < 1000 else ""
+    else:
+        time_str = " (proliferation disabled)"
+
+    return (f"**Cycle transition rate set for {cell_type}:**\n"
+            f"- phase {from_phase} → {to_phase}: {rate:g} min⁻¹{time_str}\n\n"
+            f"This sets the XML default so rules targeting 'cycle entry' "
+            f"can interpolate correctly.")
 
 
 # ============================================================================
@@ -1816,6 +1918,13 @@ def add_single_cell_rule(
             fix = (
                 f"Call `set_advanced_chemotaxis(cell_type=\"{ct}\", "
                 f"substrate=\"{substrate}\", sensitivity=0.5)` first, "
+                f"then re-add this rule with `min_signal=0`."
+            )
+        # Cycle entry / exit from cycle phase
+        elif b == "cycle entry" or b.startswith("exit from cycle phase "):
+            fix = (
+                f"Call `set_cycle_transition_rate(cell_type=\"{ct}\", "
+                f"rate=0.00072)` first (0.00072 ≈ 24h doubling time), "
                 f"then re-add this rule with `min_signal=0`."
             )
 
@@ -2440,352 +2549,88 @@ def export_cell_rules_csv(
         return f"Error exporting cell rules CSV: {str(e)}"
 
 # ============================================================================
-# LITERATURE VALIDATION TOOLS
+# RULE JUSTIFICATION TOOLS
 # ============================================================================
 
 @mcp.tool()
-def get_rules_for_validation() -> str:
-    """
-    Export current cell rules in a structured format suitable for literature validation.
-
-    Returns all rules as a JSON-compatible list that can be passed to the
-    LiteratureValidation MCP server's validate_rules_batch() tool.
-
-    Returns:
-        str: Markdown with structured rule data for validation
-    """
-    session = get_current_session()
-    if not session or not session.config:
-        return "**Error:** No simulation configured. Create domain and add rules first."
-
-    # Get rules from legacy CSV API
-    try:
-        rules_api = session.config.cell_rules_csv
-        raw_rules = rules_api.get_rules()
-    except Exception:
-        raw_rules = []
-
-    if not raw_rules:
-        return (
-            "**No cell rules to validate.**\n\n"
-            "Add rules with `add_single_cell_rule()` first."
-        )
-
-    # Format rules for validation
-    rules_list = []
-    for r in raw_rules:
-        rule_dict = {
-            "cell_type": r.get("cell_type", ""),
-            "signal": r.get("signal", ""),
-            "direction": r.get("direction", ""),
-            "behavior": r.get("behavior", ""),
-            "half_max": r.get("half_max"),
-            "hill_power": r.get("hill_power"),
-            "base_value": r.get("base_value"),
-        }
-        rules_list.append(rule_dict)
-
-    result = f"## Rules Ready for Validation\n\n"
-    result += f"**Total rules:** {len(rules_list)}\n\n"
-
-    result += "### Rules\n"
-    for i, r in enumerate(rules_list, 1):
-        dir_arrow = ">" if r["direction"] == "increases" else "v"
-        result += (
-            f"{i}. **{r['cell_type']}** | {r['signal']} {dir_arrow} {r['behavior']} "
-            f"(half_max={r['half_max']}, hill={r['hill_power']})\n"
-        )
-
-    result += f"\n### Structured Data (for LiteratureValidation MCP)\n"
-    result += f"```json\n{json.dumps(rules_list, indent=2)}\n```\n\n"
-
-    result += (
-        "**Validation workflow:**\n"
-        "1. Call `validate_rules_batch(name, rules)` on the LiteratureValidation MCP — Edison searches 150M+ papers automatically\n"
-        "2. Call `get_validation_summary(name)` to review results\n"
-        "3. Call `store_validation_results()` to save results back here\n"
-        "4. Call `get_validation_report()` to generate the formal report"
-    )
-    return result
-
-
-def _extract_verdict(raw_answer: str) -> str:
-    """Extract VERDICT classification from raw PaperQA answer text.
-
-    Uses the LAST match because the answer file contains the prompt template
-    (with all VERDICT options listed) followed by PaperQA's actual answer.
-    re.search() would match the first template option, not the real verdict.
-
-    CONTRADICTORY is no longer a valid VERDICT — directional contradictions
-    are caught by the DIRECTION check instead. If PaperQA still writes
-    CONTRADICTORY, map it to 'weak'.
-    """
-    import re
-    matches = re.findall(r"VERDICT:\s*(STRONG|MODERATE|WEAK|CONTRADICTORY|UNSUPPORTED)", raw_answer, re.IGNORECASE)
-    if matches:
-        level = matches[-1].lower()  # Last match = PaperQA's actual verdict
-        if level == "contradictory":
-            return "weak"
-        return level
-    return "unsupported"
-
-
-def _extract_direction(raw_answer: str) -> str:
-    """Extract DIRECTION from raw PaperQA answer text.
-
-    Uses the LAST match because the answer file contains the prompt template
-    (with all DIRECTION options listed) followed by PaperQA's actual answer.
-    re.search() would match the first template option, not the real direction.
-
-    Returns 'increases', 'decreases', or 'ambiguous'.
-    """
-    import re
-    matches = re.findall(r"DIRECTION:\s*(INCREASES|DECREASES|AMBIGUOUS)", raw_answer, re.IGNORECASE)
-    if matches:
-        return matches[-1].lower()  # Last match = PaperQA's actual direction
-    return "ambiguous"
-
-
-def _find_answer_file(cell_type: str, signal: str, direction: str, behavior: str,
-                      collection_name: str | None = None) -> Path | None:
-    """Find a PaperQA answer file on disk for a given rule.
-
-    Searches LiteratureValidation answer directories for matching files.
-    Checks both direction-agnostic keys (new format) and legacy keys (with direction).
-    If collection_name is provided, only searches that collection.
-
-    Returns the Path to the answer file, or None if not found.
-    """
-    import re as _re
-    lit_val_base = Path.home() / "Documents" / "LiteratureValidation"
-    if not lit_val_base.exists():
-        return None
-
-    safe_key = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{behavior}")
-    safe_key_legacy = _re.sub(r'[^a-zA-Z0-9_-]', '_', f"{cell_type}_{signal}_{direction}_{behavior}")
-
-    # Determine which directories to search
-    if collection_name:
-        search_dirs = [lit_val_base / collection_name.strip().lower().replace(" ", "_")]
-    else:
-        try:
-            search_dirs = [d for d in lit_val_base.iterdir() if d.is_dir()]
-        except Exception:
-            return None
-
-    for collection_dir in search_dirs:
-        for key in (safe_key, safe_key_legacy):
-            candidate = collection_dir / "answers" / f"{key}.md"
-            if candidate.exists():
-                return candidate
-    return None
-
-
-@mcp.tool()
-def store_validation_results(
-    validations: list[dict],
+def store_rule_justification(
+    cell_type: str,
+    signal: str,
+    direction: str,
+    behavior: str,
+    justification: str,
+    key_citations: str = "",
 ) -> str:
     """
-    Store literature validation results for cell rules in the session.
+    Store a literature-based justification for a cell rule.
 
-    The server reads PaperQA answer files directly from disk — the agent does NOT
-    need to pass raw answer text. VERDICT and DIRECTION are extracted server-side
-    from the authoritative answer files written by validate_rule().
-
-    Each validation dict should contain:
-    - cell_type (str): Cell type name
-    - signal (str): Signal name
-    - direction (str): 'increases' or 'decreases'
-    - behavior (str): Behavior name
-    - collection_name (str, optional): LiteratureValidation collection name (searches all if omitted)
-    - raw_paperqa_answer (str, DEPRECATED): No longer needed — server reads from disk
-    - evidence_summary (str, optional): Summary of evidence from literature
-    - suggested_half_max (float, optional): Literature-suggested half-max value
-    - suggested_hill_power (float, optional): Literature-suggested Hill coefficient
-    - key_citations (list[str], optional): Key paper citations
+    Call this after adding each rule to record the evidence basis.
+    Use search_literature() from the LiteratureValidation MCP to find
+    evidence, then summarize it here.
 
     Args:
-        validations: List of validation result dicts
+        cell_type: Cell type name (e.g., "tumor", "macrophage")
+        signal: Signal name (e.g., "oxygen", "pressure")
+        direction: 'increases' or 'decreases'
+        behavior: Behavior name (e.g., "necrosis", "cycle entry")
+        justification: Evidence summary explaining why this rule is biologically valid
+        key_citations: Comma-separated citations (optional, e.g., "Smith 2020, Jones 2019")
 
     Returns:
-        str: Summary of stored validation results
+        str: Confirmation of stored justification
     """
     session = get_current_session()
     if not session or not session.config:
         return "**Error:** No simulation configured."
 
-    if not validations:
-        return "**Error:** No validation results provided."
+    if not all([cell_type.strip(), signal.strip(), direction.strip(), behavior.strip()]):
+        return "**Error:** cell_type, signal, direction, and behavior are all required."
 
-    stored = 0
-    errors = []
+    if direction not in ("increases", "decreases"):
+        return "**Error:** direction must be 'increases' or 'decreases'."
 
-    for v in validations:
-        cell_type = v.get("cell_type", "").strip()
-        signal = v.get("signal", "").strip()
-        direction = v.get("direction", "").strip()
-        behavior = v.get("behavior", "").strip()
-        collection_name = v.get("collection_name", "").strip() or None
+    if not justification.strip():
+        return "**Error:** justification cannot be empty."
 
-        if not all([cell_type, signal, direction, behavior]):
-            errors.append("Skipped entry with missing required fields")
-            continue
+    # Parse citations
+    citations = [c.strip() for c in key_citations.split(",") if c.strip()] if key_citations else []
 
-        # Find the PaperQA answer file on disk (written by validate_rule())
-        answer_file = _find_answer_file(cell_type, signal, direction, behavior, collection_name)
+    # Store justification
+    result = RuleJustification(
+        cell_type=cell_type.strip(),
+        signal=signal.strip(),
+        direction=direction.strip(),
+        behavior=behavior.strip(),
+        evidence_summary=justification.strip(),
+        key_citations=citations,
+    )
+    session.rule_validations.append(result)
 
-        if answer_file is None:
-            errors.append(
-                f"**REJECTED** '{cell_type}/{signal}/{behavior}': No PaperQA answer file found on disk. "
-                f"You MUST call `validate_rule()` or `validate_rules_batch()` via the "
-                f"LiteratureValidation MCP first. Do NOT skip validation."
-            )
-            continue
-
-        # Read the authoritative answer from disk (not from agent input)
-        try:
-            file_content = answer_file.read_text(encoding="utf-8")
-        except Exception as e:
-            errors.append(f"Failed to read answer file for '{cell_type}/{signal}/{behavior}': {e}")
-            continue
-
-        # Extract support level from PaperQA's own VERDICT line
-        support_level = _extract_verdict(file_content)
-
-        # Extract literature direction from PaperQA's DIRECTION line
-        literature_direction = _extract_direction(file_content)
-
-        # Compute direction match
-        if literature_direction == "ambiguous":
-            direction_match = None
-        elif literature_direction == direction:
-            direction_match = True
-        else:
-            direction_match = False
-
-        # Auto-flag direction mismatches as contradictory
-        if direction_match is False:
-            support_level = "contradictory"
-
-        result = RuleValidationResult(
-            cell_type=cell_type,
-            signal=signal,
-            direction=direction,
-            behavior=behavior,
-            support_level=support_level,
-            evidence_summary=v.get("evidence_summary", ""),
-            raw_paperqa_answer=file_content,
-            suggested_half_max=v.get("suggested_half_max"),
-            suggested_hill_power=v.get("suggested_hill_power"),
-            key_citations=v.get("key_citations", []),
-            literature_direction=literature_direction,
-            direction_match=direction_match,
-        )
-        session.rule_validations.append(result)
-        stored += 1
-
-    # Check if ALL rules have been validated before marking step complete
-    try:
-        current_rules = session.config.cell_rules_csv.get_rules()
-    except Exception:
-        current_rules = []
-
-    validated_keys = {
-        (rv.cell_type, rv.signal, rv.direction, rv.behavior)
-        for rv in session.rule_validations
-    }
-    all_rule_keys = {
-        (r.get("cell_type", ""), r.get("signal", ""),
-         r.get("direction", ""), r.get("behavior", ""))
-        for r in current_rules
-    }
-    missing_rules = all_rule_keys - validated_keys
-
-    if stored > 0 and not missing_rules:
-        session.mark_step_complete(WorkflowStep.RULES_VALIDATED)
-
-    output = f"## Validation Results Stored\n\n"
-    output += f"**Stored:** {stored} / {len(validations)} results\n\n"
-
-    if errors:
-        output += "**Warnings:**\n"
-        for err in errors[:5]:
-            output += f"- {err}\n"
-        output += "\n"
-
-    if missing_rules:
-        output += f"### Missing Validations ({len(missing_rules)} rules not yet validated)\n\n"
-        output += "The following rules have not been validated yet:\n\n"
-        for ct, sig, dir_, beh in sorted(missing_rules):
-            output += f"- {ct} | {sig} {dir_} {beh}\n"
-        output += (
-            "\nCall `validate_rules_batch()` with these rules, then "
-            "`store_validation_results()` again to complete validation.\n\n"
-        )
-
-    # Summary by support level
-    level_counts: dict[str, int] = {}
-    for rv in session.rule_validations:
-        level_counts[rv.support_level] = level_counts.get(rv.support_level, 0) + 1
-
-    output += "### Support Level Summary\n"
-    for level in ["strong", "moderate", "weak", "contradictory", "unsupported"]:
-        count = level_counts.get(level, 0)
-        if count > 0:
-            output += f"- **{level.capitalize()}:** {count}\n"
-
-    # Flag actionable items
-    flagged = [rv for rv in session.rule_validations
-               if rv.support_level in ("unsupported", "contradictory")]
-    if flagged:
-        output += "\n### Rules Needing Attention\n"
-        for rv in flagged:
-            dir_arrow = ">" if rv.direction == "increases" else "v"
-            output += f"- **{rv.support_level.upper()}**: {rv.cell_type} | {rv.signal} {dir_arrow} {rv.behavior}\n"
-
-    # Show parameter suggestions
-    suggestions = [rv for rv in session.rule_validations
-                   if rv.suggested_half_max is not None or rv.suggested_hill_power is not None]
-    if suggestions:
-        output += "\n### Suggested Parameter Adjustments\n"
-        for rv in suggestions:
-            output += f"- **{rv.cell_type} | {rv.signal} -> {rv.behavior}:**"
-            if rv.suggested_half_max is not None:
-                output += f" half_max={rv.suggested_half_max}"
-            if rv.suggested_hill_power is not None:
-                output += f" hill_power={rv.suggested_hill_power}"
-            output += "\n"
-
-    output += f"\n**Next step:** Use `get_validation_report()` for a full report."
+    dir_arrow = ">" if direction == "increases" else "v"
+    output = f"## Justification Stored\n\n"
+    output += f"**Rule:** {cell_type} | {signal} {dir_arrow} {behavior}\n"
+    output += f"**Evidence:** {justification.strip()[:200]}{'...' if len(justification.strip()) > 200 else ''}\n"
+    if citations:
+        output += f"**Citations:** {', '.join(citations)}\n"
+    output += f"\n**Total justifications stored:** {len(session.rule_validations)}"
     return output
 
 
 @mcp.tool()
-def get_validation_report() -> str:
+def get_rule_justifications() -> str:
     """
-    Generate a comprehensive validation report for all cell rules.
+    Generate a report of all stored rule justifications.
 
-    Shows each rule's validation status, evidence summary, and any
-    suggested parameter changes from published literature.
+    Lists each rule with its evidence basis and citations.
+    Flags any rules that have no justification stored.
+    Exports the report to ~/Documents/PhysiCell_MCP_Output/rule_justifications.md
 
     Returns:
-        str: Markdown-formatted validation report
+        str: Markdown-formatted justification report
     """
     session = get_current_session()
     if not session or not session.config:
         return "**Error:** No simulation configured."
-
-    if not session.rule_validations:
-        return (
-            "**No validation results stored.**\n\n"
-            "Use the LiteratureValidation MCP server to validate rules, "
-            "then call `store_validation_results()` to save results here.\n\n"
-            "**Quick start:**\n"
-            "1. `get_rules_for_validation()` — export rules\n"
-            "2. `validate_rules_batch(name, rules)` — validate against literature (LiteratureValidation MCP)\n"
-            "3. `store_validation_results()` — save results here\n"
-            "4. `get_validation_report()` — generate the formal report"
-        )
 
     # Get current rules for cross-reference
     try:
@@ -2794,139 +2639,55 @@ def get_validation_report() -> str:
     except Exception:
         current_rules = []
 
-    report = "## Literature Validation Report\n\n"
-    report += f"**Rules validated:** {len(session.rule_validations)}\n"
+    report = "## Rule Justification Report\n\n"
+    report += f"**Rules with justifications:** {len(session.rule_validations)}\n"
     report += f"**Total rules in model:** {session.rules_count}\n\n"
 
-    # Support distribution
-    level_counts: dict[str, int] = {}
-    for rv in session.rule_validations:
-        level_counts[rv.support_level] = level_counts.get(rv.support_level, 0) + 1
+    # Per-rule justifications
+    if session.rule_validations:
+        report += "### Justified Rules\n\n"
+        for i, rv in enumerate(session.rule_validations, 1):
+            dir_arrow = ">" if rv.direction == "increases" else "v"
+            report += f"#### {i}. {rv.cell_type} | {rv.signal} {dir_arrow} {rv.behavior}\n\n"
+            report += f"{rv.evidence_summary}\n\n"
+            if rv.key_citations:
+                report += "**Citations:** " + ", ".join(rv.key_citations) + "\n\n"
 
-    report += "### Overall Assessment\n"
-    for level in ["strong", "moderate", "weak", "contradictory", "unsupported"]:
-        count = level_counts.get(level, 0)
-        if count > 0:
-            report += f"- **{level.capitalize()}:** {count}\n"
-    report += "\n"
-
-    # Detailed per-rule report
-    report += "### Detailed Results\n\n"
-    for i, rv in enumerate(session.rule_validations, 1):
-        dir_arrow = ">" if rv.direction == "increases" else "v"
-        report += f"#### {i}. {rv.cell_type} | {rv.signal} {dir_arrow} {rv.behavior}\n"
-        report += f"**Support:** {rv.support_level.upper()}\n"
-
-        # Show direction match status
-        if rv.direction_match is False:
-            report += (
-                f"\n**DIRECTION MISMATCH** — Literature says {rv.signal} "
-                f"**{rv.literature_direction}** {rv.behavior}, but rule proposes "
-                f"{rv.signal} **{rv.direction}** {rv.behavior}. "
-                f"The rule direction must be changed.\n"
-            )
-        elif rv.direction_match is True:
-            report += f"**Direction:** Confirmed by literature ({rv.literature_direction})\n"
-        elif rv.literature_direction:
-            report += f"**Direction:** Could not be determined from literature\n"
-        report += "\n"
-
-        # Show raw PaperQA answer (audit trail)
-        if rv.raw_paperqa_answer:
-            raw = rv.raw_paperqa_answer
-            if len(raw) > 800:
-                raw = raw[:800] + "..."
-            report += f"**PaperQA answer:**\n> {raw.replace(chr(10), chr(10) + '> ')}\n\n"
-        elif rv.evidence_summary:
-            # Fallback for legacy results without raw answer
-            summary = rv.evidence_summary
-            if len(summary) > 500:
-                summary = summary[:500] + "..."
-            report += f"{summary}\n\n"
-
-        if rv.key_citations:
-            report += "**Key citations:**\n"
-            for cite in rv.key_citations[:5]:
-                report += f"- {cite}\n"
-            report += "\n"
-
-        if rv.suggested_half_max is not None or rv.suggested_hill_power is not None:
-            report += "**Suggested parameters:**"
-            if rv.suggested_half_max is not None:
-                report += f" half_max={rv.suggested_half_max}"
-            if rv.suggested_hill_power is not None:
-                report += f" hill_power={rv.suggested_hill_power}"
-            report += "\n\n"
-
-    # Unvalidated rules
-    validated_keys = {
+    # Find unjustified rules
+    justified_keys = {
         (rv.cell_type, rv.signal, rv.direction, rv.behavior)
         for rv in session.rule_validations
     }
-    unvalidated = []
+    unjustified = []
     for r in current_rules:
         key = (r.get("cell_type", ""), r.get("signal", ""),
                r.get("direction", ""), r.get("behavior", ""))
-        if key not in validated_keys:
-            unvalidated.append(r)
+        if key not in justified_keys:
+            unjustified.append(r)
 
-    if unvalidated:
-        report += f"### Unvalidated Rules ({len(unvalidated)} remaining)\n\n"
-        report += "The following rules have not been validated:\n\n"
-        for r in unvalidated:
-            report += f"- {r.get('cell_type', '?')} | {r.get('signal', '?')} {r.get('direction', '?')} {r.get('behavior', '?')}\n"
+    if unjustified:
+        report += f"### Unjustified Rules ({len(unjustified)})\n\n"
+        report += "The following rules have no stored justification:\n\n"
+        for r in unjustified:
+            dir_arrow = ">" if r.get("direction") == "increases" else "v"
+            report += f"- {r.get('cell_type', '?')} | {r.get('signal', '?')} {dir_arrow} {r.get('behavior', '?')}\n"
         report += (
-            "\nCall `validate_rules_batch()` with these rules, then "
-            "`store_validation_results()` to complete validation.\n\n"
+            "\nConsider using `search_literature()` to find evidence, then "
+            "`store_rule_justification()` to record it.\n"
+        )
+    elif session.rule_validations:
+        report += "All rules have justifications stored.\n"
+    else:
+        report += (
+            "**No justifications stored yet.**\n\n"
+            "Use `search_literature()` via the LiteratureValidation MCP to find evidence, "
+            "then `store_rule_justification()` after adding each rule.\n"
         )
 
-    # Action required for contradictory rules (including direction mismatches)
-    contradictory = [rv for rv in session.rule_validations if rv.support_level == "contradictory"]
-    if contradictory:
-        direction_mismatches = [rv for rv in contradictory if rv.direction_match is False]
-        other_contradictions = [rv for rv in contradictory if rv.direction_match is not False]
-
-        report += "\n### Contradictory Rules\n\n"
-        report += (
-            f"**{len(contradictory)} rule(s) are CONTRADICTORY.** Consider revising "
-            "these rules based on the literature evidence.\n\n"
-        )
-
-        if direction_mismatches:
-            report += (
-                f"**Direction Mismatches ({len(direction_mismatches)}):** The literature-determined direction "
-                "contradicts the proposed rule direction. Fix by changing the `direction` parameter in "
-                "`add_single_cell_rule()`.\n\n"
-            )
-            for rv in direction_mismatches:
-                report += (
-                    f"- **{rv.cell_type}** | {rv.signal} {rv.direction} {rv.behavior} "
-                    f"— literature says **{rv.literature_direction}**\n"
-                )
-            report += "\n"
-
-        if other_contradictions:
-            report += f"**Other Contradictions ({len(other_contradictions)}):**\n"
-            for rv in other_contradictions:
-                report += f"- {rv.cell_type} | {rv.signal} {rv.direction} {rv.behavior}\n"
-            report += "\n"
-
-        report += (
-            "**Steps to resolve:**\n"
-            "1. Review the PaperQA evidence above\n"
-            "2. Modify the rule with `add_single_cell_rule()` — for direction mismatches, change the "
-            "`direction` parameter; for other contradictions, adjust half_max, hill_power, or base value\n"
-            "3. Re-validate the modified rule with `validate_rule()` or `validate_rules_batch()`\n"
-            "4. `store_validation_results()` to update the stored results\n"
-            "5. `get_validation_report()` to regenerate this report\n\n"
-        )
-
-    report += f"**Progress:** {session.get_progress_percentage():.0f}%"
-
-    # Export report to output directory
+    # Export report
     try:
         MCP_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        report_path = MCP_OUTPUT_DIR / "validation_report.md"
+        report_path = MCP_OUTPUT_DIR / "rule_justifications.md"
         report_path.write_text(report, encoding="utf-8")
         report += f"\n\n**Report exported to:** `{report_path}`"
     except Exception:
@@ -6444,7 +6205,8 @@ def get_help() -> str:
 4. **add_single_substrate()** - Add oxygen, nutrients, drugs, etc.
 5. **add_single_cell_type()** - Add cancer cells, immune cells, etc.
 6. **configure_cell_parameters()** - Set cell volumes, motility, death rates
-6b. **set_chemotaxis()** / **set_advanced_chemotaxis()** - Configure chemotactic migration
+6b. **set_cycle_transition_rate()** - Set proliferation / cycle entry rate per cell type
+6c. **set_chemotaxis()** / **set_advanced_chemotaxis()** - Configure chemotactic migration
 7. **add_single_cell_rule()** - Create realistic cell responses
 7b. **place_initial_cells()** - (Optional) Place cells spatially for initial conditions
 
@@ -6485,11 +6247,10 @@ def get_help() -> str:
 26. **apply_calibrated_parameters()** - Update model with calibrated values
 27. **get_uq_summary()** - Overview of all UQ analysis work
 
-### Phase 6: Literature Validation (Optional, requires LiteratureValidation MCP)
-28. **get_rules_for_validation()** - Export rules for literature validation
-29. *LiteratureValidation MCP:* validate_rules_batch() → get_validation_summary()
-30. **store_validation_results()** - Save validation results in session
-31. **get_validation_report()** - View full literature validation report
+### Phase 6: Rule Justifications (Optional, use with LiteratureValidation MCP)
+28. **store_rule_justification()** - Record evidence basis for a rule
+29. **get_rule_justifications()** - View justification report for all rules
+*Use search_literature() from LiteratureValidation MCP during model building for evidence*
 
 ## Helper Functions
 - **list_all_available_signals()** - See what signals cells can sense
@@ -6503,7 +6264,7 @@ def get_help() -> str:
 - **get_simulation_analysis_overview()** - Quick simulation summary
 - **get_cell_data()** - Detailed cell data with filtering
 - **list_uq_runs()** - See all UQ analysis runs
-- **get_validation_report()** - View literature validation results
+- **get_rule_justifications()** - View rule justification report
 
 ## IMPORTANT
 - You MUST call tools in the order shown above

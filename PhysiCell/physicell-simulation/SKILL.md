@@ -4,12 +4,12 @@ description: >
   Build, configure, and run PhysiCell multicellular simulations using the PhysiCell MCP server.
   Use when the user asks to model tumors, cells, tissues, or multicellular biological systems.
   Covers simulation setup, cell rules (Hill functions), initial conditions, PhysiBoSS boolean
-  networks, UQ/calibration, and literature validation. Prevents common configuration mistakes
-  like the "from 0 towards 0" rule bug.
+  networks, UQ/calibration, and literature-informed model building. Prevents common configuration
+  mistakes like the "from 0 towards 0" rule bug.
 compatibility: Requires PhysiCell MCP server connection
 metadata:
   author: simsz
-  version: "2.0"
+  version: "3.0"
 ---
 
 # PhysiCell Simulation Skill
@@ -22,13 +22,13 @@ These rules are enforced by server-side validation. Violating them will cause to
 
 2. **All MCP tools must be called via MCP tool calling** (prefix `mcp__PhysiCell__`). Do NOT run them via Bash, subprocess, or npx.
 
-3. **Never extract parameter values from raw sources.** Do NOT read papers, abstracts, or web results and manually pick out numbers for half_max, hill_power, rates, etc. Use literature search tools or the LiteratureValidation MCP (if available) for evidence-based parameter guidance.
+3. **Never extract parameter values from raw sources.** Do NOT read papers, abstracts, or web results and manually pick out numbers for half_max, hill_power, rates, etc. Use `search_literature()` from the LiteratureValidation MCP for evidence-based parameter guidance.
 
-4. **Literature validation is optional.** If the LiteratureValidation MCP is available, use it to validate rules against published literature. If it is not available, proceed with export directly after adding rules. The validation tools (`get_rules_for_validation`, `store_validation_results`, `get_validation_report`) remain available for when validation is desired.
+4. **Always search literature before adding rules.** Before choosing half_max, hill_power, or rate values, call `search_literature()` to get evidence-based guidance. Do NOT rely on training data or memorized citations — always make the actual tool call. After adding each rule, record the evidence with `store_rule_justification()`. If `search_literature()` fails with a connection error, you may proceed without it, but you must attempt the call first.
 
 ## 1. Tool Ordering
 
-Follow this sequence. Do not skip steps.
+Follow this sequence. Do not skip steps. Literature search and justifications happen *alongside* rule creation, not as a separate phase.
 
 ```
 create_session
@@ -39,9 +39,11 @@ create_session
   → configure_cell_parameters         (repeat per cell type)
   → set_substrate_interaction         (repeat per cell×substrate pair)
   → [setter tools as needed]          (see Section 2 — set nonzero defaults BEFORE rules)
+  → search_literature                 (call BEFORE adding rules — get evidence for parameter values)
   → add_single_cell_rule              (repeat per rule — see Section 2)
+  → store_rule_justification          (record evidence AFTER each rule)
   → place_initial_cells               (repeat per placement)
-  → [LITERATURE VALIDATION]           (optional — see Section 7)
+  → get_rule_justifications           (generate evidence report before export)
   → export_xml_configuration
   → export_cell_rules_csv
   → export_cells_csv                  (if cells were placed)
@@ -92,26 +94,34 @@ No error is raised. The simulation runs but the rule has no effect.
 
 | Behavior | Default | Setter tool |
 |---|---|---|
-| cycle entry | Depends on cycle model | Usually safe as-is |
+| cycle entry / exit from cycle phase N | 0 unless set | `set_cycle_transition_rate()` |
 | apoptosis / necrosis | 0 unless set | `configure_cell_parameters` (`apoptosis_rate`, `necrosis_rate`) |
-| migration speed / persistence | 0 unless set | `configure_cell_parameters` (`motility_speed`, `persistence_time`) |
+| migration speed / persistence / bias | 0 unless set | `configure_cell_parameters` (`motility_speed`, `persistence_time`, `migration_bias`) |
 | X secretion / X uptake | 0 | `set_substrate_interaction()` |
 | transition to X | 0 | `set_cell_transformation_rate()` |
 | attack X / phagocytose X / fuse to X | 0 | `set_cell_interaction()` |
 | phagocytose dead cells | 0 | `configure_cell_interactions()` |
 | attachment / detachment rate | 0 | `configure_cell_mechanics()` |
 | damage / damage repair rate | 0 | `configure_cell_integrity()` |
-| exit from cycle phase N / custom | 0 | No setter — use nonzero `min_signal` |
+| chemotactic response to X | 0 | `set_advanced_chemotaxis()` |
+| custom behaviors | 0 | No setter — use nonzero `min_signal` |
 
 The server validates rules and rejects "from 0 towards 0" with guidance on which setter to use.
 
 ### Setter examples
 
 ```python
-# Death rates, motility:
-configure_cell_parameters(cell_type="tumor", apoptosis_rate=0.001, necrosis_rate=0.00277, motility_speed=0.5)
+# Cycle entry / proliferation rate (0.00072 ≈ 24h doubling):
+set_cycle_transition_rate(cell_type="tumor", rate=0.00072)
+# Go-or-grow: motile cells proliferate slower:
+set_cycle_transition_rate(cell_type="motile_tumor", rate=0.0002)
 
-# Secretion/uptake:
+# Death rates, motility (only provided params are changed — omitted params keep current values):
+configure_cell_parameters(cell_type="tumor", apoptosis_rate=0.001, necrosis_rate=0.00277, motility_speed=0.5)
+# Migration bias (0=random, 1=fully directed):
+configure_cell_parameters(cell_type="motile_tumor", migration_bias=0.85)
+
+# Secretion/uptake (secretion_target and net_export_rate also available):
 set_substrate_interaction(cell_type="tumor", substrate="chemokine", secretion_rate=0.1)
 
 # Cell transformation:
@@ -128,6 +138,12 @@ configure_cell_mechanics(cell_type="tumor", attachment_rate=0.01, detachment_rat
 
 # Integrity:
 configure_cell_integrity(cell_type="tumor", damage_rate=0.001, damage_repair_rate=0.0001)
+
+# Basic chemotaxis (single substrate, attraction):
+set_chemotaxis(cell_type="motile", substrate="oxygen", enabled=True, direction=1)
+
+# Advanced chemotaxis (per-substrate sensitivity — REQUIRED before "chemotactic response to X" rules):
+set_advanced_chemotaxis(cell_type="motile", substrate="oxygen", sensitivity=0.5, enabled=True)
 ```
 
 ### Worked example: Oxygen → Necrosis
@@ -204,68 +220,96 @@ set_substrate_interaction(cell_type="tumor", substrate="chemokine", secretion_ra
 
 Typical oxygen uptake: 10.0 (tumor), 5.0 (normal). Glucose: 0.5-2.0. Drug: 0.01-0.1.
 
-## 7. Literature Validation (Optional)
+## 7. Literature-Informed Model Building
 
-### When to validate
+### Default behavior
 
-Validate when the user explicitly requests literature validation or when the LiteratureValidation MCP server is available and the user wants evidence-based parameter guidance. Validation is not required for export.
+**Always search literature before choosing parameter values for rules.** This is the standard workflow, not an optional step. For every rule you add, you should:
+1. Call `search_literature()` to find evidence for the parameter values
+2. Use the returned evidence to choose half_max, hill_power, and rate values
+3. Call `store_rule_justification()` to record your evidence basis
 
-### Prohibited tools and actions
+Do NOT skip literature search because you "already know" the answer from training data. Your training data may be outdated or wrong. The tool call takes seconds and returns current, cited evidence.
 
-| Do NOT use | Why | Use instead |
-|---|---|---|
-| `get_full_text_article` | Dumps 50KB+ into context | `validate_rule()` via LiteratureValidation MCP |
-| `get_article_metadata` | Manual parameter extraction is unreliable | `validate_rule()` via LiteratureValidation MCP |
-| WebSearch/WebFetch for parameter values | Web snippets lack rigor | `validate_rule()` via LiteratureValidation MCP |
-| Task tool for literature work | Subagents lack MCP access | Do all literature work in main conversation |
+If `search_literature()` fails with a connection error (MCP server unavailable), you may fall back to the parameter reference tables. But you must **attempt the call first** — do not pre-decide to skip it.
 
 ### Workflow
 
-**Phase 1 — Validate every rule (no exceptions)**
+Search literature *during* model building, not as a post-hoc validation step.
 
-1. `get_rules_for_validation()` — get the full rule list from your PhysiCell session
-2. `validate_rules_batch(name, rules)` — validate ALL rules from step 1. Do NOT skip any. Include `signal_units` when known (e.g., "mmHg" for oxygen). Edison automatically searches 150M+ papers — no paper collection management needed.
-3. `get_validation_summary(name)` — review support levels
+**1. Search for evidence before/while adding rules**
 
-**Phase 2 — Store and report (mandatory)**
+Use `search_literature()` from the LiteratureValidation MCP to ask any biological question:
 
-4. `store_validation_results(validations)` — persist results. Each dict needs `cell_type`, `signal`, `direction`, `behavior`, and optionally `collection_name`. The server reads PaperQA answer files directly from disk — you do NOT need to pass `raw_paperqa_answer`. VERDICT and DIRECTION are extracted server-side from the authoritative files written by `validate_rule()`. Direction mismatches are auto-flagged as `contradictory`. Store ALL rules, not a subset.
-5. `get_validation_report()` — generates the formal report. **You MUST call this.** Do NOT substitute your own summary.
+```python
+# Ask about mechanisms
+search_literature("What is the effect of oxygen on tumor cell necrosis?")
 
-**Phase 3 — Revise contradictions (mandatory if any exist)**
+# Ask about parameter values
+search_literature("What oxygen concentration causes half-maximal necrosis in solid tumors?")
 
-6. For each `contradictory` rule:
-    - **Direction mismatches** (literature says the opposite direction): Change the `direction` parameter in `add_single_cell_rule()`. The server detects these automatically from PaperQA's `DIRECTION:` verdict.
-    - **Other contradictions**: Adjust half_max, hill_power, or base value based on the PaperQA evidence
-    - Re-validate with `validate_rule()` or `validate_rules_batch()`
-    - `store_validation_results()` to update
-    - `get_validation_report()` to confirm no contradictions remain
-7. For `unsupported` rules: review evidence and apply any suggested adjustments. These do not block export but should be noted.
-8. Re-export configuration after all revisions.
+# Ask about cell behaviors
+search_literature("What is a typical migration speed for breast cancer cells in vitro?")
+```
 
-### Signal units
+Edison automatically searches 150M+ papers and returns answers with citations. Results are cached.
 
-Pass `signal_units` when validating to prevent unit confusion:
-- **oxygen** → mmHg (half_max=3.75 means 3.75 mmHg ≈ 0.49% O₂)
-- **glucose** → mM
-- **pressure** → dimensionless (0-1)
-- **drugs** → μM
+**2. Add rules informed by literature**
 
-**Support levels:** strong, moderate, weak, unsupported (from PaperQA VERDICT). `contradictory` is auto-assigned by the server when a direction mismatch is detected.
+Use the evidence to choose parameter values, then add the rule:
+
+```python
+add_single_cell_rule(
+    cell_type="tumor", signal="oxygen", direction="decreases",
+    behavior="necrosis", half_max=3.75, hill_power=8
+)
+```
+
+**3. Store justification for each rule**
+
+After adding a rule, record why it's biologically valid:
+
+```python
+store_rule_justification(
+    cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis",
+    justification="Tumor cells undergo necrosis below ~5 mmHg O2. Half-max of 3.75 mmHg is consistent with published hypoxia thresholds.",
+    key_citations="Vaupel 2004, Grimes 2014"
+)
+```
+
+**4. Generate justification report**
+
+After all rules are added:
+
+```python
+get_rule_justifications()
+```
+
+This produces a report showing each rule's evidence basis, flags unjustified rules, and exports to `rule_justifications.md`.
+
+### Tips
+
+- **Always call the tool** — do not skip `search_literature()` because you think you know the answer
+- Ask specific questions (e.g., "What is the EC50 for oxygen-dependent necrosis?") rather than vague ones
+- PubMed and bioRxiv MCPs are fine for discovery and browsing; Edison (`search_literature`) is best for deep evidence search with citations
+- The Task tool cannot access MCP tools — do all literature work in the main conversation
+- One `search_literature()` call per biological question — batch related questions into separate calls
 
 ## 8. Post-Simulation Analysis
 
+All analysis tools accept either `simulation_id` (from `run_simulation()`) or `output_folder` (direct path). They use pcdl (PhysiCell Data Loader) to read binary `.mat` output files.
+
 After `run_simulation()`:
 1. Poll `get_simulation_status()` every 60 seconds until complete/failed
-2. `get_simulation_analysis_overview()` — one-shot executive summary (start here)
-3. `get_population_timeseries()` — cell counts over time, growth rates, doubling times
-4. `get_timestep_summary(timestep=N)` — drill into a specific timepoint
-5. `get_substrate_summary()` — substrate concentration statistics with gradients
-6. `get_cell_data(cell_type="X", columns="col1,col2")` — filtered cell attributes
-7. `generate_analysis_plot(plot_type="population_timeseries")` — save plots to disk
+2. `get_simulation_analysis_overview()` — one-shot executive summary (start here). Shows cell counts at first/last timestep, spatial extent, substrate stats, and suggests next tools.
+3. `get_population_timeseries()` — cell counts over time, growth rates, doubling times. Subsamples if >200 timesteps.
+4. `get_timestep_summary(timestep=N)` — drill into a specific timepoint (0-based index, -1 for latest)
+5. `get_substrate_summary(timestep=N)` — substrate concentration statistics with center-vs-edge gradients
+6. `get_cell_data(cell_type="X", columns="col1,col2", sort_by="total_volume", max_rows=50)` — filtered cell attributes with statistics
+7. `generate_analysis_plot(plot_type=T)` — save plots to disk. Types: `population_timeseries`, `cell_scatter`, `substrate_contour`
 8. `generate_simulation_gif()` — spatial animation from SVG snapshots
 
-**Do NOT** use `Read` to open binary output files (.mat, .xml output, .gif). These will crash with buffer overflow. Always use the analysis tools above.
+**Do NOT** use `Read` to open binary output files (.mat, .xml output, .gif). Always use the analysis tools above.
 
 If rules seem inactive, check `detailed_rules.txt` for "from X towards Y" values.
 
@@ -276,11 +320,11 @@ If rules seem inactive, check `detailed_rules.txt` for "from X towards Y" values
 - **`references/troubleshooting.md`** — Error diagnosis by symptom
 - **`references/uq-calibration-workflow.md`** — Sensitivity analysis and calibration
 - **`references/physiboss-integration.md`** — Boolean network (MaBoSS/PhysiBoSS) integration
-- **`references/literature-validation.md`** — Edison PaperQA3 API integration details
+- **`references/literature-search.md`** — Edison PaperQA3 literature search details
 
 ## 10. Quick Start Template
 
-Basic tumor growth simulation (no literature validation):
+Basic tumor growth simulation:
 
 ```
 1. create_session()
@@ -291,17 +335,20 @@ Basic tumor growth simulation (no literature validation):
 6. configure_cell_parameters(cell_type="tumor", volume_total=2500, motility_speed=0.5, apoptosis_rate=5.31667e-5, necrosis_rate=0.00277)
 7. set_substrate_interaction(cell_type="tumor", substrate="oxygen", uptake_rate=10.0)
 8. add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis", min_signal=0, half_max=3.75, hill_power=8)
-9. add_single_cell_rule(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", min_signal=0, half_max=1.0, hill_power=4)
-10. place_initial_cells(cell_type="tumor", pattern="random_disc", num_cells=200, radius=100)
-11. export_xml_configuration()
-12. export_cell_rules_csv()
-13. export_cells_csv()
-14. create_physicell_project("tumor_growth")
-15. compile_physicell_project("tumor_growth")
-16. run_simulation("tumor_growth")
-17. get_simulation_status(simulation_id)   # poll until complete
-18. get_simulation_analysis_overview(simulation_id)
-19. get_population_timeseries(simulation_id)
-20. generate_analysis_plot(simulation_id, plot_type="population_timeseries")
-21. generate_simulation_gif(simulation_id)
+9. store_rule_justification(cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis", justification="Hypoxia-induced necrosis threshold ~5 mmHg", key_citations="Vaupel 2004")
+10. add_single_cell_rule(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", min_signal=0, half_max=1.0, hill_power=4)
+11. store_rule_justification(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", justification="Contact inhibition of proliferation", key_citations="Helmlinger 1997")
+12. place_initial_cells(cell_type="tumor", pattern="random_disc", num_cells=200, radius=100)
+13. get_rule_justifications()
+14. export_xml_configuration()
+15. export_cell_rules_csv()
+16. export_cells_csv()
+17. create_physicell_project("tumor_growth")
+18. compile_physicell_project("tumor_growth")
+19. run_simulation("tumor_growth")
+20. get_simulation_status(simulation_id)   # poll until complete
+21. get_simulation_analysis_overview(simulation_id)
+22. get_population_timeseries(simulation_id)
+23. generate_analysis_plot(simulation_id, plot_type="population_timeseries")
+24. generate_simulation_gif(simulation_id)
 ```

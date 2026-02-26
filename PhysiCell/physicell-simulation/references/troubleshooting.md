@@ -162,6 +162,23 @@ create_physicell_project(...)  # copies all files to project
 - Check output files: `get_simulation_output_files(simulation_id, file_type="svg")`
 - Install ImageMagick if needed: `brew install imagemagick` (macOS)
 
+## Analysis Tools Return Errors
+
+**Symptom**: `get_simulation_analysis_overview()`, `get_cell_data()`, or other analysis tools fail.
+
+**Possible causes**:
+1. **pcdl not installed**: The `pcdl` package (PhysiCell Data Loader) is required for all analysis tools
+2. **Simulation not complete**: Analysis tools need `.mat` output files which are written during simulation
+3. **No output files**: Simulation crashed before writing any output
+4. **Wrong simulation_id or output_folder**: Path doesn't point to valid PhysiCell output
+
+**Fix**:
+- Install pcdl: `pip install pcdl`
+- Check simulation status first: `get_simulation_status(simulation_id)`
+- Verify output files exist: `get_simulation_output_files(simulation_id)`
+- For `get_cell_data()`: use `columns` parameter to select specific fields, `cell_type` to filter by type
+- For `generate_analysis_plot()`: valid plot types are `population_timeseries`, `cell_scatter`, `substrate_contour`
+
 ## Rules Reference Nonexistent Substrate or Cell Type
 
 **Symptom**: Rule is added without error but has no effect because the signal or behavior references something that doesn't exist in the XML.

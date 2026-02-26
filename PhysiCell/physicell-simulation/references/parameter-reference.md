@@ -87,7 +87,7 @@ Key conversions:
 
 ## Hill Function Parameters
 
-Hill function parameters (half_max, hill_power) for cell rules must be derived from literature validation using `validate_rules_batch()`. Do NOT use hardcoded default values — these parameters are model-specific and must be justified by experimental evidence.
+Hill function parameters (half_max, hill_power) for cell rules should be informed by literature. Use `search_literature()` from the LiteratureValidation MCP to find evidence-based values. Do NOT use hardcoded default values — these parameters are model-specific and should be justified by experimental evidence.
 
 General guidance:
 - **hill_power 2-4**: Graded, dose-dependent response
