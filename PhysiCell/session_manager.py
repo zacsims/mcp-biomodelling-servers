@@ -61,20 +61,17 @@ class UQParameterDef:
     perturbation: Optional[List[float]] = None  # e.g. [1.0, 5.0, 10.0] percent
 
 @dataclass
-class RuleValidationResult:
-    """Result of validating a cell rule against published literature."""
+class RuleJustification:
+    """Justification for a cell rule, based on literature evidence."""
     cell_type: str
     signal: str
     direction: str  # 'increases' or 'decreases'
     behavior: str
-    support_level: str  # 'strong', 'moderate', 'weak', 'contradictory', 'unsupported'
-    evidence_summary: str = ""
-    raw_paperqa_answer: str = ""  # Raw PaperQA answer for audit trail
-    suggested_half_max: Optional[float] = None
-    suggested_hill_power: Optional[float] = None
+    evidence_summary: str = ""  # Agent's justification text
     key_citations: List[str] = field(default_factory=list)
-    literature_direction: str = ""  # 'increases', 'decreases', or 'ambiguous'
-    direction_match: Optional[bool] = None  # True=match, False=mismatch, None=ambiguous
+
+# Keep backward compat alias
+RuleValidationResult = RuleJustification
 
 @dataclass
 class UQContext:
@@ -304,13 +301,8 @@ class SessionState:
                     'signal': rv.signal,
                     'direction': rv.direction,
                     'behavior': rv.behavior,
-                    'support_level': rv.support_level,
                     'evidence_summary': rv.evidence_summary,
-                    'suggested_half_max': rv.suggested_half_max,
-                    'suggested_hill_power': rv.suggested_hill_power,
                     'key_citations': rv.key_citations,
-                    'literature_direction': rv.literature_direction,
-                    'direction_match': rv.direction_match,
                 }
                 for rv in self.rule_validations
             ]
