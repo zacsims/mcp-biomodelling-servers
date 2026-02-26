@@ -1,20 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
 # Virtual environments
 physicell-mcp/
 .venv/
 venv/
-__pycache__/
+env/
+.env
 
-# uv
-uv.lock
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
 
-# OS
-.DS_Store
+# Test & lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+pypath_log/
+
+# Generated artifacts (runtime output – not source)
+NeKo/exports/
+NeKo/artifacts/
+MaBoSS/artifacts/
+PhysiCell/artifacts/
 
 # IDE
 .idea/
 .vscode/
+*.swp
+*.swo
 
-# Python
-*.pyc
-*.pyo
-*.egg-info/
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+uv.lock

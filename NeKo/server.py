@@ -1,40 +1,15 @@
-"""NeKo MCP Server
-
-Purpose: Provide session-scoped NeKo network construction and refinement tools for automated
-multiscale modelling workflows (NeKo -> MaBoSS -> PhysiCell). Sessions isolate hypotheses and
-store default completion parameters. Always prefer create_session() before create_network().
-
-Recommended high-level workflow:
- 1. create_session()
- 2. set_default_params(max_len=2, only_signed=True, consensus=True)  # optional tuning
- 3. create_network([...TNF pathway / fate genes...], database='omnipath')
- 4. remove_bimodal_interactions(); remove_undefined_interactions()
- 5. check_disconnected_nodes(); if disconnected -> list_components(); candidate_connectors(); apply_strategy('complete_connection')
- 6. list_genes_and_interactions(verbosity='preview'); find_paths('TNF','CASP3')
- 7. export_network(format='bnet') -> feed into MaBoSS (choose output nodes, run threads=10)
- 8. Evaluate biological plausibility; refine via filter_interactions(), get_references(), apply_strategy(), pruning
- 9. Iterate until stable; then integrate with PhysiCell (map Boolean outputs to behaviours)
-
-Strategy tools (apply_strategy): complete_connection, connect_as_atopo, connect_component,
-connect_network_radially, connect_to_upstream_nodes, connect_subgroup. Use candidate_connectors()
-first to inspect possible bridging nodes or relaxation impacts.
-
-Verbosity levels: 'summary' (token frugal), 'preview' (tables truncated), 'full'.
-
-All tools that require a network return E_NO_NET with guidance if missing.
-"""
-
 import io
+import copy
 import sys
 import os
 import glob
-import requests
 import json
 import logging
+import re
+import tempfile
 from pathlib import Path
-from typing import Optional, List
-from functools import wraps
-#from hatch_mcp_server import HatchMCP
+from typing import Annotated, Optional, List
+from pydantic import Field
 
 from neko.core.network import Network
 from neko._outputs.exports import Exports
@@ -43,6 +18,17 @@ from neko.core.tools import is_connected
 
 from utils import *
 from session_manager import session_manager, ensure_session, normalize_verbosity, DEFAULT_VERBOSITY
+
+# Make the repo root importable so we can use the shared artifact_manager
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from artifact_manager import get_artifact_dir, safe_artifact_path, list_artifacts, clean_artifacts, write_session_meta, list_artifact_sessions as _list_artifact_sessions_on_disk
+
+from src.helpers import (
+    E_NO_NET, SUMMARY_HINT, _SERVER_ROOT,
+    _short_table, _export_dir, _session_network, _invalidate,
+    _compute_components, requires_network,
+    sanitize_bnet_file, _get_translators
+)
 from neko.core.strategies import (
     connect_as_atopo,
     connect_component as strategy_connect_component,
@@ -59,155 +45,88 @@ from mcp.server.fastmcp import Context, FastMCP
 
 mcp = FastMCP("NeKo")
 
-""" # Initialize MCP server with metadata
-hatch_mcp = HatchMCP("NeKo",
-                fast_mcp=mcp,
-                origin_citation="NeKo: a tool for automatic network construction from prior knowledge, Marco Ruscone,  Eirini Tsirvouli,  Andrea Checcoli,  Denes Turei,  Emmanuel Barillot,  Julio Saez-Rodriguez,  Loredana Martignetti,  Åsmund Flobak,  Laurence Calzone, doi: https://doi.org/10.1101/2024.10.14.618311",
-                mcp_citation="https://github.com/marcorusc/Hatch_Pkg_Dev/tree/main/NeKo") """
-
 # NOTE: Previous implementation used a single global `network` object.
 # Now session-based management (see `session_manager.py`).
 # Each tool can accept an optional `session_id` allowing multiple networks.
 # If not provided, the default session is used (auto-created on first use).
 
-# Constants / shared small strings to reduce token footprints
-E_NO_NET = "E_NO_NET: No network in session. Call create_session() then create_network()."
-SUMMARY_HINT = "Set verbosity='preview' or 'full' for more details."
+# 1. Define the manual in one place so you only ever have to update it here.
+NEKO_AGENT_MANUAL = """
+# NeKo to MaBoSS Workflow Manual
 
-def _short_table(df, max_rows=25):
-    """Return markdown table (plain) truncated with note if needed."""
-    if df is None or df.empty:
-        return "(no data)", True
-    truncated = False
-    if len(df) > max_rows:
-        df = df.head(max_rows)
-        truncated = True
-    return clean_for_markdown(df).to_markdown(index=False, tablefmt="plain"), truncated
+## 1. Recommended Execution Order
+1. **Initialize:** `create_session()` -> `set_default_params(max_len=2, only_signed=True, consensus=True)`
+2. **Build:** `create_network([...seed genes...], database='omnipath')`
+3. **Curate:** `remove_bimodal_interactions()` -> `remove_undefined_interactions()`
+4. **Audit Connectivity:** `check_disconnected_nodes()`
+   - *If disconnected:* `list_components()` -> `candidate_connectors()` -> Apply a connection tool.
+5. **Inspect:** `list_genes_and_interactions(verbosity='preview')`
+6. **Export:** `export_network(format='bnet')` -> Pass to MaBoSS.
 
-def _export_dir() -> Path:
-    # Anchor exports to the directory of this server file to avoid writing to $HOME when CWD differs
-    base = Path(__file__).parent
-    d = base / "exports"
-    d.mkdir(exist_ok=True)
-    return d
+## 2. Tool Categories
+* **Sessions:** `create_session`, `list_sessions`, `set_default_session`, `delete_session`, `status`, `reset_network`
+* **Connection Solvers:** `bridge_components`, `connect_targeted_nodes`, `apply_global_connection`
+* **Inspection:** `list_genes_and_interactions`, `find_paths`, `get_references`, `filter_interactions`
 
-def _session_network(session_id: Optional[str]):
-    sess = ensure_session(session_id)
-    return sess, sess.network
+## 3. Critical Operating Rules
+* **Session First:** Always call `create_session` before `create_network`.
+* **Scout Before You Shoot:** Always run `candidate_connectors()` before heavy connection tools.
+* **Token Frugality:** In iterative loops, ALWAYS use `verbosity='summary'`. 
+"""
 
-def _invalidate(sess):
-    if sess:
-        sess.invalidate_edges_cache()
+# 2. Expose it as an MCP Prompt (For smart clients that pull system prompts)
+@mcp.prompt(name="neko_workflow_prompt", description="System prompt and operating manual for the NeKo agent.")
+def neko_workflow_prompt() -> str:
+    return NEKO_AGENT_MANUAL
 
-# ===== Decorators & Helpers for strategies & network requirements =====
-def requires_network(fn):
-    @wraps(fn)
-    def inner(*args, **kwargs):
-        session_id = kwargs.get("session_id")
-        sess, network = _session_network(session_id)
-        if network is None:
-            return E_NO_NET
-        kwargs["sess"] = sess
-        kwargs["network"] = network
-        return fn(*args, **kwargs)
-    return inner
+# 3. Expose it as an MCP Resource (For clients that prefer to 'read' documentation)
+@mcp.resource(
+    uri="docs://neko/agent_manual",
+    name="NeKo Agent Operations Manual",
+    description="The single source of truth for NeKo workflows, tool categories, and rules.",
+    mime_type="text/markdown"
+)
+def neko_agent_manual_resource() -> str:
+    return NEKO_AGENT_MANUAL
 
-def _compute_components(network) -> List[List[str]]:
-    try:
-        df = network.convert_edgelist_into_genesymbol()
-    except Exception:
-        return []
-    if df is None or df.empty:
-        return []
-    adj: dict[str, set] = {}
-    for _, r in df.iterrows():
-        s = r['source']; t = r['target']
-        if pd.isna(s) or pd.isna(t):
-            continue
-        adj.setdefault(s, set()).add(t)
-        adj.setdefault(t, set()).add(s)
-    visited = set()
-    comps = []
-    for n in adj.keys():
-        if n in visited:
-            continue
-        stack = [n]
-        cur = []
-        visited.add(n)
-        while stack:
-            node = stack.pop()
-            cur.append(node)
-            for nb in adj.get(node, []):
-                if nb not in visited:
-                    visited.add(nb)
-                    stack.append(nb)
-        comps.append(cur)
-    return comps
-
-# Main function that creates the NeKo network from a list of initial genes.
-# If the list of genes is empty but a SIF file is provided,
-# it will create a network from the SIF file.
-# If both are provided, it will create a network from the list of genes and the SIF file.
-# If neither is provided, it will return an error message.
-# If the database is not supported, it will return an error message.
-# If the network is created successfully, it will return a Markdown formatted string with the network summary.
-# If the network creation fails, it will return an error message.
-# If the network is empty, it will return a Markdown formatted string with an empty table.
-# If the network is not connected, it will return a Markdown formatted string with a warning message.
-# If the network is connected, it will return a Markdown formatted string with the network summary.
-# If the network is not reset, it will return an error message.
 @mcp.tool()
-def create_network(list_of_initial_genes: List[str],
+async def create_network(
+                   list_of_initial_genes: Annotated[List[str], Field(description="Gene symbols to seed the network (e.g. ['TP53', 'MYC', 'CASP3']). Can be empty if sif_file is provided.")],
                    ctx: Context,
-                   database: str = "omnipath",
-                   sif_file: Optional[str] = None,
-                   max_len: int = 2,
-                   algorithm: str = "bfs",
-                   only_signed: bool = True,
-                   connect_with_bias: bool = False,
-                   consensus: bool = True,
-                   session_id: Optional[str] = None,
-                   verbosity: str = DEFAULT_VERBOSITY) -> str:
-    """
-Create a NeKo network from a list of genes and/or a SIF file.
-If the list of genes is empty but a SIF file is provided, load the network from the SIF file.
-If the list of genes is not empty and there is no SIF file, use just the list of genes.
-If both are provided, load the network from the SIF file and then add all genes in the list.
-As optional parameters, you can specify the maximum length of paths to complete (default is 2),
-the algorithm to use for path completion (the user can choose between "bfs" and "dfs" which stands for breadth-first search and depth-first search, respectively),
-whether to only include signed interactions, whether to connect with bias, and whether to use consensus.
-If the database is not supported, it will return an error message.
-If the network is created successfully, it will return a Markdown formatted string with the network summary
-Args:
-list_of_initial_genes (list[str]): List of gene symbols.
-database (str): Database to use for network creation, either 'omnipath' or 'signor'.
-sif_file (str): Path to a SIF file to load the network from.
-max_len (int): Maximum length of paths to complete. Defaults to 2.
-algorithm (str): Algorithm to use for path completion, either 'bfs' or 'dfs'. Defaults to 'bfs'.
-only_signed (bool): Whether to only include signed interactions. Defaults to True.
-connect_with_bias (bool): Whether to connect with bias. Defaults to False.
-consensus (bool): Whether to use consensus. Defaults to True.
-Returns:
-str: Status message or Markdown formatted string with network summary.
+                   database: str = Field("omnipath", description="Knowledge-base to query. 'omnipath' (default) or 'signor'."),
+                   sif_file: Optional[str] = Field(None, description="Absolute path to an existing SIF file to bootstrap the network from. Combined with list_of_initial_genes when both are given."),
+                   max_len: int = Field(2, description="Maximum path length used by complete_connection to bridge seed genes (1-4; larger = denser but slower)."),
+                   algorithm: str = Field("bfs", description="Search algorithm for path completion: 'bfs' (breadth-first, default) or 'dfs' (depth-first)."),
+                   only_signed: bool = Field(True, description="Restrict to signed (+/-) interactions only. Set False to allow unsigned interactions when network is sparse."),
+                   connect_with_bias: bool = Field(False, description="Avoids looking for paths between pairs of nodes that are already connected by another path previously found."),
+                   consensus: bool = Field(True, description="Require interactions supported by multiple curated sources (higher confidence)."),
+                   session_id: Optional[str] = Field(None, description="Session ID to write the network into. Omit to use the active/default session."),
+                   verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary' (default, token-frugal), 'preview' (truncated tables), 'full'.")) -> str:
+    """Build a NeKo gene regulatory network from seed genes and/or a SIF file.
+
+    Calls complete_connection internally to bridge genes via the chosen database.
+    After creation, run remove_bimodal_interactions() and check_disconnected_nodes()
+    before exporting. Always call create_session() first.
     """
     verbosity = normalize_verbosity(verbosity)
     sess = ensure_session(session_id)
-    ctx.info(f"Creating NeKo network (session={sess.session_id}) with genes={list_of_initial_genes} sif={sif_file}")
-    logging.info(f"Creating NeKo network (session={sess.session_id}) with genes={list_of_initial_genes} sif={sif_file}") 
+    await ctx.report_progress(0, 4)
+    await ctx.info(f"Creating NeKo network (session={sess.session_id}) with genes={list_of_initial_genes} sif={sif_file}")
     # Validate database choice
     if database not in ["omnipath", "signor"]:
         return "_Unsupported database. Use `omnipath` or `signor`._"
 
     # If using SIGNOR, download and build the SIGNOR resource
     if database == "signor":
-        ctx.info("Downloading SIGNOR database...")
-        ctx.info("SIGNOR database downloaded successfully.")
+        await ctx.info("Downloading SIGNOR database...")
         signor_res = signor()
         signor_res.build()
+        await ctx.info("SIGNOR database downloaded successfully.")
         resources = signor_res.interactions
     else:
         resources = "omnipath"
 
+    await ctx.report_progress(1, 4)
     # Case 1: SIF file provided (with or without genes)
     if sif_file is not None and os.path.exists(sif_file):
         # Use NeKo's documented SIF loading
@@ -225,6 +144,7 @@ str: Status message or Markdown formatted string with network summary.
     # Case 2: Only genes provided
     elif list_of_initial_genes:
         sess.set_network(Network(list_of_initial_genes, resources=resources))
+        await ctx.info(f"Running complete_connection (max_len={max_len}, only_signed={only_signed})...")
         sess.network.complete_connection(
             maxlen=max_len,
             algorithm=algorithm,
@@ -243,7 +163,7 @@ str: Status message or Markdown formatted string with network summary.
         return format_network_creation_error("build_failed", list_of_initial_genes, str(e))
 
     if df_edges.empty:
-        ctx.warning("No interactions found in the network. Please check the input parameters.")
+        await ctx.warning("No interactions found in the network. Please check the input parameters.")
         return format_empty_network_response(list_of_initial_genes, database, max_len, only_signed)
 
     # Compute basic statistics
@@ -251,7 +171,8 @@ str: Status message or Markdown formatted string with network summary.
     unique_nodes = pd.unique(df_edges[["source", "target"]].values.ravel())
     num_nodes = len(unique_nodes)
 
-    ctx.info("Network created successfully.")
+    await ctx.report_progress(4, 4)
+    await ctx.info(f"Network created successfully: {num_nodes} nodes, {num_edges} edges.")
 
     # Prepare a preview of the first 100 interactions
     if verbosity == "summary":
@@ -272,14 +193,14 @@ str: Status message or Markdown formatted string with network summary.
 
 @mcp.tool()
 @requires_network
-def add_gene(gene: str, session_id: Optional[str] = None, autoconnect: bool = False, sess=None, network=None) -> str:
-    """
-    Add a gene to the current network. The gene must be a valid gene symbol.
-    If no network exists, it prompts the user to create one first.
-    Args:
-        gene (str): Gene symbol to add.
-    Returns:
-        str: Status message.
+def add_gene(
+        gene: Annotated[str, Field(description="Gene symbol to add (e.g. 'TP53'). Case-sensitive; use uppercase HGNC symbols.")],
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        autoconnect: bool = Field(False, description="Re-run complete_connection after adding the gene to integrate it into the network topology."),
+        sess=None, network=None) -> str:
+    """Add a single gene node to the current network.
+
+    To add multiple genes at once use extend_network().
     """
     try:
         network.add_node(gene)
@@ -297,15 +218,13 @@ def add_gene(gene: str, session_id: Optional[str] = None, autoconnect: bool = Fa
 
 @mcp.tool()
 @requires_network
-def remove_gene(gene: str, session_id: Optional[str] = None, sess=None, network=None) -> str:
-    """
-    Remove a gene from the current network. The gene must be a valid gene symbol.
-    If no network exists, it prompts the user to create one first.
-    If the gene is not found in the network, it returns an error message.
-    Args:
-        gene (str): Gene symbol to remove.
-    Returns:
-        str: Status message.
+def remove_gene(
+        gene: Annotated[str, Field(description="Gene symbol to remove. Case-insensitive; closest match is suggested if not found.")],
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        sess=None, network=None) -> str:
+    """Remove a gene node (and all its edges) from the current network.
+
+    Use list_genes_and_interactions() first to verify the exact symbol present in the network.
     """
     try:
         df_nodes = network.nodes if hasattr(network, 'nodes') else None
@@ -329,7 +248,7 @@ def remove_gene(gene: str, session_id: Optional[str] = None, sess=None, network=
 
         query = gene.upper()
         if query not in symbols:
-            # Suggest similar (substring or Levenshtein-lite via length difference) – keep it lightweight
+            # Suggest similar (substring or Levenshtein-lite via length difference) - keep it lightweight
             candidates = list(symbol_map.values())
             partial = [c for c in candidates if query in c.upper() or c.upper() in query]
             # If no substring hits, fall back to first few for orientation
@@ -350,17 +269,14 @@ def remove_gene(gene: str, session_id: Optional[str] = None, sess=None, network=
 
 @mcp.tool()
 @requires_network
-def remove_interaction(node_A: str, node_B: str, session_id: Optional[str] = None, sess=None, network=None) -> str:
-    """
-    Remove an interaction between two genes in the current network.
-    If no network exists, it prompts the user to create one first.
-    If the interaction is not found in the network, it returns an error message.
-    It only deletes the interaction in the specified direction (A to B).
-    Args:
-        node_A (str): First gene symbol.
-        node_B (str): Second gene symbol.
-    Returns:
-        str: Status message.
+def remove_interaction(
+        node_A: Annotated[str, Field(description="Source gene symbol (interaction goes A -> B).")],
+        node_B: Annotated[str, Field(description="Target gene symbol (interaction goes A -> B).")],
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        sess=None, network=None) -> str:
+    """Remove a directed edge A -> B from the network (does not affect B -> A if it exists).
+
+    Use filter_interactions() or list_genes_and_interactions() to locate the exact edge first.
     """
     try:
         df_edges = network.convert_edgelist_into_genesymbol()
@@ -380,209 +296,102 @@ def remove_interaction(node_A: str, node_B: str, session_id: Optional[str] = Non
     else:
         return f"**Interaction not found:** No interaction from {node_A} to {node_B} in the current network.\n**Tip:** Use `get_network()` to see all available interactions"
 
-# TO DO: Implement multiple network enrichment strategies (connect upstream, connect as atopo, etc...)
-
 # TO DO: Implement export of images with graphviz
-
-# TO DO: implement better check of which nodes are disconnected and use MCM strategy to connect the disconnected component with the connected one
 
 # TO DO: implement GO enrichment
 
 @mcp.tool()
-def export_network(format: str = "sif", session_id: Optional[str] = None, verbosity: str = DEFAULT_VERBOSITY) -> str:
-    """
-    When the user asks to export the current network,
-    or asks to save the network in a specific format,
-    or asks to export the network as SIF or BNET,
-    this function exports the network in the specified format.
-    If no network exists, it prompts the user to create one first.
-    If the format is not supported, it returns an error message.
-    The function returns a Markdown formatted string with the export status,
-    including a preview of the exported file.
-    If the exported file is in SIF format, it shows the first 100 lines as a Markdown table,
-    containing the source, interaction, and target columns.
-    If the exported file is in BNET format, it shows the first 100 lines as a Markdown table,
-    containing the gene and Boolean expression columns.
-    Args:
-        format (str): Format to export the network, either 'sif' or 'bnet'.
-    Returns:
-        str: Markdown formatted string with export status and preview.
+def export_network(
+        format: str = Field("sif", description="Export format: 'sif' (Simple Interaction Format, tab-separated) or 'bnet' (Boolean network for MaBoSS). BNET requires a fully connected network."),
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary', 'preview', or 'full'.")) -> str:
+    """Export the current network to SIF or BNET format.
+
+    After BNET export, hand the file path to the MaBoSS server via bnet_to_bnd_and_cfg().
+    BNET export fails if the network is not fully connected — run check_disconnected_nodes() first.
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
     if network is None:
         return format_no_network_guidance()
     exporter = Exports(network)
+    out_dir = _export_dir(sess.session_id)
 
-    # Helper to read & preview first 100 lines, returning Markdown
-    def _preview_file(path: str, sep: str, cols: list[str]) -> str:
-        """
-        Try to read up to 100 rows of `path` (with pandas) using sep and columns list.
-        If successful, return as Markdown table. Otherwise, return first 10
-        raw lines in a fenced code block.
-        """
-        if not os.path.exists(path):
-            return f"_File `{path}` not found._"
-
-        # First, attempt to load with pandas and produce a Markdown table
-        try:
-            df_preview = pd.read_csv(path, sep=sep, header=None, names=cols, nrows=100, dtype=str)
-            # Drop any fully-NaN rows (sometimes trailing newlines)
-            df_preview.dropna(how="all", inplace=True)
-            return clean_for_markdown(df_preview).to_markdown(index=False, tablefmt="plain")
-        except Exception:
-            # Fallback: just show the first 100 lines as-is
-            lines = []
-            with open(path, "r") as f:
-                for _ in range(100):
-                    line = f.readline()
-                    if not line:
-                        break
-                    lines.append(line.rstrip("\n"))
-            if not lines:
-                return "_File is empty or could not be read._"
-
-            code_block = ["```"] + lines + ["```"]
-            return "\n".join(code_block)
-
-    # 1) Handle SIF export
+    # ── SIF export ────────────────────────────────────────────────────────────
     if format.lower() == "sif":
-        out_dir = _export_dir()
         out_path = str(out_dir / "Network.sif")
         try:
             exporter.export_sif(out_path)
         except Exception as e:
-            return f"**Error exporting SIF:** {str(e)}"
-
-        # Now build a Markdown snippet showing the path + preview
+            return f"**Error exporting SIF:** {e}"
         if verbosity == "summary":
             return f"SIF exported: {out_path}. {SUMMARY_HINT}"
-        md_lines = [f"Exported to `{out_path}`", "Preview (first 100 lines):", ""]
-        # SIF format is: source<TAB>interaction<TAB>target
-        preview_md = _preview_file(out_path, sep="\t", cols=["source", "interaction", "target"])
-        md_lines.append(preview_md)
-        return "\n".join(md_lines)
+        try:
+            df_prev = pd.read_csv(out_path, sep="\t", header=None,
+                                  names=["source", "interaction", "target"],
+                                  nrows=100, dtype=str).dropna(how="all")
+            preview_md = _short_table(df_prev, max_rows=100)[0]
+        except Exception:
+            preview_md = "_Preview unavailable._"
+        return f"SIF exported: `{out_path}`\n\nPreview (first 100 rows):\n{preview_md}"
 
-    # 2) Handle BNET export
+    # ── BNET export ───────────────────────────────────────────────────────────
     elif format.lower() == "bnet":
-        def clean_node_name(name: str) -> str:
-            import re
-            return re.sub(r"[^A-Za-z0-9_]", "_", name)
-
-        # Check connectivity first with enhanced guidance
         if not is_connected(network):
             return format_connectivity_guidance()
-
-        # Export
         try:
-            out_dir = _export_dir()
             exporter.export_bnet(str(out_dir / "Network"))
-            clean_bnet_headers(str(out_dir))
         except Exception as e:
-            return f"**Error exporting BNET:** {str(e)}"
+            return f"**Error exporting BNET:** {e}"
 
-        # Find all .bnet files in the exports directory
-        bnet_files = [os.path.basename(f) for f in glob.glob(str(out_dir / "*.bnet"))]
+        bnet_files = sorted(out_dir.glob("*.bnet"))
         if not bnet_files:
             return "**Error:** No .bnet files were generated."
-        out_path = str(out_dir / bnet_files[0])
+        out_path = str(bnet_files[0])
 
-        # Clean node names in the BNET file (both columns)
-        cleaned_names = set()
         try:
-            # First pass: build mapping of original -> cleaned names
-            with open(out_path, "r") as f:
-                lines = f.readlines()
-            name_map = {}
-            for line in lines:
-                if "," in line:
-                    gene, _ = line.split(",", 1)
-                    gene_clean = clean_node_name(gene.strip())
-                    if gene_clean != gene.strip():
-                        cleaned_names.add(gene.strip())
-                    name_map[gene.strip()] = gene_clean
-            # Second pass: rewrite lines with cleaned names in both columns
-            new_lines = []
-            import re
-            for line in lines:
-                if "," in line:
-                    gene, expr = line.split(",", 1)
-                    gene_clean = name_map.get(gene.strip(), gene.strip())
-                    expr_clean = expr
-                    for orig, clean in name_map.items():
-                        if orig != clean:
-                            expr_clean = re.sub(rf'(?<![A-Za-z0-9_]){re.escape(orig)}(?![A-Za-z0-9_])', clean, expr_clean)
-                    new_lines.append(f"{gene_clean},{expr_clean}")
-                else:
-                    new_lines.append(line)
-            with open(out_path, "w") as f:
-                f.writelines(new_lines)
+            result = sanitize_bnet_file(out_path)
         except Exception as e:
-            return f"**Error cleaning BNET gene names:** {str(e)}"
-
-        # Check for special characters in gene/node names in the bnet file (should be clean now)
-        special_char_issues = []
-        try:
-            with open(out_path, "r") as f:
-                for i, line in enumerate(f):
-                    if i >= 1000:
-                        break
-                    if "," in line:
-                        gene = line.split(",", 1)[0].strip()
-                        import re
-                        if re.search(r"[^A-Za-z0-9_]", gene):
-                            special_char_issues.append(gene)
-        except Exception as e:
-            return f"**Error reading BNET file for gene name check:** {str(e)}"
+            return f"**Error sanitizing BNET:** {e}"
 
         if verbosity == "summary":
             return f"BNET exported: {out_path}. {SUMMARY_HINT}"
-        md_lines = [f"Exported to `{out_path}`", "Preview (first 100 lines):", ""]
-        preview_md = _preview_file(out_path, sep=",", cols=["gene", "expression"])
-        md_lines.append(preview_md)
-        if len(bnet_files) > 1:
-            md_lines.append(f"\n_Warning: More than one .bnet file was found ({', '.join(bnet_files)}). Previewing only the first one._")
-        if cleaned_names:
-            md_lines.append(f"\n**Warning:** The following gene/node names were modified to remove special characters: {', '.join(sorted(cleaned_names))}")
-        if special_char_issues:
-            md_lines.append(f"\n**Warning:** The following gene/node names still contain special characters and may not be compatible: {', '.join(sorted(set(special_char_issues)))}")
+
+        try:
+            df_prev = pd.read_csv(out_path, sep=",", header=None,
+                                  names=["gene", "expression"],
+                                  nrows=100, dtype=str).dropna(how="all")
+            preview_md = _short_table(df_prev, max_rows=100)[0]
+        except Exception:
+            preview_md = "_Preview unavailable._"
+
+        md_lines = [
+            f"BNET exported: `{out_path}`",
+            f"Next: call `bnet_to_bnd_and_cfg('{out_path}')` in the MaBoSS server.",
+            "",
+            "Preview (first 100 rows):",
+            preview_md,
+        ]
+        if result["cleaned_names"]:
+            md_lines.append(f"\n**Note:** Renamed to remove special characters: "
+                            f"{', '.join(sorted(result['cleaned_names']))}")
+        if result["duplicates_removed"]:
+            md_lines.append(f"\n**Note:** Removed duplicate rules for (isoforms collapsed to first): "
+                            f"{', '.join(sorted(set(result['duplicates_removed'])))}")
         return "\n".join(md_lines)
 
-    # 3) Unsupported format - provide guidance
+    # ── Unsupported format ────────────────────────────────────────────────────
     else:
         return format_unsupported_format_guidance(format)
 
 @mcp.tool()
-def network_dimension(session_id: Optional[str] = None) -> str:
-    """
-    When the user asks for the dimension of the current network,
-    or asks how many nodes and edges are in the network,
-    or simply asks for the network size,
-    this function returns a summary string with the number of nodes and edges.
-    If no network exists, it prompts the user to create one first.
-    If the network is empty, it returns a message indicating that no nodes or edges are found.
-    Returns:
-        str: Summary string with number of nodes and edges.
-    """
-    sess, network = _session_network(session_id)
-    if network is None:
-        return E_NO_NET
-    return f"Session {sess.session_id}: nodes={len(network.nodes)} edges={len(network.edges)}"
+def list_genes_and_interactions(
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary' (counts only), 'preview' (truncated table), 'full' (up to 100 rows)."),
+        max_rows: int = Field(50, description="Maximum rows to return in preview/full mode.")) -> str:
+    """Return a Markdown table of all nodes and directed edges in the network.
 
-@mcp.tool()
-def list_genes_and_interactions(session_id: Optional[str] = None, verbosity: str = DEFAULT_VERBOSITY, max_rows: int = 50) -> str:
-    """
-    When the user asks for a list of genes and interactions in the current network,
-    or asks which interactions are present in the network,
-    or simply asks for the interactions,
-    or asks to show the network,
-    this function returns a markdown table with the interactions, excluding the 'resources' column.
-    If no network exists, it prompts the user to create one first.
-    If the network is empty, it returns a message indicating that no interactions are found.
-    If an error occurs during the conversion, it returns an error message with an empty table.
-    
-    Returns:
-        str: Markdown table of interactions or an error message.
+    Equivalent to 'show the network'. Use filter_interactions() for targeted queries.
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
@@ -615,21 +424,16 @@ def list_genes_and_interactions(session_id: Optional[str] = None, verbosity: str
         return f"**Error**: {str(e)}\n\n_Unable to retrieve data._\n\n" + clean_for_markdown(empty_df).to_markdown(index=False, tablefmt="plain")
 
 @mcp.tool()
-def find_paths(source: str, target: str, maxlen: int = 3, session_id: Optional[str] = None, verbosity: str = DEFAULT_VERBOSITY) -> str:
-    """
-    When the user asks for paths between two genes in the network,
-    or asks to find paths from one gene to another,
-    or asks for paths from a source gene to a target gene,
-    this function finds all paths between the source and target genes up to a given length.
-    It captures and returns the printed output of print_my_paths in a Markdown format.
-    If no network exists, it prompts the user to create one first.
-    If no paths are found, it returns a message indicating that no paths were found.
-    Args:
-        source (str): Source gene symbol.
-        target (str): Target gene symbol.
-        maxlen (int): Maximum length of paths to find. Defaults to 3.
-    Returns:
-        str: Markdown formatted string with paths or an error message.
+def find_paths(
+        source: Annotated[str, Field(description="Source gene symbol (path start).")],
+        target: Annotated[str, Field(description="Target gene symbol (path end).")],
+        maxlen: int = Field(3, description="Maximum number of edges in a path (1-5; longer paths are slower to compute)."),
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary' (count only), 'preview'/'full' (path listing).")) -> str:
+    """Find and display all directed paths between two genes up to maxlen edges.
+
+    Useful for verifying biological signal flow before BNET export.
+    Returns 'No paths found' if genes are in disconnected components.
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
@@ -661,138 +465,34 @@ def find_paths(source: str, target: str, maxlen: int = 3, session_id: Optional[s
         return f"**Error:** {str(e)}"
 
 @mcp.tool()
-def reset_network(session_id: Optional[str] = None) -> str:
-    """
-    When the user asks to reset the current network,
-    or asks to clear the network,
-    or simply asks to reset,
-    this function resets the global network object to None.
-    If no network exists, it returns a message indicating that no network was loaded.
-    If the network is reset successfully, it returns a confirmation message.
-    If the network is not reset, it returns an error message.
-    Args:
-        None
-    Returns:
-        str: Status message.
+def reset_network(
+        session_id: Optional[str] = Field(None, description="Session ID to reset; omit to use the active/default session.")) -> str:
+    """Discard the current network in the session without deleting the session itself.
+
+    Use delete_session() to remove the session entirely, or create_network() to rebuild.
     """
     sess = ensure_session(session_id)
     sess.set_network(None)
     return f"Session {sess.session_id} network reset."
 
 @mcp.tool()
-def clean_generated_files(folder_path: str = "exports") -> str:
-    """
-    When the user asks to clean up generated files,
-    or asks to remove .bnet files,
-    or asks to delete all .bnet files,
-    this function removes all .bnet files from the specified folder.
-    If no .bnet files are found, it returns a message indicating that no files were found to clean.
-    If the folder path is not specified, it defaults to the current directory.
-    If the files are cleaned successfully, it returns a status message indicating how many files were cleaned.
-    If an error occurs during file deletion, it returns an error message.
-    Args:
-        folder_path (str): Path to the folder to clean. Defaults to current directory.
-    Returns:
-        str: Status message indicating cleaned files.
-    """
-    bnet_files = glob.glob(os.path.join(folder_path, "*.bnet"))
-    if not bnet_files:
-        return "No .bnet files found to clean."
-
-    for file_path in bnet_files:
-        os.remove(file_path)
-
-    return f"Cleaned {len(bnet_files)} .bnet files from {folder_path}."
+def clean_generated_files(
+        session_id: Optional[str] = Field(None, description="Session ID whose artifact files (SIF, BNET, etc.) should be removed. Omit for the active/default session.")) -> str:
+    """Delete all exported artifact files (SIF, BNET) for the given session."""
+    sess = ensure_session(session_id)
+    try:
+        count = clean_artifacts(_SERVER_ROOT, sess.session_id)
+        return f"Cleaned {count} artifact file(s) from session {sess.session_id}."
+    except Exception as e:
+        return f"Error during cleanup: {str(e)}"
 
 @mcp.tool()
-def get_help() -> str:
-    """
-    Get a description of available NeKo MCP tools and their usage.
-    Returns:
-        str: Help string.
-    """
-    return (
-        "NeKo MCP Tools (workflow oriented):\n"
-        "Start: create_session -> set_default_params -> create_network.\n"
-        "Curation: remove_bimodal_interactions, remove_undefined_interactions.\n"
-        "Connectivity: check_disconnected_nodes, list_components, candidate_connectors, apply_strategy.\n"
-        "Inspection: list_genes_and_interactions, find_paths, get_references, filter_interactions, network_dimension.\n"
-        "Export: export_network (sif|bnet), list_bnet_files, clean_generated_files.\n"
-        "Sessions: list_sessions, set_default_session, delete_session, status, reset_network.\n"
-        "Guidance: workflow_guide, get_help, get_help_json.\n"
-        "Verbosity: summary|preview|full (use summary in loops). Always create_session() before create_network()."
-    )
+def remove_bimodal_interactions(
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session.")) -> str:
+    """Remove all bimodal (simultaneously activating and inhibiting) edges from the network.
 
-@mcp.tool()
-def get_help_json() -> str:
-    """Machine-readable help describing tools, categories, workflow and strategies.
-
-    Returns a JSON string with keys:
-      version: schema version (increment if structure changes)
-      recommended_workflow: ordered list of key steps
-      categories: mapping category -> list of tools
-      strategies: supported strategy names with short descriptions
-      verbosity: allowed levels and intent
-      notes: assorted planner guidance
-    """
-    data = {
-        "version": 1,
-        "recommended_workflow": [
-            "create_session",
-            "set_default_params",
-            "create_network",
-            "remove_bimodal_interactions",
-            "remove_undefined_interactions",
-            "check_disconnected_nodes",
-            "list_components (if disconnected)",
-            "candidate_connectors",
-            "apply_strategy",
-            "list_genes_and_interactions",
-            "find_paths",
-            "export_network",
-            "(MaBoSS simulation)",
-            "refine (filter_interactions / get_references / apply_strategy)",
-            "finalize for PhysiCell"
-        ],
-        "categories": {
-            "sessions": ["create_session","list_sessions","set_default_session","delete_session","status","reset_network"],
-            "build": ["create_network","extend_network","add_gene","remove_gene","remove_interaction","set_default_params"],
-            "curation": ["remove_bimodal_interactions","remove_undefined_interactions"],
-            "connectivity": ["check_disconnected_nodes","list_components","candidate_connectors","apply_strategy"],
-            "inspection": ["network_dimension","list_genes_and_interactions","find_paths","get_references","filter_interactions"],
-            "export": ["export_network","list_bnet_files","clean_generated_files","check_bnet_files_names"],
-            "guidance": ["workflow_guide","get_help","get_help_json"]
-        },
-        "strategies": {
-            "complete_connection": "Expand network to connect seed genes within maxlen constraints.",
-            "connect_as_atopo": "Connect nodes using a chosen atopo strategy (e.g., radial/loop options).",
-            "connect_component": "Bridge two disconnected components by exploring paths up to maxlen.",
-            "connect_network_radially": "Grow network outward from central nodes radially.",
-            "connect_to_upstream_nodes": "Attach upstream regulators for specified nodes (depth/rank limited).",
-            "connect_subgroup": "Densely connect a specified subgroup of nodes."
-        },
-        "verbosity": {
-            "summary": "Token-frugal status only.",
-            "preview": "Truncated tables / partial listings.",
-            "full": "Expanded context (first 100 rows for large tables)."
-        },
-        "notes": [
-            "Always explicitly call create_session before create_network to avoid reusing stale state.",
-            "Use candidate_connectors before heavy apply_strategy invocations to estimate benefit.",
-            "For iterative refinement loops prefer verbosity='summary' until you need detail.",
-            "Export only supports 'sif' and 'bnet' intentionally (keep scope focused).",
-            "After export_network(format='bnet') hand the .bnet to MaBoSS for simulation.",
-            "Edge list caching is session-scoped and invalidated automatically on mutations." 
-        ]
-    }
-    return json.dumps(data, ensure_ascii=False)
-
-@mcp.tool()
-def remove_bimodal_interactions(session_id: Optional[str] = None) -> str:
-    """
-    Remove all 'bimodal' interactions from the current network object in memory.
-    Returns:
-        str: Status message.
+    Bimodal interactions are ambiguous and cause contradictory Boolean rules in BNET export.
+    Run this as part of the standard curation step after create_network().
     """
     sess, network = _session_network(session_id)
     if network is None:
@@ -801,16 +501,18 @@ def remove_bimodal_interactions(session_id: Optional[str] = None) -> str:
         return "No 'Effect' column found in network.edges."
     before = len(network.edges)
     network.remove_bimodal_interactions()
+    _invalidate(sess)
     after = len(network.edges)
     removed = before - after
     return f"Removed {removed} bimodal interactions from the network."
 
 @mcp.tool()
-def remove_undefined_interactions(session_id: Optional[str] = None) -> str:
-    """
-    Remove all 'undefined' interactions from the current network object in memory.
-    Returns:
-        str: Status message.
+def remove_undefined_interactions(
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session.")) -> str:
+    """Remove all edges whose Effect is 'undefined' (unknown sign) from the network.
+
+    Undefined interactions cannot be mapped to Boolean activations or inhibitions.
+    Run after remove_bimodal_interactions() in the standard curation sequence.
     """
     sess, network = _session_network(session_id)
     if network is None:
@@ -819,122 +521,62 @@ def remove_undefined_interactions(session_id: Optional[str] = None) -> str:
         return "No 'Effect' column found in network.edges."
     before = len(network.edges)
     network.remove_undefined_interactions()
+    _invalidate(sess)
     after = len(network.edges)
     removed = before - after
     return f"Removed {removed} undefined interactions from the network."
 
 
 @mcp.tool()
-def list_bnet_files(folder_path: str = "exports") -> list:
-    """
-    List all .bnet files in the specified folder.
-    Args:
-        folder_path (str): Path to the folder to search for .bnet files. Defaults to current directory.
-    Returns:
-        list: List of .bnet file names found in the folder.
-    """
-    bnet_files = [os.path.basename(f) for f in glob.glob(os.path.join(folder_path, "*.bnet"))]
-    return bnet_files
-
-def download_signor_database():
-    """
-    Download the SIGNOR database from the specified URL and save it to the current directory.
-    Returns:
-        str: Status message indicating success or failure.
-    """
-    url = "https://signor.uniroma2.it/API/getHumanData.php"
-    try:
-        r = requests.get(url)
-        r.raise_for_status()  # Raise an error for bad responses
-        output_file = "SIGNOR_Human.tsv"
-        with open(output_file, 'wb') as f:
-            f.write(r.content)
-        return "SIGNOR database downloaded successfully."
-    except requests.RequestException as e:
-        return f"Error downloading SIGNOR database: {str(e)}"
-
-def clean_bnet_headers(folder_path: str = ".") -> str:
-    """
-    Remove the first two lines from any .bnet file in the specified folder if they are:
-    '# model in BoolNet format' and 'targets, factors'.
-    Args:
-        folder_path (str): Path to the folder to clean .bnet files. Defaults to current directory.
-    Returns:
-        str: Status message listing cleaned files.
-    """
-    cleaned_files = []
-    for file_path in glob.glob(os.path.join(folder_path, "*.bnet")):
-        with open(file_path, 'r') as file:
-            lines = file.readlines()
-        if len(lines) >= 2 and lines[0].strip() == "# model in BoolNet format" and lines[1].strip() == "targets, factors":
-            with open(file_path, 'w') as file:
-                file.writelines(lines[2:])
-            cleaned_files.append(os.path.basename(file_path))
-    if cleaned_files:
-        return f"Cleaned headers from: {', '.join(cleaned_files)}"
-    else:
-        return "No .bnet files needed cleaning."
-    
-@mcp.tool()
-def check_bnet_files_names(folder_path: str = "exports") -> str:
-    """
-    When the user asks to check for .bnet files,
-    or asks for the names of .bnet files in a specific folder,
-    or simply asks to list .bnet files,
-    this function checks for .bnet files in the specified folder.
-    If the folder path is not specified, it defaults to the current directory.
-    If the user asks for .bnet files, it returns a list of their names.
-    If the user asks for the existence of .bnet files, it checks if any .bnet files exist in the folder.
-    If no .bnet files are found, it returns a message indicating that no files were found.
-    If .bnet files are found, it returns their names.
-    If an error occurs during the check, it returns an error message.
-    Args:
-        folder_path (str): Path to the folder to check for .bnet files. Defaults to current directory.
-    Returns:
-        str: Names of .bnet files or a message indicating no files found.
-    """
-    bnet_files = glob.glob(os.path.join(folder_path, "*.bnet"))
-    
-    if not bnet_files:
-        return "No .bnet files found in the specified folder."
-
-    file_list = [os.path.basename(f) for f in bnet_files]
-    return "Found .bnet files:\n" + "\n".join(file_list)
+def list_bnet_files(
+        session_id: Optional[str] = Field(None, description="Session ID to query; omit to use the active/default session.")) -> str:
+    """List names of all .bnet files in the session artifact directory (newline-separated)."""
+    sess = ensure_session(session_id)
+    art_dir = get_artifact_dir(_SERVER_ROOT, sess.session_id)
+    files = [f.name for f in art_dir.glob("*.bnet")]
+    if not files:
+        return f"No .bnet files found in session {sess.session_id} artifact directory."
+    return "\n".join(files)
 
 @mcp.tool()
-def check_disconnected_nodes(session_id: Optional[str] = None) -> str:
-    """
-    When the user asks to check for disconnected nodes in the current network,
-    or asks for nodes that are not connected to any edges,
-    or simply asks for disconnected nodes,
-    this function checks for nodes in the network that do not have any edges connected to them.
-    If no network exists, it prompts the user to create one first.
-    If all nodes are connected, it returns a message indicating that.
-    If there are disconnected nodes, it returns a list of those nodes.
-    Returns:
-        str: List of disconnected nodes or a message indicating all nodes are connected.    
-    """
+def check_disconnected_nodes(
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session.")) -> str:
+    """List any nodes in the network that have no edges (isolated nodes)."""
     sess, network = _session_network(session_id)
     if network is None:
         return E_NO_NET
     
-    all_nodes = set(network.nodes["Uniprot"].tolist())
-    connected_nodes = set(network.edges["source"].tolist()) | set(network.edges["target"].tolist())
-    disconnected_nodes = all_nodes - connected_nodes
-    disconnected_nodes = [node for node in disconnected_nodes if pd.notna(node) and node != ""]
+    u2s, s2u = _get_translators(network)
     
-    if not disconnected_nodes:
+    all_nodes = set(network.nodes["Uniprot"].tolist())
+    if is_connected(network):
+        return "All nodes are connected."
+        
+    connected_nodes = set(network.edges["source"].tolist()) | set(network.edges["target"].tolist())
+    disconnected_uniprot = all_nodes - connected_nodes
+    
+    disconnected_uniprot = [node for node in disconnected_uniprot if pd.notna(node) and node != ""]
+    
+    if not disconnected_uniprot:
         return "All nodes are connected."
     
-    return "Disconnected nodes:\n" + "\n".join(disconnected_nodes)
+    # If a Uniprot ID lacks a symbol, we fall back to showing the Uniprot ID
+    disconnected_symbols = [u2s.get(uid, uid) for uid in disconnected_uniprot]
+    
+    disconnected_symbols.sort()
+    
+    return "Disconnected nodes (Gene Symbols):\n" + "\n".join(disconnected_symbols)
 
 @mcp.tool()
-def get_references(node1: str, node2: str = None, session_id: Optional[str] = None, verbosity: str = DEFAULT_VERBOSITY) -> str:
-    """
-    Retrieve references for interactions involving a node (or between two nodes).
-    - If only node1 is provided: show all interactions (edges) where node1 is source or target, with their references.
-    - If both node1 and node2 are provided: show only interactions between node1 and node2 (any direction), with references.
-    Returns a Markdown table with columns: source, target, effect, references (truncated to first 5, with count if more).
+def get_references(
+        node1: Annotated[str, Field(description="Gene symbol. Returns all edges where this gene is source or target.")],
+        node2: Optional[str] = Field(None, description="Second gene symbol. When provided, returns only edges between node1 and node2 (either direction)."),
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary' (count only), 'preview'/'full' (Markdown table).")) -> str:
+    """Show literature references for interactions involving one or two genes.
+
+    References are truncated to the first 5 per edge with a count of remaining.
+    Useful for assessing interaction evidence before pruning.
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
@@ -974,8 +616,15 @@ def get_references(node1: str, node2: str = None, session_id: Optional[str] = No
     return md
 
 @mcp.tool()
-def extend_network(genes: List[str], session_id: Optional[str] = None, verbosity: str = DEFAULT_VERBOSITY, autoconnect: bool = True) -> str:
-    """Add multiple genes; optionally rerun completion once at end."""
+def extend_network(
+        genes: Annotated[List[str], Field(description="Gene symbols to add (e.g. ['EGFR', 'AKT1']).")],
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary', 'preview', or 'full'."),
+        autoconnect: bool = Field(True, description="Re-run complete_connection with session defaults after adding all genes.")) -> str:
+    """Add multiple genes to the network in one call, optionally re-running connection completion.
+
+    More efficient than calling add_gene() in a loop.
+    """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
     if network is None:
@@ -999,27 +648,32 @@ def extend_network(genes: List[str], session_id: Optional[str] = None, verbosity
     return f"Added {added}/{len(genes)} genes. Autoconnect={'yes' if autoconnect else 'no'}."
 
 @mcp.tool()
-def set_default_params(max_len: Optional[int] = None,
-                       algorithm: Optional[str] = None,
-                       only_signed: Optional[bool] = None,
-                       connect_with_bias: Optional[bool] = None,
-                       consensus: Optional[bool] = None,
-                       session_id: Optional[str] = None) -> str:
-    """Update session default completion parameters used for future autoconnect operations."""
+def set_default_params(
+        max_len: Optional[int] = Field(None, description="Default maximum path length for complete_connection calls (1-4)."),
+        algorithm: Optional[str] = Field(None, description="Default path-search algorithm: 'bfs' or 'dfs'."),
+        only_signed: Optional[bool] = Field(None, description="Default signed-only filter for complete_connection."),
+        connect_with_bias: Optional[bool] = Field(None, description="Default activation-bias preference."),
+        consensus: Optional[bool] = Field(None, description="Default multi-source consensus requirement."),
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session.")) -> str:
+    """Persist completion parameters in the session so extend_network() and add_gene(autoconnect=True) reuse them."""
     sess = ensure_session(session_id)
     sess.update_default_params(max_len=max_len, algorithm=algorithm, only_signed=only_signed,
                                connect_with_bias=connect_with_bias, consensus=consensus)
     return "Defaults updated." 
 
 @mcp.tool()
-def filter_interactions(effect: Optional[List[str]] = None,
-                        source: Optional[str] = None,
-                        target: Optional[str] = None,
-                        session_id: Optional[str] = None,
-                        verbosity: str = DEFAULT_VERBOSITY,
-                        format: str = 'markdown',
-                        max_rows: int = 50) -> str:
-    """Filter interactions by effect type and/or source/target. Supports markdown or json output."""
+def filter_interactions(
+        effect: Optional[List[str]] = Field(None, description="Effect types to keep, e.g. ['stimulation', 'inhibition']. Omit to include all effects."),
+        source: Optional[str] = Field(None, description="Keep only edges where the source matches this gene symbol."),
+        target: Optional[str] = Field(None, description="Keep only edges where the target matches this gene symbol."),
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary' (count), 'preview'/'full' (Markdown table)."),
+        format: str = Field("markdown", description="Output format: 'markdown' (default) or 'json'."),
+        max_rows: int = Field(50, description="Maximum rows returned in preview mode.")) -> str:
+    """Filter and display interactions by effect type, source gene, or target gene.
+
+    Non-destructive - does not modify the network; use remove_interaction() to permanently delete edges.
+    """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
     if network is None:
@@ -1046,19 +700,22 @@ def filter_interactions(effect: Optional[List[str]] = None,
     return table + (" (truncated)" if truncated else "")
 
 @mcp.tool()
-def create_session() -> str:
-    """Create a new modelling session (preferred first call).
+def create_session(
+        label: Optional[str] = Field(None, description="Optional human-readable label for this session (e.g. 'TP53-MYC cancer'). Stored on disk so the session can be rediscovered after a server restart.")) -> str:
+    """Create a new isolated modelling session (always call before create_network).
 
-    Explicit session creation prevents accidental reuse of an old default network when an
-    autonomous planner starts a fresh hypothesis. Each session stores its own Network and
-    default autoconnect parameters (see set_default_params()).
+    Each session holds its own Network object and default completion parameters.
+    Prevents accidental reuse of a previous network when starting a new hypothesis.
+    A unique UUID is assigned — use it in all subsequent tool calls.
     """
     sid = session_manager.create_session(set_as_default=False)
-    return f"Created session: {sid}"
+    write_session_meta(_SERVER_ROOT, sid, server_name="NeKo", label=label)
+    label_info = f" ({label})" if label else ""
+    return f"Created session: {sid}{label_info}"
 
 @mcp.tool()
 def list_sessions() -> str:
-    """List active sessions with whether they have a network and basic size metrics."""
+    """List all active sessions with network presence and basic node/edge counts."""
     data = session_manager.list_sessions()
     if not data:
         return "No sessions."
@@ -1068,20 +725,52 @@ def list_sessions() -> str:
     return "\n".join(lines)
 
 @mcp.tool()
-def set_default_session(session_id: str) -> str:
+def list_artifact_sessions() -> str:
+    """List all NeKo sessions that have artifact files on disk (including past server runs).
+
+    Unlike list_sessions() which only shows in-memory sessions, this scans the
+    artifacts/ directory and reads session_meta.json files, so previously created
+    sessions are visible even after a server restart.
+
+    Use the returned session_id and file paths to resume earlier work, e.g.:
+      create_network(sif_file='/path/to/artifacts/<uuid>/Network.sif')
+    """
+    sessions = _list_artifact_sessions_on_disk(_SERVER_ROOT, server_name="NeKo")
+    if not sessions:
+        return "No artifact sessions found on disk."
+    lines = ["## NeKo Artifact Sessions (on disk)\n"]
+    for s in sessions:
+        sid = s["session_id"]
+        label = s.get("label") or ""
+        created = s.get("created_at", "")[:19].replace("T", " ")  # trim to YYYY-MM-DD HH:MM:SS
+        files = s.get("files", [])
+        lines.append(f"- **{sid}**" + (f" ({label})" if label else ""))
+        if created:
+            lines.append(f"  Created: {created} UTC")
+        if files:
+            lines.append(f"  Files: {', '.join(files)}")
+        else:
+            lines.append("  Files: (none)")
+    return "\n".join(lines)
+
+@mcp.tool()
+def set_default_session(
+        session_id: Annotated[str, Field(description="Session ID to make the active default; used when session_id is omitted in subsequent tool calls.")]) -> str:
     """Set the default session used when session_id is omitted in other tool calls."""
     ok = session_manager.set_default(session_id)
     return "Default set." if ok else "Session not found."
 
 @mcp.tool()
-def delete_session(session_id: str) -> str:
-    """Delete a session and its network (irreversible)."""
+def delete_session(
+        session_id: Annotated[str, Field(description="Session ID to permanently delete (irreversible).")]) -> str:
+    """Permanently delete a session and its in-memory network."""
     ok = session_manager.delete_session(session_id)
     return "Deleted." if ok else "Session not found."
 
 @mcp.tool()
-def status(session_id: Optional[str] = None) -> str:
-    """Compact session summary (nodes, edges) or note absence of network."""
+def status(
+        session_id: Optional[str] = Field(None, description="Session ID; omit to query the active/default session.")) -> str:
+    """Return a one-line session summary: session ID, node count, edge count."""
     sess, network = _session_network(session_id)
     if network is None:
         return f"Session {sess.session_id}: no network."
@@ -1089,249 +778,261 @@ def status(session_id: Optional[str] = None) -> str:
     edges = len(df) if df is not None else 0
     return f"Session {sess.session_id}: nodes={len(network.nodes)} edges={edges}."
 
-@mcp.tool()
-def workflow_guide() -> str:
-    """Return recommended end-to-end workflow (NeKo -> MaBoSS -> PhysiCell)."""
-    return (
-        "Workflow:\n"
-        "1. create_session()\n"
-        "2. set_default_params(max_len=2, only_signed=True, consensus=True)\n"
-        "3. create_network([...TNF pathway genes...], database='omnipath')\n"
-        "4. remove_bimodal_interactions(); remove_undefined_interactions()\n"
-        "5. check_disconnected_nodes(); if disconnected -> list_components(); candidate_connectors(); apply_strategy('complete_connection')\n"
-        "6. list_genes_and_interactions(verbosity='preview'); find_paths('TNF','CASP3')\n"
-        "7. export_network(format='bnet') -> MaBoSS run (threads=10)\n"
-        "8. Evaluate & refine: filter_interactions(), get_references(), apply_strategy(), pruning\n"
-        "9. Finalize -> PhysiCell integration.\n"
-        "Tips: create_session() first; use verbosity='summary' in loops; candidate_connectors() before heavy strategies." )
-
 # ===== Component & Strategy Tools =====
 @mcp.tool()
-def list_components(session_id: Optional[str] = None, verbosity: str = DEFAULT_VERBOSITY, format: str = 'markdown') -> str:
-    """List connected components with size, average degree and sample nodes.
+def list_components(
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary' (counts), 'preview'/'full' (per-component stats)."),
+        format: str = Field("markdown", description="Output format: 'markdown' (default) or 'json'.")) -> str:
+    """List connected components with size, average degree, and sample nodes.
 
-    Args:
-        session_id: Optional session identifier.
-        verbosity: summary|preview|full controls output length.
-        format: 'markdown' (default) or 'json'.
-    Returns:
-        Component statistics (string / JSON-like string).
+    Use this after check_disconnected_nodes() to understand the component structure
+    before choosing a strategy in apply_strategy().
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
     if network is None:
         return E_NO_NET
+    
     comps = _compute_components(network)
     if not comps:
-        return "No components (empty network or single component)."
-    # Degree map
-    try:
-        df = network.convert_edgelist_into_genesymbol()
-    except Exception:
-        df = None
+        return "No components (empty network)."
+    
     deg = {}
-    if df is not None and not df.empty:
-        for _, r in df.iterrows():
-            s = r['source']; t = r['target']
-            deg[s] = deg.get(s, 0) + 1
-            deg[t] = deg.get(t, 0) + 1
+    try:
+        sources = network.edges["source"].tolist()
+        targets = network.edges["target"].tolist()
+        for s, t in zip(sources, targets):
+            if pd.notna(s) and s != "":
+                s_str = str(s)
+                deg[s_str] = deg.get(s_str, 0) + 1
+            if pd.notna(t) and t != "":
+                t_str = str(t)
+                deg[t_str] = deg.get(t_str, 0) + 1
+    except Exception:
+        pass
+
     data = []
     for idx, comp in enumerate(comps):
         dvals = [deg.get(n, 0) for n in comp]
         avg_d = round(sum(dvals)/len(dvals), 2) if dvals else 0
         data.append({"id": idx, "size": len(comp), "avg_degree": avg_d, "sample": comp[:5]})
+        
     if format == 'json':
         return str(data)
+        
     if verbosity == 'summary':
-        return f"Components={len(comps)} largest={max(len(c) for c in comps)}. {SUMMARY_HINT}"
+        return f"Components={len(comps)} largest={max((len(c) for c in comps), default=0)}. {SUMMARY_HINT}"
+        
     lines = ["Components:"]
     for row in data:
         lines.append(f"- {row['id']}: size={row['size']} avg_deg={row['avg_degree']} sample={row['sample']}")
     return "\n".join(lines)
 
 @mcp.tool()
-def candidate_connectors(method: str = 'hubs', top_k: int = 10, session_id: Optional[str] = None, format: str = 'markdown', verbosity: str = DEFAULT_VERBOSITY) -> str:
-    """Suggest nodes or parameter relaxations that could bridge components.
+def candidate_connectors(
+        method: str = Field("hubs", description="Suggestion strategy: 'hubs' (rank high-degree nodes), 'relax_max_len' (simulate +1 max_len), 'unsigned' (simulate allowing unsigned interactions)."),
+        top_k: int = Field(10, description="Number of hub genes to report when method='hubs'."),
+        session_id: Optional[str] = Field(None, description="Session ID; omit to use the active/default session."),
+        format: str = Field("markdown", description="Output format: 'markdown' (default) or 'json'."),
+        verbosity: str = Field(DEFAULT_VERBOSITY, description="Output detail level: 'summary', 'preview', or 'full'.")) -> str:
+    """Suggest nodes or parameter relaxations that could bridge disconnected components.
 
-    Methods:
-        hubs          : rank high-degree nodes.
-        relax_max_len : simulate increasing maxlen by +1 (estimate new edges).
-        unsigned      : simulate allowing unsigned interactions.
-    Args:
-        method: Strategy for suggestions.
-        top_k: Number of hub genes to report when method='hubs'.
-    Returns:
-        Markdown or JSON-like string with suggestions and rationale.
+    Run before applying a connection strategy to estimate the benefit without committing to changes.
+    Outputs Gene Symbols for readability.
     """
     verbosity = normalize_verbosity(verbosity)
     sess, network = _session_network(session_id)
     if network is None:
         return E_NO_NET
+        
     method = method.lower()
-    try:
-        df = network.convert_edgelist_into_genesymbol()
-    except Exception:
-        df = None
-    if df is None or df.empty:
-        return "No data for suggestions."
+    
+    u2s, _ = _get_translators(network)
+    
     suggestions = []
     rationale = ''
+    
+    # --- HUBS METHOD ---
     if method == 'hubs':
         deg = {}
-        for _, r in df.iterrows():
-            s = r['source']; t = r['target']
-            deg[s] = deg.get(s, 0) + 1
-            deg[t] = deg.get(t, 0) + 1
-        maxd = max(deg.values()) if deg else 1
-        ranked = sorted(deg.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        suggestions = [{"gene": g, "score": round(d/maxd, 3)} for g, d in ranked]
-        rationale = 'High-degree nodes may help bridge components.'
-    elif method in ('relax_max_len','unsigned'):
-        import tempfile
         try:
-            tmpdir = tempfile.mkdtemp()
-            sif_path = os.path.join(tmpdir, 'tmp.sif')
-            Exports(network).export_sif(sif_path)
-            net_copy = Network(sif_file=sif_path, resources='omnipath')
+            # Calculate degrees natively using Uniprot IDs from the edges dataframe
+            sources = network.edges["source"].tolist()
+            targets = network.edges["target"].tolist()
+            for s, t in zip(sources, targets):
+                if pd.notna(s) and s != "": deg[s] = deg.get(s, 0) + 1
+                if pd.notna(t) and t != "": deg[t] = deg.get(t, 0) + 1
+        except Exception:
+            pass
+            
+        if not deg:
+            return "No edge data available to calculate hubs."
+            
+        maxd = max(deg.values()) if deg else 1
+        
+        # Sort by degree and take top_k
+        ranked_uniprot = sorted(deg.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        
+        # TRANSLATE BACK TO GENE SYMBOLS for the LLM
+        for uid, d in ranked_uniprot:
+            symbol = u2s.get(uid, str(uid)) # Fallback to Uniprot ID if no symbol exists
+            suggestions.append({"gene": symbol, "score": round(d/maxd, 3), "raw_degree": d})
+            
+        rationale = 'High-degree nodes (hubs) may naturally act as bridges between isolated components.'
+
+    # --- SIMULATION METHODS ---
+    elif method in ('relax_max_len', 'unsigned'):
+        try:
+            # IN-MEMORY COPY
+            net_copy = copy.deepcopy(network)
             params = sess.get_completion_params()
+            
             if method == 'relax_max_len':
                 params['maxlen'] = params.get('maxlen', 2) + 1
+                rationale = f"Simulating connection expansion by increasing max path length to {params['maxlen']}."
             if method == 'unsigned':
                 params['only_signed'] = False
+                rationale = "Simulating connection expansion by allowing unsigned (unverified direction) interactions."
+                
             before_e = len(net_copy.edges)
+            
+            # Run the completion strategy on the dummy copy
             net_copy.complete_connection(**params)
             after_e = len(net_copy.edges)
-            suggestions = [{"predicted_new_edges": after_e - before_e, "new_maxlen": params.get('maxlen'), "only_signed": params.get('only_signed')}]
-            rationale = 'Relaxation simulation.'
+            
+            suggestions = [{
+                "predicted_new_edges": after_e - before_e, 
+                "simulated_maxlen": params.get('maxlen'), 
+                "simulated_only_signed": params.get('only_signed')
+            }]
+            
         except Exception as e:
             return f"Simulation failed: {e}"
     else:
-        return 'Unsupported method. Use hubs|relax_max_len|unsigned'
+        return "Unsupported method. Please use 'hubs', 'relax_max_len', or 'unsigned'."
+
+    # --- FORMAT OUTPUT ---
     if format == 'json':
         return str({"method": method, "suggestions": suggestions, "rationale": rationale})
+        
     if verbosity == 'summary':
         return f"{method}: {len(suggestions)} suggestions. {SUMMARY_HINT}"
+        
     lines = [f"Candidate connectors ({method}):"]
     for s in suggestions:
         if 'gene' in s:
-            lines.append(f"- {s['gene']} score={s['score']}")
+            lines.append(f"- **{s['gene']}**: relative_score={s['score']} (edges={s['raw_degree']})")
         else:
-            lines.append(f"- {s}")
+            lines.append(f"- Predicted new edges: {s.get('predicted_new_edges', 0)}")
+            lines.append(f"- Parameters simulated: max_len={s.get('simulated_maxlen')}, only_signed={s.get('simulated_only_signed')}")
+            
     if rationale:
-        lines.append(f"Rationale: {rationale}")
+        lines.append(f"\n*Rationale: {rationale}*")
+        
     return "\n".join(lines)
 
 @mcp.tool()
-def apply_strategy(strategy: str,
-                   session_id: Optional[str] = None,
-                   verbosity: str = DEFAULT_VERBOSITY,
-                   max_len: Optional[int] = None,
-                   maxlen: Optional[int] = None,
-                   algorithm: str = 'bfs',
-                   minimal: bool = True,
-                   only_signed: Optional[bool] = None,
-                   consensus: Optional[bool] = None,
-                   connect_with_bias: bool = False,
-                   strategy_mode: Optional[str] = None,
-                   loops: bool = False,
-                   direction: Optional[str] = None,
-                   outputs: Optional[List[str]] = None,
-                   nodes_to_connect: Optional[List[str]] = None,
-                   depth: int = 1,
-                   rank: int = 1,
-                   comp_a: Optional[int] = None,
-                   comp_b: Optional[int] = None,
-                   subgroup: Optional[List[str]] = None,
-                   mode: str = 'OUT') -> str:
-    """Apply a NeKo connection/completion strategy to the current network.
-
-    Supported strategies:
-        complete_connection, connect_as_atopo, connect_component, connect_network_radially,
-        connect_to_upstream_nodes, connect_subgroup.
-    Use candidate_connectors first to gauge potential benefits.
-    Returns a brief status (verbosity='summary') or edge count after application.
-    """
-    verbosity = normalize_verbosity(verbosity)
+def bridge_components(
+        comp_a: List[str] = Field(..., description="First list of nodes (Gene Symbols) to bridge."),
+        comp_b: List[str] = Field(..., description="Second list of nodes (Gene Symbols) to bridge."),
+        max_len: int = Field(2, description="Maximum path length for connecting edges."),
+        mode: str = Field("OUT", description="Edge direction mode: 'OUT' or 'IN'."),
+        only_signed: Optional[bool] = Field(None, description="Restrict to signed interactions."),
+        consensus: Optional[bool] = Field(None, description="Require multi-source consensus."),
+        session_id: Optional[str] = Field(None, description="Session ID.")) -> str:
+    """Connect two specific disconnected components or subgroups of genes together."""
     sess, network = _session_network(session_id)
-    if network is None:
-        return E_NO_NET
-    strat = strategy.lower()
-    params_defaults = sess.get_completion_params()
-    if only_signed is None:
-        only_signed = params_defaults.get('only_signed', True)
-    if consensus is None:
-        consensus = params_defaults.get('consensus', True)
-    if maxlen is None and max_len is not None:
-        maxlen = max_len
-    changed = False
+    if network is None: return E_NO_NET
+    
+    params = sess.get_completion_params()
+    only_signed = only_signed if only_signed is not None else params.get('only_signed', True)
+    consensus = consensus if consensus is not None else params.get('consensus', True)
+
+    # 1. TRANSLATION LAYER: Gene Symbols -> Uniprot
+    _, s2u = _get_translators(network)
+    uniprot_a = [s2u.get(gene, gene) for gene in comp_a] # Fallback to input if not found
+    uniprot_b = [s2u.get(gene, gene) for gene in comp_b]
+
+    # 2. BACKEND MATH: Run strictly in Uniprot IDs
     try:
-        if strat == 'complete_connection':
-            strategy_complete_connection(network,
-                                         maxlen=maxlen if maxlen is not None else params_defaults.get('maxlen', 2),
-                                         algorithm=algorithm,
-                                         minimal=minimal,
-                                         only_signed=only_signed,
-                                         consensus=consensus,
-                                         connect_with_bias=connect_with_bias)
-            changed = True
-        elif strat == 'connect_as_atopo':
-            connect_as_atopo(network,
-                             strategy=strategy_mode,
-                             max_len=maxlen if maxlen is not None else 1,
-                             loops=loops,
-                             outputs=outputs,
-                             only_signed=only_signed,
-                             consensus=consensus)
-            changed = True
-        elif strat == 'connect_component':
-            comps = _compute_components(network)
-            if comp_a is None or comp_b is None:
-                return 'comp_a and comp_b required'
-            if comp_a >= len(comps) or comp_b >= len(comps):
-                return 'Component index out of range'
-            strategy_connect_component(network,
-                                       comps[comp_a],
-                                       comps[comp_b],
-                                       maxlen=maxlen if maxlen is not None else 2,
-                                       mode=mode,
-                                       only_signed=only_signed,
-                                       consensus=consensus)
-            changed = True
-        elif strat == 'connect_network_radially':
-            connect_network_radially(network,
-                                      max_len=maxlen if maxlen is not None else 1,
-                                      direction=direction,
-                                      loops=loops,
-                                      consensus=consensus,
-                                      only_signed=only_signed)
-            changed = True
-        elif strat == 'connect_to_upstream_nodes':
-            connect_to_upstream_nodes(network,
-                                       nodes_to_connect=nodes_to_connect,
-                                       depth=depth,
-                                       rank=rank,
-                                       only_signed=only_signed,
-                                       consensus=consensus)
-            changed = True
-        elif strat == 'connect_subgroup':
-            if not subgroup:
-                return 'subgroup required'
-            connect_subgroup(network,
-                              group=subgroup,
-                              maxlen=maxlen if maxlen is not None else 1,
-                              only_signed=only_signed,
-                              consensus=consensus)
-            changed = True
-        else:
-            return 'Unsupported strategy'
+        strategy_connect_component(network, uniprot_a, uniprot_b, 
+                                   maxlen=max_len, mode=mode, 
+                                   only_signed=only_signed, consensus=consensus)
+        _invalidate(sess)
+        
+        df = sess.get_edges_df()
+        return f"Successfully bridged components. Network now has {len(df) if df is not None else 0} edges."
+    except Exception as e:
+        return f"Bridging failed: {e}"
+
+@mcp.tool()
+def connect_targeted_nodes(
+        strategy: Annotated[str, Field(description="Targeted strategy.", json_schema_extra={"enum": ["connect_to_upstream_nodes", "connect_subgroup", "connect_as_atopo"]})],
+        nodes: List[str] = Field(..., description="Target genes (Gene Symbols) to connect or expand."),
+        outputs: Optional[List[str]] = Field(None, description="[connect_as_atopo] Output gene symbols to anchor topology."),
+        max_len: int = Field(1, description="Max path length or upstream depth."),
+        strategy_mode: Optional[str] = Field(None, description="[connect_as_atopo] Sub-mode passed to atopo (e.g., 'hierarchy')."),
+        only_signed: Optional[bool] = Field(None),
+        consensus: Optional[bool] = Field(None),
+        session_id: Optional[str] = None) -> str:
+    """Apply strategies targeting specific genes (upstream regulators, dense subgroups, or topological mapping)."""
+    sess, network = _session_network(session_id)
+    if network is None: return E_NO_NET
+    
+    params = sess.get_completion_params()
+    osgn = only_signed if only_signed is not None else params.get('only_signed', True)
+    cons = consensus if consensus is not None else params.get('consensus', True)
+
+    # 1. TRANSLATION LAYER: Gene Symbols -> Uniprot
+    _, s2u = _get_translators(network)
+    uniprot_nodes = [s2u.get(n, n) for n in nodes]
+    uniprot_outputs = [s2u.get(o, o) for o in outputs] if outputs else None
+
+    # 2. BACKEND MATH
+    try:
+        if strategy == "connect_to_upstream_nodes":
+            connect_to_upstream_nodes(network, nodes_to_connect=uniprot_nodes, depth=max_len, only_signed=osgn, consensus=cons)
+        elif strategy == "connect_subgroup":
+            connect_subgroup(network, group=uniprot_nodes, maxlen=max_len, only_signed=osgn, consensus=cons)
+        elif strategy == "connect_as_atopo":
+            connect_as_atopo(network, strategy=strategy_mode, max_len=max_len, outputs=uniprot_outputs, only_signed=osgn, consensus=cons)
+            
+        _invalidate(sess)
+        return f"Applied {strategy} to targeted nodes."
     except Exception as e:
         return f"Strategy failed: {e}"
-    if changed:
+
+@mcp.tool()
+def apply_global_connection(
+        strategy: Annotated[str, Field(description="Global connection strategy.", json_schema_extra={"enum": ["complete_connection", "connect_network_radially"]})],
+        max_len: int = Field(2, description="Maximum path length to search for connections."),
+        algorithm: str = Field("bfs", description="[complete_connection] Search algorithm: 'bfs' or 'dfs'."),
+        minimal: bool = Field(True, description="[complete_connection] Add only minimum required edges."),
+        direction: str = Field("OUT", description="[connect_network_radially] Growth direction ('OUT' or 'IN')."),
+        only_signed: Optional[bool] = Field(None),
+        consensus: Optional[bool] = Field(None),
+        session_id: Optional[str] = None) -> str:
+    """Apply a global connection strategy across the entire network to resolve missing edges."""
+    sess, network = _session_network(session_id)
+    if network is None: return E_NO_NET
+    
+    params = sess.get_completion_params()
+    osgn = only_signed if only_signed is not None else params.get('only_signed', True)
+    cons = consensus if consensus is not None else params.get('consensus', True)
+
+    # BACKEND MATH (No translation needed for global functions)
+    try:
+        if strategy == "complete_connection":
+            strategy_complete_connection(network, maxlen=max_len, algorithm=algorithm, minimal=minimal, only_signed=osgn, consensus=cons)
+        elif strategy == "connect_network_radially":
+            connect_network_radially(network, max_len=max_len, direction=direction, only_signed=osgn, consensus=cons)
+            
         _invalidate(sess)
-    if verbosity == 'summary':
-        return f"Strategy {strat} applied. {SUMMARY_HINT}"
-    df = sess.get_edges_df() or pd.DataFrame()
-    return f"Strategy {strat} applied. Edges now={len(df)}."
+        df = sess.get_edges_df()
+        return f"Successfully applied global {strategy}. Edges now = {len(df) if df is not None else 0}."
+    except Exception as e:
+        return f"Global strategy failed: {e}"
 
 if __name__ == "__main__":
     mcp.run()

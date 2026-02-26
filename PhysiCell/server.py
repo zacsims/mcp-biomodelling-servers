@@ -35,15 +35,21 @@ import csv
 import json
 import configparser
 from pathlib import Path
-from typing import Any, Optional, Dict, List
+from typing import Annotated, Any, Optional, Dict, List
 from dataclasses import dataclass, field
 import threading
 from threading import Lock
-#from hatch_mcp_server import HatchMCP
+from pydantic import Field
 
-# Add the physicell_config package to Python path  
+# Add the physicell_config package to Python path
 current_dir = Path(__file__).parent
 sys.path.insert(0, str(current_dir))
+
+# Make repo root importable for shared artifact_manager
+sys.path.insert(0, str(current_dir.parent))
+from artifact_manager import get_artifact_dir, list_artifacts, clean_artifacts, write_session_meta, list_artifact_sessions as _list_artifact_sessions_on_disk
+
+_SERVER_ROOT = current_dir
 
 from physicell_config import PhysiCellConfig
 from physicell_config.config.embedded_signals_behaviors import (
@@ -232,50 +238,37 @@ def _set_legacy_scenario_context(context):
 # ============================================================================
 
 @mcp.tool()
-def create_session(set_as_default: bool = True, session_name: Optional[str] = None) -> str:
-    """
-    Create a new simulation session for managing PhysiCell configurations.
-    Sessions allow you to work on multiple simulations independently.
-    
-    Args:
-        set_as_default: Whether to set this as the default session for subsequent operations
-        session_name: Optional human-readable name for cross-server linking (e.g., "gastric_cancer_v1")
-    
+def create_session(
+    set_as_default: bool = Field(default=True, description="Set this as the default session for subsequent operations."),
+    session_name: Optional[str] = Field(default=None, description="Optional human-readable name for cross-server linking (e.g., 'gastric_cancer_v1')."),
+) -> str:
+    """Create a new PhysiCell simulation session.
+
+    Sessions allow independent work on multiple simulation configurations.
+    Create one before calling any setup tools.
+
     Returns:
-        str: Session ID and instructions
+        str: Session ID and instructions.
     """
     session_id = session_manager.create_session(set_as_default, session_name)
 
     result = f"**Session created:** {session_id[:8]}..."
     if session_name:
         result += f" ({session_name})"
-    result += "\n\n"
-    result += f"**IMPORTANT: Follow this workflow in order:**\n\n"
-    result += f"**Phase 1 - Configure Simulation:**\n"
-    result += f"1. `analyze_biological_scenario()` - Describe your biological scenario\n"
-    result += f"2. `create_simulation_domain()` - Set domain size and simulation time\n"
-    result += f"3. `add_single_substrate()` - Add substrates (oxygen, glucose, etc.)\n"
-    result += f"4. `add_single_cell_type()` - Add cell types\n"
-    result += f"5. `add_single_cell_rule()` - Define cell behaviors\n\n"
-    result += f"**Phase 2 - Export Configuration:**\n"
-    result += f"6. `export_xml_configuration()` - Export XML config\n"
-    result += f"7. `export_cell_rules_csv()` - Export cell rules\n\n"
-    result += f"**Phase 3 - Run Simulation:**\n"
-    result += f"8. `create_physicell_project()` - Create project directory\n"
-    result += f"9. `compile_physicell_project()` - Compile the project\n"
-    result += f"10. `run_simulation()` - Start simulation\n"
-    result += f"11. `get_simulation_status()` - Monitor progress\n"
-    result += f"12. `generate_simulation_gif()` - Create visualization\n"
+    result += "\n"
+    result += f"**Next steps:**\n"
+    result += f"1. `analyze_biological_scenario()` - Set your biological context\n"
+    result += f"2. `create_simulation_domain()` - Define spatial framework\n"
+    result += f"3. Use `get_workflow_status()` to track progress"
 
     return result
 
 @mcp.tool()
 def list_sessions() -> str:
-    """
-    List all active simulation sessions with their status and progress.
-    
+    """List all active simulation sessions with their status and progress.
+
     Returns:
-        str: Formatted list of sessions with progress information
+        str: Formatted list of sessions with progress information.
     """
     sessions = session_manager.list_sessions()
     
@@ -303,20 +296,48 @@ def list_sessions() -> str:
         
         result += "\n"
     
-    result += "Use `switch_session(session_id)` to switch between sessions."
+    result += "Use `set_default_session(session_id)` to switch between sessions."
     
     return result
 
 @mcp.tool()
-def switch_session(session_id: str) -> str:
+def list_artifact_sessions() -> str:
+    """List all PhysiCell sessions that have artifact files on disk (including past server runs).
+
+    Unlike list_sessions() which only shows in-memory sessions, this scans the
+    artifacts/ directory and reads session_meta.json files, so previously created
+    sessions are visible even after a server restart.
+
+    Use the returned session_id and file paths to resume earlier work, e.g.:
+      load_xml_configuration(xml_path='/path/to/artifacts/<uuid>/PhysiCell_settings.xml')
     """
-    Switch to a different session as the default for subsequent operations.
-    
-    Args:
-        session_id: The ID of the session to switch to (can be shortened to first 8 characters)
-    
+    sessions = _list_artifact_sessions_on_disk(_SERVER_ROOT, server_name="PhysiCell")
+    if not sessions:
+        return "No artifact sessions found on disk."
+    lines = ["## PhysiCell Artifact Sessions (on disk)\n"]
+    for s in sessions:
+        sid = s["session_id"]
+        label = s.get("label") or ""
+        created = s.get("created_at", "")[:19].replace("T", " ")
+        files = s.get("files", [])
+        lines.append(f"- **{sid[:8]}...**" + (f" ({label})" if label else ""))
+        lines.append(f"  Full ID: `{sid}`")
+        if created:
+            lines.append(f"  Created: {created} UTC")
+        if files:
+            lines.append(f"  Files: {', '.join(files)}")
+        else:
+            lines.append("  Files: (none)")
+    return "\n".join(lines)
+
+@mcp.tool()
+def set_default_session(
+    session_id: Annotated[str, Field(description="ID of the session to activate. May be shortened to the first 8 characters.")],
+) -> str:
+    """Switch the default session used by subsequent tool calls.
+
     Returns:
-        str: Confirmation of session switch
+        str: Confirmation of the session switch.
     """
     # Allow partial session IDs
     if len(session_id) == 8:
@@ -339,51 +360,24 @@ def switch_session(session_id: str) -> str:
 
 @mcp.tool()
 def get_workflow_status() -> str:
-    """
-    Get the current workflow status and recommended next steps.
-    
+    """Return the current workflow status and recommended next steps.
+
+    Alias for `get_simulation_summary()` — provides identical information.
+    Prefer `get_simulation_summary()` for new code.
+
     Returns:
-        str: Current progress and next recommended actions
+        str: Progress summary with completed steps and next recommendations.
     """
-    session = get_current_session()
-    if not session:
-        return "No active session. Use `create_session()` to start."
-    
-    progress = session.get_progress_percentage()
-    recommendations = session.get_next_recommended_steps()
-    
-    result = f"## Workflow Status\n\n"
-    result += f"**Session:** {session.session_id[:8]}...\n"
-    result += f"**Progress:** {progress:.0f}%\n\n"
-    
-    # Show completed steps
-    completed_steps = [step.value.replace('_', ' ').title() for step in session.completed_steps]
-    if completed_steps:
-        result += f"**Completed Steps:**\n"
-        for step in completed_steps:
-            result += f"{step}\n"
-        result += "\n"
-    
-    # Show next steps
-    result += f"**Next Recommended Steps:**\n"
-    for i, rec in enumerate(recommendations[:3], 1):
-        result += f"{i}. {rec}\n"
-    
-    if session.scenario_context:
-        result += f"\n**Current Scenario:** {session.scenario_context}"
-    
-    return result
+    return get_simulation_summary()
 
 @mcp.tool()
-def delete_session(session_id: str) -> str:
-    """
-    Delete a simulation session permanently.
-    
-    Args:
-        session_id: The ID of the session to delete
-    
+def delete_session(
+    session_id: Annotated[str, Field(description="The ID of the session to delete permanently.")],
+) -> str:
+    """Delete a simulation session and all its state permanently.
+
     Returns:
-        str: Confirmation of deletion
+        str: Confirmation of deletion.
     """
     success = session_manager.delete_session(session_id)
     if success:
@@ -392,28 +386,26 @@ def delete_session(session_id: str) -> str:
         return "Error: Session not found"
 
 @mcp.tool()
-def set_maboss_context(model_name: str, bnd_file_path: str, cfg_file_path: str,
-                      target_cell_type: str, available_nodes: str = "",
-                      output_nodes: str = "", simulation_results: str = "",
-                      biological_context: str = "") -> str:
-    """
-    Store MaBoSS model context for integration into PhysiCell simulation.
-    This is typically called by the agent after analyzing a MaBoSS model.
-    
-    Args:
-        model_name: Name of the MaBoSS model
-        bnd_file_path: Path to the .bnd boolean network file
-        cfg_file_path: Path to the .cfg configuration file  
-        target_cell_type: Which cell type this model should be integrated into
-        available_nodes: Comma-separated list of available boolean nodes
-        output_nodes: Comma-separated list of output nodes
-        simulation_results: Summary of MaBoSS simulation behavior
-        biological_context: Original biological question/context
-    
+def set_maboss_context(
+    model_name: Annotated[str, Field(description="Name of the MaBoSS model.")],
+    bnd_file_path: Annotated[str, Field(description="Absolute path to the .bnd boolean network file.")],
+    cfg_file_path: Annotated[str, Field(description="Absolute path to the .cfg configuration file.")],
+    target_cell_type: Annotated[str, Field(description="Cell type this boolean model will be integrated into.")],
+    available_nodes: str = Field(default="", description="Comma-separated list of available boolean nodes."),
+    output_nodes: str = Field(default="", description="Comma-separated list of output nodes."),
+    simulation_results: str = Field(default="", description="Summary of MaBoSS simulation behaviour."),
+    biological_context: str = Field(default="", description="Original biological question or context."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Store MaBoSS model context for integration into a PhysiCell simulation.
+
+    Typically called after analysing a MaBoSS model in the MaBoSS server.
+    The stored context is used by `add_physiboss_model()` and `add_physiboss_input_link()`.
+
     Returns:
-        str: Confirmation of context storage
+        str: Confirmation of context storage.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session:
         return "Error: No active session. Use `create_session()` first."
     
@@ -442,15 +434,18 @@ def set_maboss_context(model_name: str, bnd_file_path: str, cfg_file_path: str,
     return result
 
 @mcp.tool()
-def get_maboss_context() -> str:
-    """
-    Get the stored MaBoSS context for the current session.
-    Shows available boolean nodes and simulation results.
-    
+def get_maboss_context(
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session."),
+) -> str:
+    """Return the stored MaBoSS context for the current session.
+
+    Shows the linked boolean model name, file paths, available nodes, and
+    simulation results previously stored via `set_maboss_context()`.
+
     Returns:
-        str: MaBoSS context information
+        str: MaBoSS context information, or a message if none is stored.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session:
         return "Error: No active session."
     
@@ -485,27 +480,26 @@ def get_maboss_context() -> str:
     
     return result
 
-import time
-
 # ============================================================================
 # XML CONFIGURATION LOADING
 # ============================================================================
 
 @mcp.tool()
-def load_xml_configuration(filepath: str, session_name: Optional[str] = None) -> str:
-    """
-    Load an existing PhysiCell XML configuration file into the current session.
-    After loading, use existing tools like configure_cell_parameters() to modify.
-    
-    Args:
-        filepath: Path to the PhysiCell XML configuration file
-        session_name: Optional name for the session (useful for tracking)
-    
+def load_xml_configuration(
+    filepath: Annotated[str, Field(description="Absolute path to the PhysiCell XML configuration file to load.")],
+    session_name: Optional[str] = Field(default=None, description="Optional name for the session, useful for cross-server tracking."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Load an existing PhysiCell XML configuration file into the current session.
+
+    After loading, inspect with `analyze_loaded_configuration()` or modify directly
+    using tools such as `configure_cell_parameters()` and `add_single_cell_rule()`.
+
     Returns:
-        str: Summary of loaded configuration and next steps
+        str: Summary of loaded components and next steps.
     """
     try:
-        session = ensure_session()
+        session = ensure_session(session_id)
         xml_path = Path(filepath)
         
         if not xml_path.exists():
@@ -525,7 +519,6 @@ def load_xml_configuration(filepath: str, session_name: Optional[str] = None) ->
         # Load the XML configuration
         config.load_xml(str(xml_path))
         session.config = config
-        _set_legacy_config(config)  # Backward compatibility
         
         # Update session state
         session.loaded_from_xml = True
@@ -551,15 +544,13 @@ def load_xml_configuration(filepath: str, session_name: Optional[str] = None) ->
         return f"Load error: {str(e)}"
 
 @mcp.tool()
-def validate_xml_file(filepath: str) -> str:
-    """
-    Validate a PhysiCell XML configuration file without loading it.
-    
-    Args:
-        filepath: Path to the XML file to validate
-    
+def validate_xml_file(
+    filepath: Annotated[str, Field(description="Absolute path to the PhysiCell XML file to validate.")],
+) -> str:
+    """Validate a PhysiCell XML configuration file without loading it.
+
     Returns:
-        str: Validation results
+        str: Validation result — valid confirmation or error description.
     """
     try:
         xml_path = Path(filepath)
@@ -575,14 +566,15 @@ def validate_xml_file(filepath: str) -> str:
         return f"Validation error: {str(e)}"
 
 @mcp.tool()
-def analyze_loaded_configuration() -> str:
-    """
-    Show overview of loaded XML configuration with modification instructions.
-    
+def analyze_loaded_configuration(
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session."),
+) -> str:
+    """Show an overview of the loaded XML configuration with modification instructions.
+
     Returns:
-        str: Configuration analysis and next steps
+        str: Configuration summary (domain, substrates, cell types) with tool hints.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config or not session.loaded_from_xml:
         return "No XML configuration loaded. Use load_xml_configuration() first."
     
@@ -622,17 +614,16 @@ def analyze_loaded_configuration() -> str:
     return "\n".join(lines)
 
 @mcp.tool()
-def list_loaded_components(component_type: str = "all") -> str:
-    """
-    List loaded components with details and modification instructions.
-    
-    Args:
-        component_type: "substrates", "cell_types", "physiboss", or "all"
-    
+def list_loaded_components(
+    component_type: str = Field(default="all", description="Filter results: 'substrates', 'cell_types', 'physiboss', or 'all'."),
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session."),
+) -> str:
+    """List components from a loaded XML configuration with details and modification hints.
+
     Returns:
-        str: Detailed component information
+        str: Detailed component information with parameter values and tool hints.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config or not session.loaded_from_xml:
         return "No XML configuration loaded. Use load_xml_configuration() first."
     
@@ -691,55 +682,25 @@ def list_loaded_components(component_type: str = "all") -> str:
 # BIOLOGICAL SCENARIO ANALYSIS
 # ============================================================================
 
-@mcp.resource(
-    uri="docs://tools/analyze_biological_scenario",
-    name="Documentation for analyze_biological_scenario",
-    description="Stores a description of the biological scenario for simulation context.",
-    mime_type="text/markdown"
-)
-def docs_analyze_biological_scenario() -> str:
-    return """
-# Tool: analyze_biological_scenario
-
-Stores the biological scenario/context for this simulation session.  
-Call this first to set the context for parameter choices in later steps.
-
-## Parameters
-- `biological_scenario` (`str`, required): Description of the scenario, e.g. `"Breast cancer cells in hypoxic 3D tissue with immune infiltration."`
-
-## Example
-
-```python
-analyze_biological_scenario(biological_scenario="Breast cancer cells in a 3D hypoxic tissue, infiltrated by CD8 T cells.")
-
-Notes
-
-This does not perform automatic analysis, but stores your description for context-aware setup.
-
-Only one scenario is stored at a time; calling again will overwrite the previous context.
-            """
-
 @mcp.tool()
-def analyze_biological_scenario(biological_scenario: str) -> str:
-    """
-    Store a biological scenario description to provide context for subsequent simulation setup.
-    This context helps inform parameter choices for substrates, cell types, and rules.
-    
-    Args:
-        biological_scenario: Description of the biological scenario or experimental setup
-    
+def analyze_biological_scenario(
+    biological_scenario: Annotated[str, Field(description="Description of the biological scenario or experimental setup (e.g., 'Breast cancer cells in hypoxic 3D tissue with immune infiltration').")],
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Store a biological scenario description to provide context for subsequent simulation setup.
+
+    This context is displayed alongside signal/behavior lists and helps inform parameter choices.
+    Call this before `create_simulation_domain()` to anchor the session to a specific biology.
+
     Returns:
-        str: Confirmation message with stored scenario context
+        str: Confirmation message.
     """
     if not biological_scenario or not biological_scenario.strip():
         return "Error: Biological scenario description cannot be empty"
     
-    session = ensure_session()
+    session = ensure_session(session_id)
     session.scenario_context = biological_scenario.strip()
     session.mark_step_complete(WorkflowStep.SCENARIO_ANALYSIS)
-    
-    # Update legacy global for backward compatibility
-    _set_legacy_scenario_context(biological_scenario.strip())
     
     result = f"**Biological scenario stored:** {biological_scenario}\n"
     result += f"**Next step:** Use `create_simulation_domain()` to set up the spatial framework."
@@ -750,85 +711,69 @@ def analyze_biological_scenario(biological_scenario: str) -> str:
 # SIMULATION SETUP
 # ============================================================================
 
-@mcp.resource(
-    uri="docs://tools/create_simulation_domain",
-    name="Documentation for create_simulation_domain",
-    description="Creates a 3D simulation domain with specified size and time duration.",
-    mime_type="text/markdown"
-)
-def docs_create_simulation_domain() -> str:
-    return """
-# Tool: create_simulation_domain
-
-Sets up the spatial and temporal domain for the simulation.
-
-## Parameters
-- `domain_x` (`float`, required): Domain width in μm (e.g., 3000)
-- `domain_y` (`float`, required): Domain height in μm (e.g., 3000)
-- `domain_z` (`float`, required): Domain depth in μm (e.g., 500)
-- `dx` (`float`, optional): Mesh spacing in μm (default: 20)
-- `max_time` (`float`, optional): Maximum simulation time in minutes (default: 7200 = 5 days)
-
-## Example
-
-```python
-create_simulation_domain(domain_x=3000, domain_y=3000, domain_z=500, dx=20, max_time=7200)
-
-Notes
-
-This should be the first configuration step for every new simulation.
-
-After creating the domain, you can add substrates and cell types.
-"""
-
 @mcp.tool()
-def create_simulation_domain(domain_x: float, domain_y: float, 
-                           domain_z: float, dx: float = 20.0, 
-                           max_time: float = 7200.0) -> str:
-    """
-    Create the spatial and temporal framework for a PhysiCell simulation.
-    This sets up the 3D domain size, mesh resolution, and simulation duration.
-    
-    Args:
-        domain_x: Domain width in micrometers
-        domain_y: Domain height in micrometers  
-        domain_z: Domain depth in micrometers
-        dx: Mesh spacing in micrometers (default: 20)
-        max_time: Maximum simulation time in minutes (default: 7200 = 5 days)
-    
+def create_simulation_domain(
+    domain_x: Annotated[float, Field(description="Domain width in micrometers (e.g., 2000).")],
+    domain_y: Annotated[float, Field(description="Domain height in micrometers (e.g., 2000).")],
+    use_2d: bool = Field(default=True, description="If True (default), creates a quasi-2D simulation. The z thickness is automatically set to the mesh spacing (dx). Set to False for a full 3D simulation and provide domain_z."),
+    domain_z: Optional[float] = Field(default=None, description="Domain depth in micrometers. Required only for 3D simulations (use_2d=False). Ignored in 2D mode."),
+    dx: float = Field(default=20.0, description="Mesh spacing in micrometers. Smaller values increase spatial resolution and computation time. In 2D, also sets the z thickness."),
+    max_time: float = Field(default=7200.0, description="Maximum simulation time in minutes. 7200 = 5 days."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Create the spatial and temporal framework for a PhysiCell simulation.
+
+    Sets up the domain bounds, mesh resolution, and simulation duration.
+    Must be called before adding substrates or cell types.
+    The domain is centred at the origin: bounds run from -x/2 to +x/2 in each axis.
+
+    In 2D mode (`use_2d=True`) the z extent is set to `dx` (one voxel thick)
+    and `set_2D(True)` is applied so PhysiCell treats the simulation as planar.
+
     Returns:
-        str: Success message with domain specifications
+        str: Confirmation with domain specs and next step.
     """
     # Basic validation
-    if domain_x <= 0 or domain_y <= 0 or domain_z <= 0:
+    if domain_x <= 0 or domain_y <= 0:
         return "Error: Domain dimensions must be positive"
     if dx <= 0:
         return "Error: Mesh spacing must be positive"
     if max_time <= 0:
         return "Error: Simulation time must be positive"
-    
-    session = ensure_session()
+
+    # Resolve z dimension
+    if use_2d:
+        domain_z = dx  # one voxel thick
+    else:
+        if domain_z is None:
+            return "Error: domain_z is required for 3D simulations. Set use_2d=True for a planar simulation."
+        if domain_z <= 0:
+            return "Error: domain_z must be positive"
+
+    session = ensure_session(session_id)
     
     # Create new PhysiCell configuration
     session.config = PhysiCellConfig()
     session.config.domain.set_bounds(
         -domain_x/2, domain_x/2,
-        -domain_y/2, domain_y/2, 
+        -domain_y/2, domain_y/2,
         -domain_z/2, domain_z/2
     )
     session.config.domain.set_mesh(dx, dx, dx)
+
+    if use_2d:
+        session.config.domain.set_2D(True)
+
     session.config.options.set_max_time(max_time)
     session.config.options.set_time_steps(dt_diffusion=0.01, dt_mechanics=0.1, dt_phenotype=6.0)
     
     # Mark workflow step as complete
     session.mark_step_complete(WorkflowStep.DOMAIN_SETUP)
     
-    # Update legacy global for backward compatibility
-    _set_legacy_config(session.config)
-    
     # Format result
-    result = f"**Simulation domain created:**\n"
-    result += f"- Domain: {domain_x}×{domain_y}×{domain_z} μm\n"
+    mode = "2D" if use_2d else "3D"
+    result = f"**Simulation domain created ({mode}):**\n"
+    result += f"- Domain: {domain_x}×{domain_y}" + (f" μm (z = {domain_z} μm, one voxel)\n" if use_2d else f"×{domain_z} μm\n")
     result += f"- Mesh: {dx} μm\n"
     result += f"- Duration: {max_time/60:.1f} hours\n"
     result += f"- Progress: {session.get_progress_percentage():.0f}%\n"
@@ -836,67 +781,26 @@ def create_simulation_domain(domain_x: float, domain_y: float,
     
     return result
 
-@mcp.resource(
-    uri="docs://tools/add_single_substrate",
-    name="Documentation for add_single_substrate",
-    description="Adds a chemical substrate (e.g., oxygen) with its physical/chemical properties.",
-    mime_type="text/markdown"
-)
-def docs_add_single_substrate() -> str:
-    return """
-# Tool: add_single_substrate
-
-Adds a chemical substrate (oxygen, glucose, drug, etc.) to the simulation environment.
-
-## Parameters
-- `substrate_name` (`str`, required): Name (e.g., `"oxygen"`)
-- `diffusion_coefficient` (`float`, required): Diffusion rate in μm²/min (e.g., 100000)
-- `decay_rate` (`float`, required): Decay rate in 1/min (e.g., 0.01)
-- `initial_condition` (`float`, required): Initial concentration (e.g., 38 for oxygen)
-- `units` (`str`, optional): Concentration units (default: "dimensionless")
-- `dirichlet_enabled` (`bool`, optional): Use boundary conditions (default: False)
-- `dirichlet_value` (`float`, optional): Value at boundary (default: initial_condition)
-
-## Example
-
-```python
-add_single_substrate(
-    substrate_name="oxygen",
-    diffusion_coefficient=100000,
-    decay_rate=0.01,
-    initial_condition=38,
-    units="dimensionless",
-    dirichlet_enabled=False
-)
-
-Notes
-
-Call this once for each substrate you want to add.
-
-For multiple substrates, repeat with different names and values.
-    """
-
 @mcp.tool()
-def add_single_substrate(substrate_name: str, diffusion_coefficient: float, decay_rate: float,
-                        initial_condition: float, units: str = "dimensionless",
-                        dirichlet_enabled: bool = False, dirichlet_value: Optional[float] = None) -> str:
-    """
-    Add a chemical substrate (oxygen, glucose, drug, etc.) to the simulation environment.
+def add_single_substrate(
+    substrate_name: Annotated[str, Field(description="Name of the substrate (e.g., 'oxygen', 'glucose', 'drug').")],
+    diffusion_coefficient: Annotated[float, Field(description="Diffusion rate in μm²/min. Typical: 100000 for oxygen, 30000 for glucose.")],
+    decay_rate: Annotated[float, Field(description="Decay/uptake rate in 1/min. Typical: 0.01.")],
+    initial_condition: Annotated[float, Field(description="Starting concentration everywhere in the domain. Typical: 38 for oxygen (mmHg).")],
+    units: str = Field(default="dimensionless", description="Concentration units label (cosmetic only)."),
+    dirichlet_enabled: bool = Field(default=False, description="If True, enforce a fixed boundary concentration (Dirichlet condition)."),
+    dirichlet_value: Optional[float] = Field(default=None, description="Fixed boundary concentration. Defaults to initial_condition if omitted."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Add a chemical substrate (oxygen, glucose, drug, etc.) to the simulation environment.
+
     Substrates diffuse through the domain and can be consumed or secreted by cells.
-    
-    Args:
-        substrate_name: Name of the substrate (e.g., 'oxygen', 'glucose', 'drug')
-        diffusion_coefficient: Diffusion rate in μm²/min (typical: 100000 for oxygen)
-        decay_rate: Decay rate in 1/min (typical: 0.01)
-        initial_condition: Initial concentration (typical: 38 for oxygen)
-        units: Concentration units (default: 'dimensionless')
-        dirichlet_enabled: Whether to use boundary conditions (default: False)
-        dirichlet_value: Boundary concentration (default: same as initial_condition)
-    
+    Call `create_simulation_domain()` first. Repeat for each substrate.
+
     Returns:
-        str: Success message with substrate parameters
+        str: Confirmation with substrate parameters and next step.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -911,9 +815,11 @@ def add_single_substrate(substrate_name: str, diffusion_coefficient: float, deca
     if dirichlet_value is None:
         dirichlet_value = initial_condition
     
+    name = substrate_name.strip()
+    
     # Add substrate to configuration
     session.config.substrates.add_substrate(
-        substrate_name.strip(),
+        name,
         diffusion_coefficient=diffusion_coefficient,
         decay_rate=decay_rate,
         initial_condition=initial_condition,
@@ -922,21 +828,27 @@ def add_single_substrate(substrate_name: str, diffusion_coefficient: float, deca
         units=units
     )
 
-    # When Dirichlet is enabled, also enable per-boundary conditions for x/y
-    # (z boundaries left disabled for 2D simulations)
+    # Set per-boundary Dirichlet conditions when enabled
+    dirichlet_boundaries = []
     if dirichlet_enabled:
+        # Determine 2D vs 3D using the domain's use_2D flag
+        try:
+            is_3d = not session.config.domain.data.get("use_2D", False)
+        except Exception:
+            is_3d = False
+
+        boundaries = ["xmin", "xmax", "ymin", "ymax"]
+        if is_3d:
+            boundaries += ["zmin", "zmax"]
+
         name = substrate_name.strip()
-        for boundary in ['xmin', 'xmax', 'ymin', 'ymax']:
-            session.config.substrates.set_dirichlet_boundary(
-                name, boundary, enabled=True, value=dirichlet_value
-            )
+        for boundary in boundaries:
+            session.config.substrates.set_dirichlet_boundary(name, boundary, True, dirichlet_value)
+        dirichlet_boundaries = boundaries
 
     # Update session counters
     session.substrates_count += 1
     session.mark_step_complete(WorkflowStep.SUBSTRATES_ADDED)
-    
-    # Update legacy global for backward compatibility
-    _set_legacy_config(session.config)
     
     # Format result
     result = f"**Substrate added:** {substrate_name}\n"
@@ -944,54 +856,29 @@ def add_single_substrate(substrate_name: str, diffusion_coefficient: float, deca
     result += f"- Decay: {decay_rate:g} min⁻¹\n"
     result += f"- Initial: {initial_condition:g} {units}\n"
     if dirichlet_enabled:
-        result += f"- Boundary: {dirichlet_value:g} {units}\n"
+        result += f"- Dirichlet boundaries: {', '.join(dirichlet_boundaries)} = {dirichlet_value:g} {units}\n"
     result += f"- Progress: {session.get_progress_percentage():.0f}%\n"
     result += f"**Next step:** Use `add_single_cell_type()` to add cancer cells, immune cells, etc."
     
     return result
 
-@mcp.resource(
-    uri="docs://tools/add_single_cell_type",
-    name="Documentation for add_single_cell_type",
-    description="Adds a new cell type with a selected cell cycle model.",
-    mime_type="text/markdown"
-)
-def docs_add_single_cell_type() -> str:
-    return """
-# Tool: add_single_cell_type
-
-Adds a cell type (cancer, immune, fibroblast, etc.) with a basic cell cycle model.
-
-## Parameters
-- `cell_type_name` (`str`, required): e.g. "cancer_cell", "immune_cell"
-- `cycle_model` (`str`, optional): Cell cycle model, e.g. "Ki67_basic" (default), "live_cell" (see `get_available_cycle_models` for options)
-
-## Example
-
-```python
-add_single_cell_type(cell_type_name="cancer_cell", cycle_model="Ki67_basic")
-
-Notes
-
-Call this once for each cell type.
-
-For custom cycle models, consult get_available_cycle_models.
-                """
-
 @mcp.tool()
-def add_single_cell_type(cell_type_name: str, cycle_model: str = "Ki67_basic") -> str:
-    """
-    Add a cell type (cancer, immune, fibroblast, etc.) to the simulation.
-    Cell types define the agents that will populate the simulation domain.
-    
-    Args:
-        cell_type_name: Name of the cell type (e.g., 'cancer_cell', 'immune_cell', 'fibroblast')
-        cycle_model: Cell cycle model (default: 'Ki67_basic')
-    
+def add_single_cell_type(
+    cell_type_name: Annotated[str, Field(description="Name for this cell type (e.g., 'cancer_cell', 'immune_cell', 'fibroblast').")],
+    cycle_model: str = Field(default="Ki67_basic", description="Cell cycle model. Use `get_available_cycle_models()` to list options. Common: 'Ki67_basic', 'Ki67_advanced', 'live'."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Add a cell type (cancer, immune, fibroblast, etc.) to the simulation.
+
+    Cell types define the agents that populate the simulation domain.
+    Call `create_simulation_domain()` first. Repeat for each cell type.
+    After adding, use `configure_cell_parameters()` to set size and motility,
+    and `add_single_cell_rule()` to define signal-response behaviours.
+
     Returns:
-        str: Success message with cell type details
+        str: Confirmation with cell type details and next step.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -1009,9 +896,6 @@ def add_single_cell_type(cell_type_name: str, cycle_model: str = "Ki67_basic") -
     session.cell_types_count += 1
     session.mark_step_complete(WorkflowStep.CELL_TYPES_ADDED)
     
-    # Update legacy global for backward compatibility
-    _set_legacy_config(session.config)
-    
     # Format result
     result = f"**Cell type added:** {cell_type_name}\n"
     result += f"- Cycle model: {cycle_model}\n"
@@ -1024,54 +908,46 @@ def add_single_cell_type(cell_type_name: str, cycle_model: str = "Ki67_basic") -
 
 
 @mcp.tool()
-def configure_cell_parameters(cell_type: str, volume_total: float = 2500.0, 
-                             volume_nuclear: float = 500.0, fluid_fraction: float = 0.75,
-                             motility_speed: float = 0.5, persistence_time: float = 5.0,
-                             apoptosis_rate: float = 0.0001, necrosis_rate: float = 0.0001) -> str:
-    """
-When the user asks to configure cell properties, set cell size, or adjust cell behavior,
-this function modifies the basic parameters for a cell type.
-In particular, it sets the total and nuclear volume, fluid fraction,
-motility speed, persistence time, and death rates.
-The function modifies an existing cell type; it does not create a new one.
-This allows for detailed configuration of cell properties based on the biological scenario.
-To modify multiple cell types, use this function repeatedly.
+def configure_cell_parameters(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type to configure.")],
+    volume_total: float = Field(default=2500.0, description="Total cell volume in μm³."),
+    volume_nuclear: float = Field(default=500.0, description="Nuclear volume in μm³."),
+    fluid_fraction: float = Field(default=0.75, description="Cytoplasmic fluid fraction (0–1)."),
+    motility_speed: float = Field(default=0.5, description="Cell migration speed in μm/min."),
+    persistence_time: float = Field(default=5.0, description="Directional persistence time in minutes."),
+    apoptosis_rate: float = Field(default=0.0001, description="Spontaneous apoptosis rate in 1/min."),
+    necrosis_rate: float = Field(default=0.0001, description="Spontaneous necrosis rate in 1/min."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Modify volume, motility, and death-rate parameters for an existing cell type.
 
-Input parameters:
-cell_type (str): Name of existing cell type to configure
-volume_total (float): Total cell volume (μm³, default: 2500.0)
-volume_nuclear (float): Nuclear volume (μm³, default: 500.0)
-fluid_fraction (float): Cytoplasmic fluid fraction (0-1, default: 0.75)
-motility_speed (float): Cell movement speed (μm/min, default: 0.5)
-persistence_time (float): Directional persistence (min, default: 5.0)
-apoptosis_rate (float): Apoptosis rate (1/min, default: 0.0001)
-necrosis_rate (float): Necrosis rate (1/min, default: 0.0001)
+    The cell type must already exist (created by `add_single_cell_type()`).
+    Call repeatedly to configure multiple cell types.
 
-Returns:
-str: Success message with configured parameters
+    Returns:
+        str: Confirmation with the configured parameter values.
     """
-    global config
-    if config is None:
+    session = get_current_session(session_id)
+    if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
     try:
         # Set volume parameters
-        config.cell_types.set_volume_parameters(cell_type, total=volume_total, 
-                                              nuclear=volume_nuclear, fluid_fraction=fluid_fraction)
-        
+        session.config.cell_types.set_volume_parameters(cell_type, total=volume_total,
+                                                        nuclear=volume_nuclear, fluid_fraction=fluid_fraction)
+
         # Set motility parameters
-        config.cell_types.set_motility(cell_type, speed=motility_speed, 
-                                     persistence_time=persistence_time, enabled=True)
-        
+        session.config.cell_types.set_motility(cell_type, speed=motility_speed,
+                                               persistence_time=persistence_time, enabled=True)
+
         # Set death rates
-        config.cell_types.set_death_rate(cell_type, 'apoptosis', apoptosis_rate)
-        config.cell_types.set_death_rate(cell_type, 'necrosis', necrosis_rate)
-        
+        session.config.cell_types.set_death_rate(cell_type, 'apoptosis', apoptosis_rate)
+        session.config.cell_types.set_death_rate(cell_type, 'necrosis', necrosis_rate)
+
         # Track modification if loaded from XML
-        session = get_current_session()
-        if session and session.loaded_from_xml:
+        if session.loaded_from_xml:
             session.mark_xml_modification()
-        
+
         result = f"**Configured parameters for {cell_type}:**\n"
         result += f"- **Volume:** {volume_total:g} μm³ (nuclear: {volume_nuclear:g} μm³)\n"
         result += f"- **Motility:** {motility_speed:g} μm/min (persistence: {persistence_time:g} min)\n"
@@ -1082,38 +958,32 @@ str: Success message with configured parameters
         return f"Error configuring cell type '{cell_type}': {str(e)}"
 
 @mcp.tool()
-def set_substrate_interaction(cell_type: str, substrate: str, 
-                             secretion_rate: float = 0.0, uptake_rate: float = 0.0) -> str:
-    """
-When the user asks to set oxygen consumption, drug uptake, or substrate secretion,
-this function defines how a cell type interacts with a substrate.
-In particular, it sets the secretion and uptake rates for the substrate.
-The function modifies an existing cell type's interaction with a substrate;
-it does not create a new interaction.
-This allows for detailed configuration of how cells respond to their environment.
-To modify multiple interactions, use this function repeatedly.
+def set_substrate_interaction(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type.")],
+    substrate: Annotated[str, Field(description="Name of an existing substrate (must match a name passed to add_single_substrate()).")],
+    secretion_rate: float = Field(default=0.0, description="Rate at which the cell secretes the substrate (1/min)."),
+    uptake_rate: float = Field(default=0.0, description="Rate at which the cell consumes the substrate (1/min). Typical oxygen uptake: 10."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Define how a cell type interacts with a substrate via secretion and uptake rates.
 
-Input parameters:
-cell_type (str): Name of existing cell type
-substrate (str): Name of existing substrate
-secretion_rate (float): Substrate secretion rate (1/min, default: 0.0)
-uptake_rate (float): Substrate uptake rate (1/min, default: 0.0)
+    Both cell type and substrate must already exist in the current session.
+    Call repeatedly to configure multiple cell-substrate pairs.
 
-Returns:
-str: Success message with interaction details
+    Returns:
+        str: Confirmation with the configured rates.
     """
-    global config
-    if config is None:
+    session = get_current_session(session_id)
+    if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
-    
+
     try:
-        config.cell_types.add_secretion(cell_type, substrate, 
-                                      secretion_rate=secretion_rate,
-                                      uptake_rate=uptake_rate)
-        
+        session.config.cell_types.add_secretion(cell_type, substrate,
+                                                secretion_rate=secretion_rate,
+                                                uptake_rate=uptake_rate)
+
         # Track modification if loaded from XML
-        session = get_current_session()
-        if session and session.loaded_from_xml:
+        if session.loaded_from_xml:
             session.mark_xml_modification()
         
         return f"**Substrate interaction set:** {cell_type} ↔ {substrate} (secretion: {secretion_rate:g}, uptake: {uptake_rate:g} min⁻¹)"
@@ -1536,12 +1406,10 @@ str: Success message with advanced chemotaxis configuration
 
 @mcp.tool()
 def get_available_cycle_models() -> str:
-    """
-When the user asks about cell cycle models, what cycles are available, or needs to choose a cycle type,
-this function returns the available cell cycle models in PhysiCell.
+    """List all available PhysiCell cell cycle models with their identifiers.
 
-Returns:
-str: Markdown-formatted list of available cell cycle models with descriptions
+    Returns:
+        str: Markdown list of model keys and names to use in `add_single_cell_type()`.
     """
 
     defaults = get_default_parameters()
@@ -1562,16 +1430,19 @@ str: Markdown-formatted list of available cell cycle models with descriptions
 # ============================================================================
 
 @mcp.tool()
-def list_all_available_signals() -> str:
-    """
-    Get the complete list of PhysiCell signals that can be used in cell rules.
-    This function automatically updates the context from the current configuration
-    and returns expanded signals including substrate-specific and cell-type-specific signals.
-    
+def list_all_available_signals(
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session."),
+) -> str:
+    """List all PhysiCell signals that can be used in cell rules.
+
+    Automatically expands to include substrate-specific and cell-type-specific signals
+    based on components already added to the current session.
+    Call `list_all_available_behaviors()` to see the corresponding behavior targets.
+
     Returns:
-        str: Markdown-formatted list of all available signals with descriptions
+        str: Markdown table of signals grouped by type.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     
     # Update context from current config if available
     if session and session.config:
@@ -1618,16 +1489,19 @@ def list_all_available_signals() -> str:
     return result
 
 @mcp.tool()
-def list_all_available_behaviors() -> str:
-    """
-    Get the complete list of PhysiCell behaviors that can be controlled by rules.
-    This function automatically updates the context from the current configuration
-    and returns expanded behaviors including substrate-specific and cell-type-specific behaviors.
-    
+def list_all_available_behaviors(
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session."),
+) -> str:
+    """List all PhysiCell behaviours that can be controlled by cell rules.
+
+    Automatically expands to include substrate-specific and cell-type-specific behaviours
+    based on components already added to the current session.
+    Use exact behavior names in `add_single_cell_rule()`.
+
     Returns:
-        str: Markdown-formatted list of all available behaviors with descriptions
+        str: Markdown table of behaviours grouped by type.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     
     # Update context from current config if available
     if session and session.config:
@@ -1809,27 +1683,27 @@ def _get_behavior_default_from_config(session, cell_type: str, behavior: str) ->
 
 
 @mcp.tool()
-def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: str,
-                        min_signal: float = 0, max_signal: float = 1, 
-                        hill_power: float = 4.0, half_max: float = 0.5) -> str:
-    """
-    Add a signal-behavior rule that makes cells respond realistically to their environment.
-    Rules define how cells change their behavior in response to environmental signals.
-    
-    Args:
-        cell_type: Name of existing cell type
-        signal: Signal name (use list_all_available_signals() to see options)
-        direction: Signal direction ('increases' or 'decreases')
-        behavior: Behavior name (use list_all_available_behaviors() to see options)
-        min_signal: Minimum signal value (default: 0)
-        max_signal: Maximum signal value (default: 1)
-        hill_power: Hill coefficient (default: 4.0, typical: 1.0-8.0)
-        half_max: Half-maximum signal level (default: 0.5)
-    
+def add_single_cell_rule(
+    cell_type: Annotated[str, Field(description="Name of existing cell type.")],
+    signal: Annotated[str, Field(description="Signal name. Use list_all_available_signals() to see options.")],
+    direction: Annotated[str, Field(description="'increases' or 'decreases' — whether the signal promotes or suppresses the behavior.")],
+    behavior: Annotated[str, Field(description="Behavior name. Use list_all_available_behaviors() to see options.")],
+    saturation_value: float = Field(default=1.0, description="Value of the behavior when the signal is at saturation (maximum effect)."),
+    half_max: float = Field(default=0.5, description="Signal level at which the behavior is halfway between its base value and the saturation value."),
+    hill_power: float = Field(default=4.0, description="Hill coefficient controlling the sharpness of the dose-response curve (typical: 1–8)."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Add a signal-behaviour rule that makes cells respond to environmental cues.
+
+    Rules are Hill-function dose-response relationships: when `signal` rises,
+    `behavior` is increased or decreased according to a Hill curve parameterised by
+    `saturation_value`, `half_max`, and `hill_power`.
+    Use `list_all_available_signals()` and `list_all_available_behaviors()` first.
+
     Returns:
-        str: Success message with rule details
+        str: Confirmation with rule summary and export readiness indicator.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -2032,7 +1906,7 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
     # For "decreases": low signal → xml_default (saturation), high signal → base_value (min_signal)
     result = f"**Cell rule added:**\n"
     result += f"- Rule: {cell_type} | {signal} {direction} → {behavior}\n"
-    result += f"- Signal range: {min_signal} to {max_signal}\n"
+    result += f"- Saturation value: {saturation_value}\n"
     result += f"- Half-max: {half_max}\n"
     result += f"- Hill power: {hill_power}\n"
     if xml_default is not None:
@@ -2059,26 +1933,23 @@ def add_single_cell_rule(cell_type: str, signal: str, direction: str, behavior: 
     return result
 
 @mcp.tool()
-def add_physiboss_model(cell_type: str, bnd_file: str, cfg_file: str) -> str:
-    """
-When the user asks to add boolean networks, intracellular models, or MaBoSS models,
-this function integrates a PhysiBoSS boolean network model into a cell type.
-This function allows the user to specify the MaBoSS .bnd and .cfg files.
-In particular, it sets the cell type name, the MaBoSS .bnd file path,
-and the MaBoSS .cfg file path.
-The function adds one PhysiBoSS model at a time, allowing for detailed configuration; for multiple models,
-use this function repeatedly.
-This function must be called after defining cell types.
+def add_physiboss_model(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type to attach the boolean network to.")],
+    bnd_file: Annotated[str, Field(description="Absolute path to the MaBoSS .bnd boolean network file.")],
+    cfg_file: Annotated[str, Field(description="Absolute path to the MaBoSS .cfg configuration file.")],
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Integrate a PhysiBoSS boolean network model into a cell type.
 
-Input parameters:
-cell_type (str): Name of existing cell type
-bnd_file (str): Path to MaBoSS .bnd boolean network file
-cfg_file (str): Path to MaBoSS .cfg configuration file
+    The cell type must already exist. Requires PhysiBoSS support in the
+    installed `physicell_config` package.
+    After adding, call `configure_physiboss_settings()`, then
+    `add_physiboss_input_link()` and `add_physiboss_output_link()`.
 
-Returns:
-str: Success message with PhysiBoSS model details
+    Returns:
+        str: Confirmation with model file paths and next step.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -2112,9 +1983,6 @@ str: Success message with PhysiBoSS model details
                 biological_context=""
             )
         
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
-        
         result = f"**PhysiBoSS model added to {cell_type}:**\n"
         result += f"- Model file: {bnd_file}\n"
         result += f"- Config file: {cfg_file}\n"
@@ -2126,31 +1994,22 @@ str: Success message with PhysiBoSS model details
         return f"Error adding PhysiBoSS model: {str(e)}"
 
 @mcp.tool()
-def configure_physiboss_settings(cell_type: str, intracellular_dt: float = 6.0,
-                                time_stochasticity: int = 0, scaling: float = 1.0,
-                                start_time: float = 0.0, inheritance_global: bool = False) -> str:
+def configure_physiboss_settings(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type with a PhysiBoSS model attached.")],
+    intracellular_dt: float = Field(default=6.0, description="PhysiBoSS update interval in minutes. Should be a multiple of the phenotype time step."),
+    time_stochasticity: int = Field(default=0, description="Time stochasticity level (0 = deterministic)."),
+    scaling: float = Field(default=1.0, description="Scaling factor applied to the intracellular dynamics."),
+    start_time: float = Field(default=0.0, description="Simulation time in minutes at which the boolean network starts running."),
+    inheritance_global: bool = Field(default=False, description="If True, daughter cells inherit the parent's boolean node states globally."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Configure timing, stochasticity, and inheritance parameters for a PhysiBoSS model.
+    Must be called after `add_physiboss_model()`. Repeat for each cell type.
+    Checked with `list_all_available_signals()` and `list_all_available_behaviors()` the available signals and behaviors to use in `add_physiboss_input_link()` and `add_physiboss_output_link()`.
+    Returns:
+        str: Confirmation with the configured settings and next step.
     """
-When the user asks to configure PhysiBoSS parameters, set intracellular settings, or adjust boolean network timing,
-this function configures the intracellular settings for a PhysiBoSS model.
-This function allows the user to specify timing, stochasticity, and inheritance parameters.
-In particular, it sets the intracellular time step, time stochasticity, scaling factor,
-start time, and global inheritance behavior.
-The function configures one cell type at a time; for multiple cell types,
-use this function repeatedly.
-This function must be called after adding a PhysiBoSS model to the cell type.
-
-Input parameters:
-cell_type (str): Name of existing cell type with PhysiBoSS model
-intracellular_dt (float): PhysiBoSS time step in minutes (default: 6.0)
-time_stochasticity (int): Time stochasticity level (default: 0)
-scaling (float): Scaling factor for intracellular dynamics (default: 1.0)
-start_time (float): Start time for intracellular model in minutes (default: 0.0)
-inheritance_global (bool): Whether to use global inheritance (default: False)
-
-Returns:
-str: Success message with PhysiBoSS settings details
-    """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -2172,9 +2031,6 @@ str: Success message with PhysiBoSS settings details
         session.physiboss_settings_count += 1
         session.mark_step_complete(WorkflowStep.PHYSIBOSS_SETTINGS_CONFIGURED)
         
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
-        
         result = f"**PhysiBoSS settings configured for {cell_type}:**\n"
         result += f"- Time step: {intracellular_dt} min\n"
         result += f"- Stochasticity: {time_stochasticity}\n"
@@ -2189,32 +2045,22 @@ str: Success message with PhysiBoSS settings details
         return f"Error configuring PhysiBoSS settings: {str(e)}"
 
 @mcp.tool()
-def add_physiboss_input_link(cell_type: str, physicell_signal: str, 
-                            boolean_node: str, action: str = "activation",
-                            threshold: float = 1.0, smoothing: int = 0) -> str:
+def add_physiboss_input_link(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type with a PhysiBoSS model.")],
+    physicell_signal: Annotated[str, Field(description="PhysiCell signal name. Use list_all_available_signals() to see options.")],
+    boolean_node: Annotated[str, Field(description="MaBoSS boolean node name to drive (from the .bnd file).")],
+    action: str = Field(default="activation", description="'activation' (signal turns node ON) or 'inhibition' (signal turns node OFF)."),
+    threshold: float = Field(default=1.0, description="Signal level at which the node is toggled."),
+    smoothing: int = Field(default=0, description="Smoothing level (0 = no smoothing)."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Create an input link from a PhysiCell signal to a MaBoSS boolean node.
+    Requires a PhysiBoSS model already attached to the cell type.
+    Call `add_physiboss_output_link()` after all input links are defined.
+    Returns:
+        str: Confirmation with link details and next step.
     """
-When the user asks to link PhysiCell signals to boolean nodes or connect environment to networks,
-this function creates an input connection from PhysiCell to the MaBoSS boolean network.
-This function allows the user to specify the cell type, PhysiCell signal,
-MaBoSS boolean node, action type, activation threshold, and smoothing.
-In particular, it sets the cell type name, the PhysiCell signal name,
-the MaBoSS boolean network node name, action type, activation threshold, and smoothing level.
-The function adds one input link at a time, allowing for detailed configuration; for multiple links,
-use this function repeatedly.
-This function must be called after defining cell types and adding PhysiBoSS models.
-
-Input parameters:
-cell_type (str): Name of existing cell type with PhysiBoSS model
-physicell_signal (str): PhysiCell signal name (use list_all_available_signals())
-boolean_node (str): MaBoSS boolean network node name
-action (str): Action type - "activation" or "inhibition" (default: "activation")
-threshold (float): Activation threshold (default: 1.0)
-smoothing (int): Smoothing level (default: 0)
-
-Returns:
-str: Success message with input link details
-    """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -2236,9 +2082,6 @@ str: Success message with input link details
         session.physiboss_input_links_count += 1
         session.mark_step_complete(WorkflowStep.PHYSIBOSS_INPUTS_LINKED)
         
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
-        
         result = f"**PhysiBoSS input:** {physicell_signal} → {boolean_node}\n"
         result += f"- Action: {action}\n"
         result += f"- Threshold: {threshold}\n"
@@ -2251,34 +2094,23 @@ str: Success message with input link details
         return f"Error adding PhysiBoSS input link: {str(e)}"
 
 @mcp.tool()
-def add_physiboss_output_link(cell_type: str, boolean_node: str,
-                             physicell_behavior: str, action: str = "activation",
-                             value: float = 1000000, base_value: float = 0,
-                             smoothing: int = 0) -> str:
+def add_physiboss_output_link(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type with a PhysiBoSS model.")],
+    boolean_node: Annotated[str, Field(description="MaBoSS boolean node name whose state drives the behavior.")],
+    physicell_behavior: Annotated[str, Field(description="PhysiCell behavior name to control. Use list_all_available_behaviors() to see options.")],
+    action: str = Field(default="activation", description="'activation' (node ON increases behavior) or 'inhibition' (node ON decreases behavior)."),
+    value: float = Field(default=1000000.0, description="Behavior value applied when the node is active."),
+    base_value: float = Field(default=0.0, description="Baseline behavior value when the node is inactive."),
+    smoothing: int = Field(default=0, description="Smoothing level (0 = no smoothing)."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Create an output link from a MaBoSS boolean node to a PhysiCell cell behaviour.
+    Requires a PhysiBoSS model already attached to the cell type.
+    Use `apply_physiboss_mutation()` afterward for genetic perturbations.
+    Returns:
+        str: Confirmation with link details and next step.
     """
-When the user asks to link boolean nodes to cell behaviors or connect networks to phenotypes,
-this function creates an output connection from the MaBoSS boolean network to PhysiCell behaviors.
-This function allows the user to specify the cell type, MaBoSS boolean node,
-PhysiCell behavior, action type, value when active, base value, and smoothing.
-In particular, it sets the cell type name, the MaBoSS boolean network node name,
-the PhysiCell behavior name, action type, value when node is active, base value, and smoothing level.
-The function adds one output link at a time, allowing for detailed configuration; for multiple links,
-use this function repeatedly.
-This function must be called after defining cell types and adding PhysiBoSS models.
-
-Input parameters:
-cell_type (str): Name of existing cell type with PhysiBoSS model
-boolean_node (str): MaBoSS boolean network node name
-physicell_behavior (str): PhysiCell behavior name (use list_all_available_behaviors())
-action (str): Action type - "activation" or "inhibition" (default: "activation")
-value (float): Behavior value when node is active (default: 1000000)
-base_value (float): Base behavior value when node is inactive (default: 0)
-smoothing (int): Smoothing level (default: 0)
-
-Returns:
-str: Success message with output link details
-    """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -2301,9 +2133,6 @@ str: Success message with output link details
         session.physiboss_output_links_count += 1
         session.mark_step_complete(WorkflowStep.PHYSIBOSS_OUTPUTS_LINKED)
         
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
-        
         result = f"**PhysiBoSS output:** {boolean_node} → {physicell_behavior}\n"
         result += f"- Action: {action}\n"
         result += f"- Active value: {value}\n"
@@ -2317,26 +2146,21 @@ str: Success message with output link details
         return f"Error adding PhysiBoSS output link: {str(e)}"
 
 @mcp.tool()
-def apply_physiboss_mutation(cell_type: str, node_name: str, fixed_value: int) -> str:
-    """
-When the user asks to simulate mutations, fix gene states, or apply genetic changes,
-this function applies a mutation by fixing a boolean node to a specific value.
-This function allows the user to specify the cell type, MaBoSS boolean node,
-and the fixed value (0 or 1).
-In particular, it sets the cell type name, the MaBoSS boolean network node name,
-and the fixed value for the node.
-The function applies one mutation at a time, allowing for detailed configuration; for multiple mutations,
-use this function repeatedly.   
+def apply_physiboss_mutation(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type with a PhysiBoSS model.")],
+    node_name: Annotated[str, Field(description="MaBoSS boolean node name to fix (from the .bnd file).")],
+    fixed_value: Annotated[int, Field(description="Fixed node state: 0 (always OFF / loss-of-function) or 1 (always ON / gain-of-function).")],
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Fix a MaBoSS boolean node to a constant value, simulating a genetic mutation.
 
-Input parameters:
-cell_type (str): Name of existing cell type with PhysiBoSS model
-node_name (str): MaBoSS boolean network node name to mutate
-fixed_value (int): Fixed value for the node (0 or 1)
+    Requires a PhysiBoSS model already attached to the cell type.
+    Call repeatedly to apply multiple mutations.
 
-Returns:
-str: Success message with mutation details
+    Returns:
+        str: Confirmation of the applied mutation.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "Error: Create simulation domain first using create_simulation_domain()"
     
@@ -2355,9 +2179,6 @@ str: Success message with mutation details
         session.physiboss_mutations_count += 1
         session.mark_step_complete(WorkflowStep.PHYSIBOSS_MUTATIONS_APPLIED)
         
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
-        
         result = f"**Mutation applied:** {cell_type}.{node_name} = {fixed_value}\n"
         result += f"- Progress: {session.get_progress_percentage():.0f}%\n"
         result += f"**Next step:** Apply additional mutations or use `export_xml_configuration()` to finish."
@@ -2371,15 +2192,18 @@ str: Success message with mutation details
 # ============================================================================
 
 @mcp.tool()
-def get_simulation_summary() -> str:
-    """
-    Get a comprehensive summary of the current simulation configuration.
-    Shows configured components, progress, and readiness for export.
-    
+def get_simulation_summary(
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session."),
+) -> str:
+    """Return a comprehensive summary of the current simulation configuration.
+
+    Shows session progress, configured components (substrates, cell types, rules,
+    PhysiBoSS models), completed workflow steps, and export readiness.
+
     Returns:
-        str: Markdown-formatted summary of current simulation state
+        str: Markdown summary of current simulation state.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session:
         return "No active session. Use `create_session()` to start."
     
@@ -2397,10 +2221,10 @@ def get_simulation_summary() -> str:
     except:
         cell_types = []
     
-    # Get rules count using cell_rules_csv API
+    # Get rules count
     rules_count = 0
     try:
-        rules_count = len(session.config.cell_rules_csv.get_rules())
+        rules_count = len(session.config.cell_rules.get_rules())
     except:
         rules_count = 0
     
@@ -2463,19 +2287,19 @@ def get_simulation_summary() -> str:
     return result
 
 @mcp.tool()
-def export_xml_configuration(filename: str = "PhysiCell_settings.xml") -> str:
-    """
-When the user asks to export the simulation, save the configuration, or generate XML,
-this function exports the complete PhysiCell configuration to an XML file.
-This function generates the XML configuration file based on the current simulation setup,
+def export_xml_configuration(
+    filename: str = Field(default="PhysiCell_settings.xml", description="Output filename for the XML configuration file."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Export the complete PhysiCell configuration to an XML file in the session artifact directory.
 
-Input parameters:
-filename (str): Name for XML configuration file (default: 'PhysiCell_settings.xml')
+    The generated file can be passed directly to a PhysiCell executable.
+    A simulation domain must have been created before calling this.
 
-Returns:
-str: Markdown-formatted export status with file details
+    Returns:
+        str: Export status, file path, and execution instructions.
     """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "**Error:** No simulation configured. Create domain and add components first."
     
@@ -2520,7 +2344,7 @@ str: Markdown-formatted export status with file details
 
         with open(output_path, 'w') as f:
             f.write(xml_content)
-        
+
         xml_size = len(xml_content) // 1024
 
         result = f"## XML Configuration Exported\n\n"
@@ -2551,49 +2375,31 @@ str: Markdown-formatted export status with file details
         result += f"**Next step:** Copy to PhysiCell project directory and run:\n"
         result += f"```bash\n./myproject {filename}\n```"
         
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
-        
         return result
         
     except Exception as e:
         return f"Error exporting XML configuration: {str(e)}"
 
 @mcp.tool()
-def export_cell_rules_csv(filename: str = "cell_rules.csv") -> str:
+def export_cell_rules_csv(
+    filename: str = Field(default="cell_rules.csv", description="Output filename for the cell rules CSV file."),
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Export cell signal-behaviour rules to a CSV file in the session artifact directory.
+
+    The generated file is used alongside `PhysiCell_settings.xml` by the PhysiCell executable.
+    At least one rule must exist (added via `add_single_cell_rule()`).
+
+    Returns:
+        str: Export status and file path.
     """
-When the user asks to export rules, save cell behaviors, or generate CSV,
-this function exports the cell rules to a CSV file for PhysiCell.
-This function generates the CSV file based on the current cell rules configuration,
-
-
-Input parameters:
-filename (str): Name for CSV rules file (default: 'cell_rules.csv')
-
-Returns:
-str: Markdown-formatted export status with file details
-    """
-    session = get_current_session()
+    session = get_current_session(session_id)
     if not session or not session.config:
         return "**Error:** No simulation configured. Create domain and add components first."
     
     try:
-        # Check for rules in both new API and legacy API
-        rule_count = 0
-        
-        # Try new API first
-        try:
-            from physicell_config.modules.cell_rules import CellRulesModule
-            cell_rules = CellRulesModule(session.config)
-            new_api_rules = getattr(cell_rules, 'rules', [])
-            rule_count += len(new_api_rules)
-        except (ImportError, AttributeError):
-            pass
-        
-        # Check legacy CSV API
-        rules = session.config.cell_rules_csv
-        legacy_rules = rules.get_rules()
-        rule_count += len(legacy_rules)
+        # Check rules via CellRulesModule API
+        rule_count = len(session.config.cell_rules.get_rules())
         
         if rule_count == 0:
             return "**No cell rules to export**\n\nUse add_single_cell_rule() to create signal-behavior relationships first."
@@ -2627,9 +2433,6 @@ str: Markdown-formatted export status with file details
         result += f"**Rules:** {rule_count}\n"
         result += f"**Progress:** {session.get_progress_percentage():.0f}%\n\n"
         result += f"**Next step:** Copy to PhysiCell project directory alongside XML configuration"
-        
-        # Update legacy global for backward compatibility
-        _set_legacy_config(session.config)
         
         return result
         
@@ -3519,83 +3322,63 @@ def clean_for_markdown(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 @mcp.tool()
-def list_generated_files(folder_path: str = ".") -> str:
-    """
-When the user asks to see generated files or check what files have been created,
-this function lists PhysiCell-related files in the specified folder.
+def list_generated_files(
+    session_id: Optional[str] = Field(default=None, description="Session to query. Omit to use the active session. Pass 'all' to list files across every session."),
+) -> str:
+    """List PhysiCell artifact files (XML/CSV) for the active session.
 
-Args:
-folder_path (str): Path to the folder to search (default: current directory)
-
-Returns:
-str: List of PhysiCell-related files found
+    Returns:
+        str: Grouped list of XML and CSV artifact files.
     """
-    xml_files = glob.glob(os.path.join(folder_path, "*.xml"))
-    csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
-    
-    result = f"## Generated Files in {folder_path}\n\n"
-    
+    if session_id == "all":
+        files = list_artifacts(_SERVER_ROOT, session_id=None)
+    else:
+        session = get_current_session(session_id)
+        if session is None:
+            return "**No active session.** Use `create_session()` first."
+        files = list_artifacts(_SERVER_ROOT, session_id=session.session_id)
+
+    xml_files = [f for f in files if str(f).endswith(".xml")]
+    csv_files = [f for f in files if str(f).endswith(".csv")]
+
+    result = "## Generated Artifact Files\n\n"
+
     if xml_files:
-        result += f"**XML files:**\n"
+        result += "**XML files:**\n"
         for f in xml_files:
-            result += f"- {os.path.basename(f)}\n"
+            result += f"- {f}\n"
         result += "\n"
-    
+
     if csv_files:
-        result += f"**CSV files:**\n"
+        result += "**CSV files:**\n"
         for f in csv_files:
-            result += f"- {os.path.basename(f)}\n"
+            result += f"- {f}\n"
         result += "\n"
-    
+
     if not xml_files and not csv_files:
-        result += "No PhysiCell files found."
-    
+        result += "No PhysiCell artifact files found."
+
     return result
 
+
 @mcp.tool()
-def clean_generated_files(folder_path: str = ".") -> str:
+def clean_generated_files(
+    session_id: Optional[str] = Field(default=None, description="Session to clean. Omit to use the active session."),
+) -> str:
+    """Remove all artifact files (XML, CSV, etc.) for the active session.
+
+    Returns:
+        str: Count of files removed.
     """
-When the user asks to clean up generated files or remove old configurations,
-this function removes PhysiCell XML and CSV files from the specified folder.
+    session = get_current_session(session_id)
+    if session is None:
+        return "**No active session.** Use `create_session()` first."
 
-Args:
-folder_path (str): Path to the folder to clean (default: current directory)
-
-Returns:
-str: Status message indicating cleaned files
-    """
-    xml_files = glob.glob(os.path.join(folder_path, "PhysiCell_*.xml"))
-    csv_files = glob.glob(os.path.join(folder_path, "*_rules.csv"))
-    
-    all_files = xml_files + csv_files
-    
-    if not all_files:
-        return f"No PhysiCell files found to clean in {folder_path}."
-    
-    for file_path in all_files:
-        try:
-            os.remove(file_path)
-        except OSError as e:
-            return f"Error removing {file_path}: {str(e)}"
-    
-    return f"**Cleaned {len(all_files)} PhysiCell files** from {folder_path}:\n" + "\n".join([f"- {os.path.basename(f)}" for f in all_files])
-
-@mcp.resource(
-    uri="docs://tools/index",
-    name="Tool Documentation Index",
-    description="Links to all tool documentation resources.",
-    mime_type="text/markdown"
-)
-def docs_tools_index() -> str:
-    return """
-# Tool Documentation Index
-
-- [analyze_biological_scenario](docs://tools/analyze_biological_scenario)
-- [create_simulation_domain](docs://tools/create_simulation_domain)
-- [add_single_substrate](docs://tools/add_single_substrate)
-- [add_single_cell_type](docs://tools/add_single_cell_type)
-... (add links to all tool docs)
-"""
+    try:
+        count = clean_artifacts(_SERVER_ROOT, session.session_id)
+        return f"**Cleaned {count} artifact file(s)** for session {session.session_id[:8]}..."
+    except Exception as e:
+        return f"Error during cleanup: {str(e)}"
 
 # ============================================================================
 # PHYSICELL PROJECT CREATION AND EXECUTION TOOLS
@@ -6648,7 +6431,7 @@ def get_help() -> str:
     this function returns a guide to the available tools and their usage.
 
     Returns:
-        str: Markdown-formatted help guide
+        str: Markdown-formatted help guide.
     """
     return """# PhysiCell MCP Server Help
 

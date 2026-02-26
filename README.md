@@ -1,4 +1,4 @@
-# MCP Bio‑Modelling MCP Servers
+# MCP Bio‑Modelling Servers
 
 This repository centralizes **Model Context Protocol (MCP)** servers that wrap Python‑based *mechanistic / systems biology* modelling tools. Each subfolder contains a `server.py` entrypoint plus a README describing the specific tool interface.
 
