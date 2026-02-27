@@ -862,6 +862,47 @@ def add_single_substrate(
     
     return result
 
+def _expand_cell_type_interactions(session) -> None:
+    """Expand interaction & transformation dicts so every cell type lists every other cell type.
+
+    The library initialises these dicts with a single ``"default": 0.0`` placeholder.
+    PhysiCell XML expects an explicit entry for each cell type present in the simulation
+    (e.g. ``<attack_rate name="tumor">``).  This helper replaces the placeholder with
+    concrete entries for all currently-defined cell types, preserving any rates that
+    were already set via setter tools.
+    """
+    cell_types_dict = session.config.cell_types.cell_types
+    all_names = list(cell_types_dict.keys())
+
+    # Dicts inside cell_interactions that are per-target-cell-type
+    interaction_keys = ["live_phagocytosis_rates", "attack_rates", "fusion_rates"]
+    transformation_key = "transformation_rates"
+
+    for ct_name, ct_data in cell_types_dict.items():
+        phenotype = ct_data.get("phenotype", {})
+
+        # --- cell_interactions ---
+        interactions = phenotype.get("cell_interactions", {})
+        for ik in interaction_keys:
+            rates = interactions.get(ik, {})
+            # Remove the placeholder "default" key
+            rates.pop("default", None)
+            # Ensure an entry for every cell type (including self)
+            for other in all_names:
+                if other not in rates:
+                    rates[other] = 0.0
+            interactions[ik] = rates
+
+        # --- cell_transformations ---
+        transformations = phenotype.get("cell_transformations", {})
+        t_rates = transformations.get(transformation_key, {})
+        t_rates.pop("default", None)
+        for other in all_names:
+            if other not in t_rates:
+                t_rates[other] = 0.0
+        transformations[transformation_key] = t_rates
+
+
 @mcp.tool()
 def add_single_cell_type(
     cell_type_name: Annotated[str, Field(description="Name for this cell type (e.g., 'cancer_cell', 'immune_cell', 'fibroblast').")],
@@ -891,7 +932,10 @@ def add_single_cell_type(
     # Add cell type to configuration
     session.config.cell_types.add_cell_type(cell_type_name, template='default')
     session.config.cell_types.set_cycle_model(cell_type_name, cycle_model)
-    
+
+    # Expand interaction/transformation dicts so XML lists all cell types
+    _expand_cell_type_interactions(session)
+
     # Update session counters
     session.cell_types_count += 1
     session.mark_step_complete(WorkflowStep.CELL_TYPES_ADDED)

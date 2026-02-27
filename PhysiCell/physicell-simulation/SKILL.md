@@ -108,6 +108,8 @@ No error is raised. The simulation runs but the rule has no effect.
 
 The server validates rules and rejects "from 0 towards 0" with guidance on which setter to use.
 
+> **Auto-expansion:** `add_single_cell_type()` automatically initializes interaction and transformation rate entries for every cell type present. You do NOT need to call setter tools just to create zero-rate XML entries — they already exist. Only call setters when a **non-zero** base rate is needed (i.e., before adding a rule that interpolates toward that rate).
+
 ### Setter examples
 
 ```python
