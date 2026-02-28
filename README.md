@@ -10,6 +10,7 @@ Current servers (see their own READMEs & upstream docs):
 | NeKo | `NeKo/` | https://github.com/sysbio-curie/Neko |
 | PhysiCell (settings wrapper) | `PhysiCell/` | https://github.com/marcorusc/PhysiCell_Settings |
 | Literature Validation (PaperQA2) | `LiteratureValidation/` | https://github.com/Future-House/paper-qa |
+| **SpatialTissue** | `SpatialTissue/` | Spatial statistics panel analysis of PhysiCell output (LDA, network metrics, Ripley's K, Mapper) |
 
 All servers are Python processes speaking MCP over stdio.
 
@@ -26,7 +27,15 @@ MaBoSS/                # MaBoSS MCP server (Boolean / stochastic models)
 NeKo/                  # NeKo MCP server
 PhysiCell/             # PhysiCell settings / sessions MCP server
 LiteratureValidation/  # Literature validation MCP server (PaperQA2)
+SpatialTissue/         # Spatial statistics panel analysis MCP server (spatialtissuepy)
 README.md
+```
+
+**Cross-server workflow:**
+```
+NeKo (network construction) → MaBoSS (Boolean simulation) → PhysiCell (tissue simulation)
+  → SpatialTissue (spatial statistics)   ← invoke /spatial-analysis skill
+  → LiteratureValidation (rule validation)
 ```
 Consult the README within each tool folder for: purpose, required Python packages, and any model/data file expectations. Installation instructions for the modelling tools themselves live *there* (or in the upstream project links above) — they are intentionally not duplicated here.
 

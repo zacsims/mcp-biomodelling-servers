@@ -32,6 +32,7 @@ jobs:
             MaBoSS/session_manager.py \
             NeKo/session_manager.py \
             PhysiCell/session_manager.py \
+            SpatialTissue/session_manager.py \
             tests/
 
       # ------------------------------------------------------------------ #
@@ -46,7 +47,8 @@ jobs:
             artifact_manager.py \
             MaBoSS/session_manager.py \
             NeKo/session_manager.py \
-            PhysiCell/session_manager.py
+            PhysiCell/session_manager.py \
+            SpatialTissue/session_manager.py
 
       # ------------------------------------------------------------------ #
       # Unit tests                                                           #

@@ -60,6 +60,16 @@ create_session
   → generate_simulation_gif           (spatial animation)
 ```
 
+### Step 9 — Deep Spatial Analysis (SpatialTissue server)
+
+After basic pcdl analysis, invoke the `/spatial-analysis` skill for:
+- Composable panel of spatial statistics across all timesteps (Ripley's K, Clark–Evans, neighbourhood entropy, diversity indices, etc.)
+- Spatial LDA — microenvironment topic discovery
+- Cell-graph network analysis (betweenness, assortativity, homophily)
+- Topological Mapper analysis (TDA landscape)
+
+The `output_folder` path comes from `get_simulation_status()` or the artifact directory shown by `create_physicell_project()`.
+
 ## 2. Hill Function Rules
 
 ### How rules work
