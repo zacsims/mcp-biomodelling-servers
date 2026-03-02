@@ -1871,10 +1871,10 @@ def add_single_cell_rule(
     update_signals_behaviors_context_from_config(session.config)
 
     # --- "From 0 towards 0" detection ---
-    # If both the base_value (min_signal) and the XML default are 0, the Hill
+    # If both the XML default (base) and the saturation_value are 0, the Hill
     # function evaluates to 0 everywhere, making the rule silently useless.
     xml_default = _get_behavior_default_from_config(session, cell_type.strip(), behavior.strip())
-    if xml_default is not None and xml_default == 0 and min_signal == 0:
+    if xml_default is not None and xml_default == 0 and saturation_value == 0:
         b = behavior.strip()
         ct = cell_type.strip()
         fix = None
@@ -1886,7 +1886,7 @@ def add_single_cell_rule(
             fix = (
                 f"Call `set_cell_transformation_rate(cell_type=\"{ct}\", "
                 f"target_cell_type=\"{target}\", rate=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         elif b.endswith(" secretion") or b.endswith(" uptake"):
             substrate = b.rsplit(" ", 1)[0]
@@ -1894,14 +1894,14 @@ def add_single_cell_rule(
             fix = (
                 f"Call `set_substrate_interaction(cell_type=\"{ct}\", "
                 f"substrate=\"{substrate}\", {rate_type}=0.1)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         elif b in ("apoptosis", "necrosis"):
             rate_kwarg = f"{b}_rate"
             fix = (
                 f"Call `configure_cell_parameters(cell_type=\"{ct}\", "
                 f"{rate_kwarg}=0.0001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         # Per-cell-type interactions: attack, phagocytose (live), fuse
         elif b.startswith("attack "):
@@ -1909,7 +1909,7 @@ def add_single_cell_rule(
             fix = (
                 f"Call `set_cell_interaction(cell_type=\"{ct}\", "
                 f"target_cell_type=\"{target}\", interaction_type=\"attack\", rate=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         elif b.startswith("phagocytose ") and b not in (
             "phagocytose apoptotic cell", "phagocytose necrotic cell", "phagocytose other dead cell"
@@ -1918,14 +1918,14 @@ def add_single_cell_rule(
             fix = (
                 f"Call `set_cell_interaction(cell_type=\"{ct}\", "
                 f"target_cell_type=\"{target}\", interaction_type=\"phagocytose\", rate=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         elif b.startswith("fuse to "):
             target = b[len("fuse to "):]
             fix = (
                 f"Call `set_cell_interaction(cell_type=\"{ct}\", "
                 f"target_cell_type=\"{target}\", interaction_type=\"fuse\", rate=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         # Dead-cell phagocytosis
         elif b in ("phagocytose apoptotic cell", "phagocytose necrotic cell", "phagocytose other dead cell"):
@@ -1938,7 +1938,7 @@ def add_single_cell_rule(
             fix = (
                 f"Call `configure_cell_interactions(cell_type=\"{ct}\", "
                 f"{param}=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         # Mechanics: attachment/detachment
         elif b in ("cell attachment rate", "cell detachment rate"):
@@ -1946,7 +1946,7 @@ def add_single_cell_rule(
             fix = (
                 f"Call `configure_cell_mechanics(cell_type=\"{ct}\", "
                 f"{param}=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         # Cell integrity: damage/repair
         elif b in ("damage rate", "damage repair rate"):
@@ -1954,7 +1954,7 @@ def add_single_cell_rule(
             fix = (
                 f"Call `configure_cell_integrity(cell_type=\"{ct}\", "
                 f"{param}=0.001)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         # Chemotaxis: "chemotactic response to X"
         elif b.startswith("chemotactic response to "):
@@ -1962,26 +1962,26 @@ def add_single_cell_rule(
             fix = (
                 f"Call `set_advanced_chemotaxis(cell_type=\"{ct}\", "
                 f"substrate=\"{substrate}\", sensitivity=0.5)` first, "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
         # Cycle entry / exit from cycle phase
         elif b == "cycle entry" or b.startswith("exit from cycle phase "):
             fix = (
                 f"Call `set_cycle_transition_rate(cell_type=\"{ct}\", "
                 f"rate=0.00072)` first (0.00072 ≈ 24h doubling time), "
-                f"then re-add this rule with `min_signal=0`."
+                f"then re-add this rule."
             )
 
         if fix is None:
             fix = (
                 f"Set a nonzero XML default for `{b}` before adding this rule, "
-                f"or use a nonzero `min_signal` value."
+                f"or pass a nonzero `saturation_value`."
             )
 
         return (
             f"**Error: \"From 0 towards 0\" rule detected — this rule would have no effect.**\n\n"
-            f"Both `min_signal` (base_value={min_signal}) and the XML default for "
-            f"`{b}` (={xml_default}) are 0.\n"
+            f"Both the XML default for `{b}` (={xml_default}) and `saturation_value` "
+            f"(={saturation_value}) are 0.\n"
             f"The Hill function computes: rate = 0 + (0 − 0) × H(signal) = **0 always**.\n\n"
             f"**Fix:** {fix}"
         )
@@ -1997,8 +1997,8 @@ def add_single_cell_rule(
             "signal": signal.strip(),
             "direction": direction,
             "behavior": behavior.strip(),
-            "min_signal": min_signal,
-            "max_signal": max_signal,
+            "min_signal": saturation_value,
+            "max_signal": saturation_value,
             "hill_power": hill_power,
             "half_max": half_max
         }
@@ -2011,7 +2011,7 @@ def add_single_cell_rule(
             signal=signal.strip(),
             direction=direction,
             behavior=behavior.strip(),
-            base_value=min_signal,  # Map min_signal to base_value
+            base_value=saturation_value,
             half_max=half_max,
             hill_power=hill_power,
             apply_to_dead=0
@@ -2025,7 +2025,7 @@ def add_single_cell_rule(
             signal=signal.strip(),
             direction=direction,
             behavior=behavior.strip(),
-            base_value=min_signal,  # Map min_signal to base_value
+            base_value=saturation_value,
             half_max=half_max,
             hill_power=hill_power,
             apply_to_dead=0
@@ -2055,20 +2055,14 @@ def add_single_cell_rule(
         session.mark_xml_modification()
 
     # Format result with interpolation range
-    # For "increases": low signal → base_value (min_signal), high signal → xml_default (saturation)
-    # For "decreases": low signal → xml_default (saturation), high signal → base_value (min_signal)
     result = f"**Cell rule added:**\n"
     result += f"- Rule: {cell_type} | {signal} {direction} → {behavior}\n"
     result += f"- Saturation value: {saturation_value}\n"
     result += f"- Half-max: {half_max}\n"
     result += f"- Hill power: {hill_power}\n"
     if xml_default is not None:
-        if direction == "increases":
-            result += f"- At low signal: {behavior} = {min_signal:g} (base_value)\n"
-            result += f"- At high signal: {behavior} → {xml_default:g} (XML default/saturation)\n"
-        else:
-            result += f"- At high signal: {behavior} = {min_signal:g} (base_value)\n"
-            result += f"- At low signal: {behavior} → {xml_default:g} (XML default/saturation)\n"
+        result += f"- At low signal: {behavior} = {xml_default:g} (XML default)\n"
+        result += f"- At high signal: {behavior} → {saturation_value:g} (saturation)\n"
     result += f"- Progress: {session.get_progress_percentage():.0f}%\n"
     
     # Check if ready for export based on core components (not arbitrary percentage)
