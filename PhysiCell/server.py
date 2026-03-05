@@ -863,18 +863,21 @@ def add_single_substrate(
     return result
 
 def _expand_cell_type_interactions(session) -> None:
-    """Expand interaction & transformation dicts so every cell type lists every other cell type.
+    """Expand per-cell-type dicts so every cell type lists every other cell type.
 
-    The library initialises these dicts with a single ``"default": 0.0`` placeholder.
-    PhysiCell XML expects an explicit entry for each cell type present in the simulation
-    (e.g. ``<attack_rate name="tumor">``).  This helper replaces the placeholder with
-    concrete entries for all currently-defined cell types, preserving any rates that
-    were already set via setter tools.
+    The library initialises these dicts with a single ``"default"`` placeholder.
+    PhysiCell XML expects an explicit entry for each cell type present in the
+    simulation (e.g. ``<attack_rate name="tumor">``).  This helper replaces the
+    placeholder with concrete entries for all currently-defined cell types,
+    preserving any values that were already set via setter tools.
+
+    Covers: cell_interactions (phagocytosis, attack, fusion), cell_transformations,
+    and mechanics (cell_adhesion_affinities).
     """
     cell_types_dict = session.config.cell_types.cell_types
     all_names = list(cell_types_dict.keys())
 
-    # Dicts inside cell_interactions that are per-target-cell-type
+    # Dicts inside cell_interactions that are per-target-cell-type (default 0.0)
     interaction_keys = ["live_phagocytosis_rates", "attack_rates", "fusion_rates"]
     transformation_key = "transformation_rates"
 
@@ -885,22 +888,29 @@ def _expand_cell_type_interactions(session) -> None:
         interactions = phenotype.get("cell_interactions", {})
         for ik in interaction_keys:
             rates = interactions.get(ik, {})
-            # Remove the placeholder "default" key
-            rates.pop("default", None)
-            # Ensure an entry for every cell type (including self)
+            default_val = rates.pop("default", 0.0)
             for other in all_names:
                 if other not in rates:
-                    rates[other] = 0.0
+                    rates[other] = default_val
             interactions[ik] = rates
 
         # --- cell_transformations ---
         transformations = phenotype.get("cell_transformations", {})
         t_rates = transformations.get(transformation_key, {})
-        t_rates.pop("default", None)
+        default_val = t_rates.pop("default", 0.0)
         for other in all_names:
             if other not in t_rates:
-                t_rates[other] = 0.0
+                t_rates[other] = default_val
         transformations[transformation_key] = t_rates
+
+        # --- mechanics: cell_adhesion_affinities (default 1.0) ---
+        mechanics = phenotype.get("mechanics", {})
+        affinities = mechanics.get("cell_adhesion_affinities", {})
+        default_val = affinities.pop("default", 1.0)
+        for other in all_names:
+            if other not in affinities:
+                affinities[other] = default_val
+        mechanics["cell_adhesion_affinities"] = affinities
 
 
 @mcp.tool()
