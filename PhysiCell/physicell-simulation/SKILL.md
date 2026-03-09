@@ -26,6 +26,8 @@ These rules are enforced by server-side validation. Violating them will cause to
 
 4. **Always search literature before adding rules.** Before choosing half_max, hill_power, or rate values, call `search_literature()` to get evidence-based guidance. Do NOT rely on training data or memorized citations — always make the actual tool call. After adding each rule, record the evidence with `store_rule_justification()`. If `search_literature()` fails with a connection error, you may proceed without it, but you must attempt the call first.
 
+5. **Respect user-specified parameter values.** When the user provides specific values for any simulation parameter — domain size, cell counts, substrate concentrations, diffusion/decay rates, initial conditions, cell volumes, motility speeds, death rates, rule parameters, etc. — treat those values as **fixed constraints**. Do NOT adjust, round, override, or "optimize" them during model building, calibration, exploration, or iterative refinement unless the user **explicitly** instructs you to change them. If you believe a user-specified value may be problematic, explain your concern and ask before modifying it.
+
 ## 1. Tool Ordering
 
 Follow this sequence. Do not skip steps. Literature search and justifications happen *alongside* rule creation, not as a separate phase.
