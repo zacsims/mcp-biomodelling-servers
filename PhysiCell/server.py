@@ -2401,14 +2401,12 @@ def get_simulation_summary(
     result += f"- **Cell Types ({len(cell_types)}):** {', '.join(cell_types[:3])}{'...' if len(cell_types) > 3 else 'None' if not cell_types else ''}\n"
     result += f"- **Rules:** {rules_count}\n"
     if session.rule_validations:
-        validated = len(session.rule_validations)
-        strong = sum(1 for rv in session.rule_validations if rv.support_level == "strong")
-        moderate = sum(1 for rv in session.rule_validations if rv.support_level == "moderate")
-        flagged = sum(1 for rv in session.rule_validations if rv.support_level in ("unsupported", "contradictory"))
-        result += f"- **Rules Validated:** {validated} ({strong} strong, {moderate} moderate"
-        if flagged:
-            result += f", {flagged} flagged"
-        result += ")\n"
+        justified = len(session.rule_validations)
+        with_citations = sum(1 for rv in session.rule_validations if rv.key_citations)
+        result += f"- **Rules Justified:** {justified}"
+        if with_citations:
+            result += f" ({with_citations} with citations)"
+        result += "\n"
     if session.initial_cells_count > 0:
         result += f"- **Initial Cell Positions:** {session.initial_cells_count}\n"
     result += f"- **PhysiBoSS Models:** {session.physiboss_models_count}\n\n"
