@@ -1996,13 +1996,10 @@ def add_single_cell_rule(
             f"**Fix:** {fix}"
         )
 
-    # Add rule to configuration - check if we should use the new API or legacy
+    # Add rule to configuration
     try:
-        # Try new API first (from test)
-        from physicell_config.modules.cell_rules import CellRulesModule
-        cell_rules = CellRulesModule(session.config)
-        
-        rule = {
+        # Add to CellRulesModule (for in-memory tracking)
+        session.config.cell_rules.rules.append({
             "cell_type": cell_type.strip(),
             "signal": signal.strip(),
             "direction": direction,
@@ -2011,10 +2008,9 @@ def add_single_cell_rule(
             "max_signal": saturation_value,
             "hill_power": hill_power,
             "half_max": half_max
-        }
-        cell_rules.rules.append(rule)
-        
-        # Also add to legacy API for export compatibility
+        })
+
+        # Add to CellRulesCSV (for CSV export)
         rules = session.config.cell_rules_csv
         rules.add_rule(
             cell_type=cell_type.strip(),
@@ -2378,12 +2374,8 @@ def get_simulation_summary(
     except:
         cell_types = []
     
-    # Get rules count
-    rules_count = 0
-    try:
-        rules_count = len(session.config.cell_rules.get_rules())
-    except:
-        rules_count = 0
+    # Get rules count from session counter (cell_rules module may not track correctly)
+    rules_count = session.rules_count
     
     # Calculate progress
     progress = session.get_progress_percentage()
