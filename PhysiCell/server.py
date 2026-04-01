@@ -2553,14 +2553,12 @@ def export_cell_rules_csv(
         return "**Error:** No simulation configured. Create domain and add components first."
     
     try:
-        # Check rules via CellRulesModule API
-        rule_count = len(session.config.cell_rules.get_rules())
-        
+        # Get the CSV rules module (where add_single_cell_rule stores rules)
+        csv_rules = session.config.cell_rules_csv
+        rule_count = len(csv_rules.rules)
+
         if rule_count == 0:
             return "**No cell rules to export**\n\nUse add_single_cell_rule() to create signal-behavior relationships first."
-        
-        # For now, export using the legacy CSV API (since that's what PhysiCell expects)
-        # TODO: If new API rules exist, we might need to convert them to legacy format
 
         # Ensure we write to a writable location
         output_dir = MCP_OUTPUT_DIR
@@ -2569,7 +2567,7 @@ def export_cell_rules_csv(
         # Always save as cell_rules.csv for consistency with create_physicell_project
         output_path = output_dir / "cell_rules.csv"
 
-        rules.generate_csv(str(output_path))
+        csv_rules.generate_csv(str(output_path))
 
         # Fix CRLF → LF: the library's csv.writer uses \r\n (RFC 4180),
         # but PhysiCell doesn't strip \r, causing the last field to include
