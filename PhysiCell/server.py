@@ -1844,7 +1844,7 @@ def add_single_cell_rule(
     signal: Annotated[str, Field(description="Signal name. Use list_all_available_signals() to see options.")],
     direction: Annotated[str, Field(description="'increases' or 'decreases' — whether the signal promotes or suppresses the behavior.")],
     behavior: Annotated[str, Field(description="Behavior name. Use list_all_available_behaviors() to see options.")],
-    saturation_value: float = Field(default=1.0, description="Value of the behavior when the signal is at saturation (maximum effect)."),
+    saturation_value: Annotated[float, Field(description="Behavior value at maximum signal effect. For 'decreases' rules, typically 0. For 'increases' rules, set to the desired maximum rate. Must be explicitly provided — there is no default.")],
     half_max: float = Field(default=0.5, description="Signal level at which the behavior is halfway between its base value and the saturation value."),
     hill_power: float = Field(default=4.0, description="Hill coefficient controlling the sharpness of the dose-response curve (typical: 1–8)."),
     session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),

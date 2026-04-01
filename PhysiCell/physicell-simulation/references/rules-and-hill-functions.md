@@ -56,7 +56,7 @@ The behavior value when the signal has **maximum** effect:
 - For `"decreases"`: set `saturation_value` **lower** than XML default (typically 0) — the behavior is suppressed at high signal
 - For `"increases"`: set `saturation_value` **higher** than XML default — the behavior is amplified at high signal
 
-Default in tool: 1.0. **Check that this makes sense for your behavior** — a necrosis rate of 1.0/min would be extremely aggressive.
+This parameter is **required** (no default). Always choose a biologically meaningful value — never use an arbitrary number like 1.0 without justification.
 
 #### XML default (NOT in CSV — comes from cell type config)
 

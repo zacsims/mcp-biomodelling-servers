@@ -68,7 +68,7 @@ create_session
 
 `add_single_cell_rule` creates a dose-response rule using a Hill function. The tool parameters are:
 
-- **`saturation_value`** (default 1.0) — the behavior's value when the signal has **maximum** effect
+- **`saturation_value`** (required, no default) — the behavior's value when the signal has **maximum** effect
 - **`half_max`** (default 0.5) — the signal concentration at which the effect is 50%
 - **`hill_power`** (default 4.0) — steepness: 1=gradual, 4=moderate, 8=switch-like
 
