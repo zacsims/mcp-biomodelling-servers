@@ -66,25 +66,28 @@ create_session
 
 ### How rules work
 
-`add_single_cell_rule` writes a CSV row that PhysiCell reads to compute behavior via a Hill function:
+`add_single_cell_rule` creates a dose-response rule using a Hill function. The tool parameters are:
 
-```
-                                      signal^n
-behavior = base_value + (saturation - base_value) × ─────────────────
-                                      half_max^n + signal^n
-```
+- **`saturation_value`** (default 1.0) — the behavior's value when the signal has **maximum** effect
+- **`half_max`** (default 0.5) — the signal concentration at which the effect is 50%
+- **`hill_power`** (default 4.0) — steepness: 1=gradual, 4=moderate, 8=switch-like
 
-- **base_value** = `min_signal` parameter (default: 0). Behavior value when signal is absent.
-- **saturation** = XML default rate for that behavior. Comes from cell type config, NOT from the rule tool.
-- **half_max** = signal level at 50% effect.
-- **hill_power** (n) = steepness: 1=gradual, 4=moderate, 8=switch-like.
+The behavior interpolates between two endpoints as the signal changes:
 
-`direction = "increases"`: base_value (low signal) → saturation (high signal).
-`direction = "decreases"`: saturation (low signal) → base_value (high signal).
+| | At low signal (signal ≈ 0) | At high signal (signal → ∞) |
+|---|---|---|
+| **Value** | XML default (set by setter tools) | `saturation_value` (set in the rule) |
+
+This is the same for both directions. The `direction` parameter describes the biological relationship:
+
+- `"decreases"` → high signal **suppresses** the behavior → set `saturation_value` **lower** than the XML default (typically 0)
+- `"increases"` → high signal **promotes** the behavior → set `saturation_value` **higher** than the XML default
+
+**The XML default is always the starting point (behavior at zero signal).** You control where the behavior goes at high signal via `saturation_value`.
 
 ### The "from 0 towards 0" bug
 
-If base_value = 0 AND the XML default is also 0:
+If `saturation_value = 0` AND the XML default is also 0:
 
 ```
 behavior = 0 + (0 - 0) × Hill(signal) = 0    ← ALWAYS ZERO, rule does nothing
@@ -106,7 +109,7 @@ No error is raised. The simulation runs but the rule has no effect.
 | attachment / detachment rate | 0 | `configure_cell_mechanics()` |
 | damage / damage repair rate | 0 | `configure_cell_integrity()` |
 | chemotactic response to X | 0 | `set_advanced_chemotaxis()` |
-| custom behaviors | 0 | No setter — use nonzero `min_signal` |
+| custom behaviors | 0 | No setter — pass nonzero `saturation_value` |
 
 The server validates rules and rejects "from 0 towards 0" with guidance on which setter to use.
 
@@ -150,24 +153,48 @@ set_chemotaxis(cell_type="motile", substrate="oxygen", enabled=True, direction=1
 set_advanced_chemotaxis(cell_type="motile", substrate="oxygen", sensitivity=0.5, enabled=True)
 ```
 
-### Worked example: Oxygen → Necrosis
+### Worked examples
 
-Goal: Low oxygen increases necrosis rate.
+**Example 1: Oxygen → Necrosis** (low O₂ increases necrosis)
 
 ```python
-# 1. Cell type has necrosis_rate=0.0001 from configure_cell_parameters → XML default = 0.0001 ✓
-# 2. Rule: oxygen DECREASES necrosis (high O2 = less necrosis)
+# 1. Set nonzero XML default for necrosis:
+configure_cell_parameters(cell_type="tumor", necrosis_rate=0.00277)
+# XML default is now 0.00277
+
+# 2. Rule: oxygen DECREASES necrosis (high O₂ suppresses it toward 0)
 add_single_cell_rule(
     cell_type="tumor",
     signal="oxygen",
-    direction="decreases",     # high oxygen → LESS necrosis
+    direction="decreases",
     behavior="necrosis",
-    min_signal=0.0,            # base_value: necrosis at high O2
-    max_signal=38,
-    half_max=5.0,              # O2 level at 50% effect
+    saturation_value=0,        # necrosis → 0 at high O₂
+    half_max=3.75,             # O₂ level at 50% effect (mmHg)
+    hill_power=8               # sharp threshold
+)
+# At low O₂:  necrosis = 0.00277 (XML default)
+# At high O₂: necrosis → 0 (saturation_value)
+```
+
+**Example 2: Oxygen → Phenotype reversion** (high O₂ increases reversion rate)
+
+```python
+# 1. Set nonzero XML default for transformation:
+set_cell_transformation_rate(cell_type="motile_tumor", target_cell_type="tumor", rate=0.001)
+# XML default is now 0.001
+
+# 2. Rule: oxygen INCREASES reversion (high O₂ promotes reversion)
+add_single_cell_rule(
+    cell_type="motile_tumor",
+    signal="oxygen",
+    direction="increases",
+    behavior="transition to tumor",
+    saturation_value=0.005,    # reversion rate → 0.005 at high O₂
+    half_max=15,               # O₂ level at 50% effect (mmHg)
     hill_power=4
 )
-# Result: necrosis = 0 at high O2, rises toward 0.0001 as O2 drops ✓
+# At low O₂:  reversion = 0.001 (XML default — slow reversion in hypoxia)
+# At high O₂: reversion → 0.005 (saturation_value — faster in normoxia)
 ```
 
 ## 3. Common Mistakes
@@ -338,9 +365,9 @@ Basic tumor growth simulation:
 5. add_single_cell_type("tumor")
 6. configure_cell_parameters(cell_type="tumor", volume_total=2500, motility_speed=0.5, apoptosis_rate=5.31667e-5, necrosis_rate=0.00277)
 7. set_substrate_interaction(cell_type="tumor", substrate="oxygen", uptake_rate=10.0)
-8. add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis", min_signal=0, half_max=3.75, hill_power=8)
+8. add_single_cell_rule(cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis", saturation_value=0, half_max=3.75, hill_power=8)
 9. store_rule_justification(cell_type="tumor", signal="oxygen", direction="decreases", behavior="necrosis", justification="Hypoxia-induced necrosis threshold ~5 mmHg", key_citations="Vaupel 2004")
-10. add_single_cell_rule(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", min_signal=0, half_max=1.0, hill_power=4)
+10. add_single_cell_rule(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", saturation_value=0, half_max=1.0, hill_power=4)
 11. store_rule_justification(cell_type="tumor", signal="pressure", direction="decreases", behavior="cycle entry", justification="Contact inhibition of proliferation", key_citations="Helmlinger 1997")
 12. place_initial_cells(cell_type="tumor", pattern="random_disc", num_cells=200, radius=100)
 13. get_rule_justifications()

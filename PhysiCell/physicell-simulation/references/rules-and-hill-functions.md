@@ -5,7 +5,7 @@
 PhysiCell's signal-behavior rules define how cells respond to their environment. Rules are stored in a CSV file (`cell_rules.csv`) with this format (no header):
 
 ```
-cell_type, signal, direction, behavior, base_value, half_max, hill_power, apply_to_dead
+cell_type, signal, direction, behavior, saturation_value, half_max, hill_power, apply_to_dead
 ```
 
 Example row:
@@ -17,55 +17,64 @@ tumor,oxygen,decreases,necrosis,0,3.75,8,0
 
 ### The Core Equation
 
-For `direction = "increases"`:
+The behavior interpolates between the **XML default** (behavior at zero signal) and the **saturation_value** (behavior at maximum signal effect):
 
 ```
-                                      signal^n
-behavior = base + (sat - base) × ─────────────────
-                                  half_max^n + signal^n
+                                                signal^n
+behavior = XML_default + (saturation_value - XML_default) × ─────────────────
+                                                half_max^n + signal^n
 ```
 
-For `direction = "decreases"`:
+For `direction = "decreases"`, the Hill term is inverted:
 
 ```
-                                            signal^n
-behavior = sat + (base - sat) × ─────────────────────
-                                  half_max^n + signal^n
+                                                half_max^n
+behavior = saturation_value + (XML_default - saturation_value) × ─────────────────
+                                                  half_max^n + signal^n
 ```
+
+Both formulas produce the **same endpoints**:
+
+| | At signal ≈ 0 | At signal → ∞ |
+|---|---|---|
+| **behavior =** | XML default | saturation_value |
+
+The direction only affects the **shape** of the curve (sigmoid vs inverted sigmoid).
 
 Where:
-- **base** = `base_value` from the CSV (= `min_signal` parameter in the tool)
-- **sat** = saturation value = **XML default rate** for that behavior
-- **half_max** = signal concentration at 50% effect
-- **n** = `hill_power` = Hill coefficient (steepness)
+- **XML_default** = the behavior's value set via setter tools (e.g., `configure_cell_parameters(necrosis_rate=0.00277)`)
+- **saturation_value** = the `saturation_value` parameter in `add_single_cell_rule()` (CSV column 5)
+- **half_max** = signal concentration at 50% effect (CSV column 6)
+- **n** = `hill_power` = Hill coefficient / steepness (CSV column 7)
 
 ### Parameter Interpretation
 
-#### `base_value` (CSV column 5, tool parameter: `min_signal`)
+#### `saturation_value` (CSV column 5, tool parameter: `saturation_value`)
 
-The behavior value at the signal extreme **opposite** to the direction:
-- For "increases": base_value is the behavior when signal is LOW (near zero)
-- For "decreases": base_value is the behavior when signal is HIGH (saturated)
+The behavior value when the signal has **maximum** effect:
 
-Default in tool: 0. This often makes sense (e.g., no necrosis when oxygen is abundant), but check that the saturation value is nonzero.
+- For `"decreases"`: set `saturation_value` **lower** than XML default (typically 0) — the behavior is suppressed at high signal
+- For `"increases"`: set `saturation_value` **higher** than XML default — the behavior is amplified at high signal
 
-#### Saturation value (NOT in CSV — comes from XML)
+Default in tool: 1.0. **Check that this makes sense for your behavior** — a necrosis rate of 1.0/min would be extremely aggressive.
 
-The behavior value at the signal extreme **aligned** with the direction:
-- For "increases": saturation is the behavior when signal is HIGH
-- For "decreases": saturation is the behavior when signal is LOW
+#### XML default (NOT in CSV — comes from cell type config)
 
-**This value is the XML default rate for the target behavior.** It is set by:
-- `configure_cell_parameters()` — sets apoptosis_rate, necrosis_rate, motility_speed
-- Cell cycle model defaults — sets cycle entry / transition rates
-- Template defaults — applied when `add_single_cell_type()` is called
+The behavior value when the signal is **absent** (signal ≈ 0). This is set by:
+- `configure_cell_parameters()` — sets apoptosis_rate, necrosis_rate, motility_speed, etc.
+- `set_cycle_transition_rate()` — sets cycle entry / phase transition rates
+- `set_cell_transformation_rate()` — sets phenotype transition rates
+- `set_substrate_interaction()` — sets secretion/uptake rates
+- `set_advanced_chemotaxis()` — sets chemotactic sensitivity
+
+**If the XML default is 0 AND saturation_value is 0, the rule does nothing** (the "from 0 towards 0" bug).
 
 #### `half_max` (CSV column 6)
 
-The signal concentration at which the behavior is exactly halfway between base and saturation.
+The signal concentration at which the behavior is exactly halfway between XML default and saturation_value.
 
 ```
-At signal = half_max:  behavior = (base + sat) / 2
+At signal = half_max:  behavior = (XML_default + saturation_value) / 2
 ```
 
 Choosing half_max:
@@ -97,7 +106,7 @@ sat ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ x x x
                   x
                 x
               x
-base ─ x x x ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+XML ─ x x x ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
       0         half_max              max signal
 
 sat ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ x x x x x
@@ -107,7 +116,7 @@ sat ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ x x x x x
                          x
                         x
                        x
-base ─ x x x x x x x x ─ ─ ─ ─ ─ ─ ─ ─ ─
+XML ─ x x x x x x x x ─ ─ ─ ─ ─ ─ ─ ─ ─
       0         half_max              max signal
 ```
 
@@ -115,7 +124,7 @@ base ─ x x x x x x x x ─ ─ ─ ─ ─ ─ ─ ─ ─
 
 ### What happens
 
-When both `base_value = 0` and the XML default rate (saturation) = 0:
+When both `saturation_value = 0` and the XML default rate = 0:
 
 ```
 behavior = 0 + (0 - 0) × Hill(signal) = 0
@@ -125,27 +134,18 @@ The rule produces zero for ALL signal values. It silently does nothing.
 
 ### Where XML defaults come from
 
-The saturation value for each behavior is determined by the cell type's XML configuration:
-
 | Behavior | XML Source | How it's set |
 |---|---|---|
-| cycle entry | `<cycle>` model's transition rate | Cell cycle model template default |
-| exit from cycle phase N | `<cycle>` transition_rates | Explicitly via library or template |
+| cycle entry | `<cycle>` model's transition rate | `set_cycle_transition_rate()` |
+| exit from cycle phase N | `<cycle>` transition_rates | `set_cycle_transition_rate(from_phase, to_phase)` |
 | apoptosis | `<death><model>` rate | `configure_cell_parameters(apoptosis_rate=X)` |
 | necrosis | `<death><model>` rate | `configure_cell_parameters(necrosis_rate=X)` |
 | migration speed | `<motility><speed>` | `configure_cell_parameters(motility_speed=X)` |
 | persistence time | `<motility><persistence_time>` | `configure_cell_parameters(persistence_time=X)` |
 | secretion of X | `<secretion><substrate><secretion_rate>` | `set_substrate_interaction(secretion_rate=X)` |
 | uptake of X | `<secretion><substrate><uptake_rate>` | `set_substrate_interaction(uptake_rate=X)` |
-| chemotactic response | `<motility><chemotaxis><chemotactic_sensitivity>` | Advanced motility settings |
-
-### Common "from 0 towards 0" scenarios
-
-1. **Transition rates**: Most cycle models have transition rates = 0 by default for unused phases. Adding a rule that targets these transitions does nothing.
-
-2. **Custom behaviors**: Any behavior not explicitly initialized has XML default = 0.
-
-3. **Secretion/uptake as rule targets**: If `set_substrate_interaction()` wasn't called first, the XML default is 0.
+| chemotactic response | `<motility><chemotaxis><chemotactic_sensitivity>` | `set_advanced_chemotaxis(sensitivity=X)` |
+| transition to X | `<cell_transformations>` | `set_cell_transformation_rate(rate=X)` |
 
 ### How to verify rules work
 
@@ -153,22 +153,18 @@ After running a simulation, check `detailed_rules.txt` in the output directory. 
 
 ```
 # In detailed_rules.txt:
-tumor: oxygen decreases necrosis from 0.0000 towards 0.0028
+tumor: oxygen decreases necrosis from 0.0028 towards 0.0000
 #                                     ^^^^^^           ^^^^^^
-#                                     base_value       saturation (from XML)
+#                                     XML default       saturation_value
 ```
 
-If saturation = 0.0000, the rule is broken.
+If both values are 0.0000, the rule is broken.
 
 ### Fix procedure
 
 1. Identify which behavior is the target
-2. Set a nonzero value for that behavior BEFORE adding the rule:
-   - For death rates: `configure_cell_parameters(apoptosis_rate=X, necrosis_rate=Y)`
-   - For motility: `configure_cell_parameters(motility_speed=X)`
-   - For secretion: `set_substrate_interaction(secretion_rate=X)`
-   - For cycle entry: ensure the cycle model has nonzero transition rates (Ki67_basic and live models do by default)
-3. Then add the rule — it will interpolate between base_value and the (now nonzero) XML default
+2. Set a nonzero XML default for that behavior BEFORE adding the rule (see setter table above)
+3. Then add the rule — it will interpolate between XML default and saturation_value
 
 ## Worked Examples
 
@@ -179,20 +175,21 @@ If saturation = 0.0000, the rule is broken.
 ```python
 # Step 1: Ensure necrosis rate is nonzero in XML
 configure_cell_parameters(cell_type="tumor", necrosis_rate=0.00277)
-# → XML default necrosis rate = 0.00277 (saturation value)
+# → XML default necrosis rate = 0.00277
 
 # Step 2: Add rule — oxygen DECREASES necrosis
-# (high oxygen → less necrosis, low oxygen → more necrosis up to 0.00277)
+# (high oxygen → less necrosis, low oxygen → more necrosis)
 add_single_cell_rule(
     cell_type="tumor",
     signal="oxygen",
     direction="decreases",
     behavior="necrosis",
-    min_signal=0,         # base_value: necrosis rate at HIGH oxygen = 0
-    half_max=3.75,        # oxygen level (mmHg) at 50% necrosis
+    saturation_value=0,   # necrosis → 0 at high O₂
+    half_max=3.75,        # oxygen level (mmHg) at 50% effect
     hill_power=8          # steep response (threshold-like)
 )
-# Result: necrosis rate goes from 0 (abundant O2) to 0.00277 (no O2) ✓
+# At low O₂:  necrosis = 0.00277 (XML default)
+# At high O₂: necrosis → 0 (saturation_value)  ✓
 ```
 
 ### Example 2: Pressure-dependent proliferation
@@ -200,8 +197,9 @@ add_single_cell_rule(
 **Goal**: High mechanical pressure stops cell division.
 
 ```python
-# Step 1: cycle entry rate comes from Ki67_basic model (~0.00072 by default) ✓
-# No extra configuration needed
+# Step 1: Set cycle entry rate
+set_cycle_transition_rate(cell_type="tumor", rate=0.00072)
+# → XML default cycle entry = 0.00072
 
 # Step 2: Add rule — pressure DECREASES cycle entry
 add_single_cell_rule(
@@ -209,11 +207,12 @@ add_single_cell_rule(
     signal="pressure",
     direction="decreases",
     behavior="cycle entry",
-    min_signal=0,         # base_value: cycle rate at HIGH pressure = 0 (stopped)
-    half_max=1.0,         # pressure level at 50% growth inhibition
+    saturation_value=0,   # proliferation → 0 at high pressure
+    half_max=1.0,         # pressure at 50% growth inhibition
     hill_power=4          # moderate steepness
 )
-# Result: proliferation goes from 0.00072 (no pressure) to 0 (high pressure) ✓
+# At low pressure:  cycle entry = 0.00072 (XML default)
+# At high pressure: cycle entry → 0 (saturation_value)  ✓
 ```
 
 ### Example 3: Chemokine-directed migration
@@ -222,8 +221,8 @@ add_single_cell_rule(
 
 ```python
 # Step 1: Set base migration speed
-configure_cell_parameters(cell_type="immune", motility_speed=0.5)
-# → XML default migration speed = 0.5
+configure_cell_parameters(cell_type="immune", motility_speed=0.1)
+# → XML default migration speed = 0.1
 
 # Step 2: Add rule — chemokine INCREASES migration speed
 add_single_cell_rule(
@@ -231,11 +230,12 @@ add_single_cell_rule(
     signal="chemokine",
     direction="increases",
     behavior="migration speed",
-    min_signal=0.1,       # base_value: speed when no chemokine = 0.1
+    saturation_value=0.5, # speed → 0.5 at high chemokine
     half_max=0.5,         # chemokine level at 50% effect
     hill_power=4
 )
-# Result: speed goes from 0.1 (no chemokine) to 0.5 (high chemokine) ✓
+# At low chemokine:  speed = 0.1 (XML default)
+# At high chemokine: speed → 0.5 (saturation_value)  ✓
 ```
 
 ### Example 4: BROKEN — "from 0 towards 0"
@@ -243,10 +243,7 @@ add_single_cell_rule(
 **Goal**: Drug increases apoptosis. **BUG**: forgot to set apoptosis rate.
 
 ```python
-# Step 1: MISSING — apoptosis_rate left at default
-configure_cell_parameters(cell_type="tumor", motility_speed=0.5)
-# → apoptosis_rate = 0.0001 (template default — this is actually nonzero!)
-# But if template default were 0...
+# Step 1: MISSING — apoptosis_rate not set, XML default is 0
 
 # Step 2: Add rule
 add_single_cell_rule(
@@ -254,17 +251,17 @@ add_single_cell_rule(
     signal="drug",
     direction="increases",
     behavior="apoptosis",
-    min_signal=0,         # base_value = 0
+    saturation_value=0,   # also 0!
     half_max=0.5,
     hill_power=4
 )
-# IF XML default apoptosis = 0:
-#   behavior = 0 + (0 - 0) × Hill = 0  ← BROKEN!
-# IF XML default apoptosis = 0.0001:
-#   behavior = 0 + (0.0001 - 0) × Hill  ← works, but effect is tiny
+# behavior = 0 + (0 - 0) × Hill = 0  ← BROKEN! Rule does nothing.
 ```
 
-**Fix**: Set a meaningful apoptosis rate first:
+**Fix**: Set a meaningful apoptosis rate first, and use a nonzero saturation_value:
 ```python
-configure_cell_parameters(cell_type="tumor", apoptosis_rate=0.01)
+configure_cell_parameters(cell_type="tumor", apoptosis_rate=5.31667e-5)
+add_single_cell_rule(
+    ..., saturation_value=0.01, ...  # apoptosis increases to 0.01 at high drug
+)
 ```
