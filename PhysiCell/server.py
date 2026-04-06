@@ -3085,6 +3085,41 @@ def export_cells_csv(filename: str = "cells.csv") -> str:
 # HELPER FUNCTIONS (inspired by NeKo)
 # ============================================================================
 
+def _next_output_dir(project_name: str) -> Path:
+    """Return the next sequential output directory for a project and create it.
+
+    Scans user_projects/{project_name}/output_NNN directories, finds the
+    highest number, and returns a new directory with NNN+1.
+    """
+    project_dir = USER_PROJECTS_DIR / project_name
+    existing = sorted(project_dir.glob("output_[0-9][0-9][0-9]"))
+    if existing:
+        last_num = int(existing[-1].name.split("_")[1])
+    else:
+        last_num = 0
+    next_dir = project_dir / f"output_{last_num + 1:03d}"
+    next_dir.mkdir(parents=True, exist_ok=True)
+    return next_dir
+
+
+def _patch_xml_output_folder(xml_path: Path, output_folder: Path) -> None:
+    """Set <save><folder> in a PhysiCell XML config to an absolute path."""
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    folder_elem = root.find(".//save/folder")
+    if folder_elem is not None:
+        folder_elem.text = str(output_folder)
+    else:
+        # Create <save><folder> if missing
+        save_elem = root.find(".//save")
+        if save_elem is None:
+            save_elem = ET.SubElement(root, "save")
+        folder_elem = ET.SubElement(save_elem, "folder")
+        folder_elem.text = str(output_folder)
+    tree.write(xml_path, xml_declaration=True, encoding="unicode")
+
+
 def _resolve_output_folder(simulation_id: Optional[str] = None,
                            output_folder: Optional[str] = None) -> tuple:
     """Resolve simulation output folder from simulation_id or explicit path.
@@ -3471,16 +3506,12 @@ def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
         if not executable.exists():
             return f"Error: Executable '{exec_name}' not found. Run compile_physicell_project() first."
 
-        # Set up output folder
-        output_folder = PHYSICELL_ROOT / "output"
-        output_folder.mkdir(exist_ok=True)
+        # Set up a unique output directory for this run
+        output_folder = _next_output_dir(project_name)
 
-        # Clear previous output
-        for f in output_folder.glob("*"):
-            try:
-                f.unlink()
-            except:
-                pass
+        # Patch the loaded XML config so PhysiCell writes to this directory
+        loaded_config = PHYSICELL_ROOT / "config" / "PhysiCell_settings.xml"
+        _patch_xml_output_folder(loaded_config, output_folder)
 
         # Start the simulation process
         # Redirect stdout/stderr to a log file instead of PIPE to prevent

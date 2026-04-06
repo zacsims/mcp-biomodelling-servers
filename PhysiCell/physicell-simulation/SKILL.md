@@ -352,6 +352,8 @@ If rules seem inactive, check `detailed_rules.txt` for "from X towards Y" values
 - **`references/uq-calibration-workflow.md`** — Sensitivity analysis and calibration
 - **`references/physiboss-integration.md`** — Boolean network (MaBoSS/PhysiBoSS) integration
 - **`references/literature-search.md`** — Edison PaperQA3 literature search details
+- **`references/pcdl-analysis-reference.md`** — DataFrame columns, phase classification, tool-to-pcdl mapping
+- **`references/spatial-recapitulation-workflow.md`** — Reverse-engineer simulations from spatial statistics
 
 ## 10. Quick Start Template
 
@@ -383,3 +385,17 @@ Basic tumor growth simulation:
 23. generate_analysis_plot(simulation_id, plot_type="population_timeseries")
 24. generate_simulation_gif(simulation_id)
 ```
+
+## 11. Spatial Recapitulation
+
+When asked to recapitulate or reverse-engineer a simulation from its output:
+
+1. **Characterize** the target simulation using spatialtissuepy MCP tools (load output, compute spatial fingerprint)
+2. **Translate** statistics to PhysiCell parameters using the translation table in `references/spatial-recapitulation-workflow.md`
+3. **Build** the model following the standard workflow (Sections 1-7) with parameters derived from spatial statistics
+4. **Compare** fingerprints by running the same statistics on the new simulation's output
+5. **Iterate** using the decision table until convergence (population within 15%, clustering/colocalization patterns match)
+
+Key principle: match population dynamics first, then spatial organization.
+
+See `references/spatial-recapitulation-workflow.md` for tool call sequences, translation table, and convergence criteria.
