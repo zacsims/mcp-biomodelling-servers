@@ -554,6 +554,46 @@ To verify the server is registered:
 claude mcp list
 ```
 
+#### Environment Variables
+
+The server reads two environment variables to locate your PhysiCell installation and simulation outputs. Both have sensible defaults, so you only need to set them if your layout differs.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PHYSICELL_ROOT` | `~/PhysiCell` | Path to the compiled PhysiCell source tree. Used to locate `Makefile`, `sample_projects/template/`, `user_projects/`, and the compiled simulation binary. |
+| `MCP_OUTPUT_DIR` | `~/PhysiCell_MCP_Output` | Directory where the MCP server writes session artifacts (exported XML configs, `cells.csv`, rules CSVs, generated GIFs, etc.). |
+
+Set them at registration time with `-e VAR=value` if you want to override the defaults. For Claude Code:
+
+```bash
+claude mcp add PhysiCell \
+  -s user \
+  -e PHYSICELL_ROOT=/absolute/path/to/PhysiCell \
+  -e MCP_OUTPUT_DIR=/absolute/path/to/outputs \
+  -- uv run \
+  --project /absolute/path/to/mcp-biomodelling-servers/PhysiCell \
+  python /absolute/path/to/mcp-biomodelling-servers/PhysiCell/server.py
+```
+
+For Claude Desktop, add an `"env"` block to the server entry in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "PhysiCell": {
+      "command": "uv",
+      "args": ["run", "--project", "/absolute/path/to/mcp-biomodelling-servers/PhysiCell", "python", "/absolute/path/to/mcp-biomodelling-servers/PhysiCell/server.py"],
+      "env": {
+        "PHYSICELL_ROOT": "/absolute/path/to/PhysiCell",
+        "MCP_OUTPUT_DIR": "/absolute/path/to/outputs"
+      }
+    }
+  }
+}
+```
+
+If your PhysiCell source lives at `~/PhysiCell` (the default), you can skip this entirely.
+
 #### Companion Server: SpatialTissuePy
 
 The [SpatialTissuePy MCP server](https://github.com/emcramer/spatialtissuepy) is a companion server that analyzes spatial organization of cells in tissue samples from multiplexed imaging experiments and agent-based simulations. It pairs well with PhysiCell for analyzing simulation output or comparing simulated tissue architecture to experimental data.
