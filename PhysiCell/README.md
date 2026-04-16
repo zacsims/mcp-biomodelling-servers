@@ -554,6 +554,36 @@ To verify the server is registered:
 claude mcp list
 ```
 
+#### Companion Server: SpatialTissuePy
+
+The [SpatialTissuePy MCP server](https://github.com/emcramer/spatialtissuepy) is a companion server that analyzes spatial organization of cells in tissue samples from multiplexed imaging experiments and agent-based simulations. It pairs well with PhysiCell for analyzing simulation output or comparing simulated tissue architecture to experimental data.
+
+**Install (isolated tool install via `uv`):**
+
+```bash
+uv tool install "spatialtissuepy[mcp,viz] @ git+https://github.com/emcramer/spatialtissuepy"
+```
+
+The `mcp` extra pulls in the MCP server dependencies; the `viz` extra adds `matplotlib` (required — the server fails to start without it).
+
+**Register with Claude Code:**
+
+```bash
+claude mcp add spatialtissuepy -s user -- \
+  spatialtissuepy-mcp --data-dir /absolute/path/to/your/tissue/data
+```
+
+The `--data-dir` is where SpatialTissuePy looks for CSV/JSON spatial data files by default. Point it at wherever you keep exported PhysiCell cell positions or experimental imaging data.
+
+**Verify:**
+
+```bash
+claude mcp list
+# spatialtissuepy: ... - ✓ Connected
+```
+
+The server exposes ~97 tools across data loading, spatial statistics (Ripley's H, colocalization), network/topology analysis, LDA, and visualization. See its repo for the full tool list.
+
 #### Install the AgentSkill (Recommended)
 
 The repository includes a `physicell-simulation` AgentSkill that guides LLMs through correct simulation setup and prevents common mistakes (like the "from 0 towards 0" rule bug). To install it:
