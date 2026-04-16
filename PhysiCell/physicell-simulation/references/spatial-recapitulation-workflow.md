@@ -90,7 +90,7 @@ Target Fingerprint:
 
 ## Phase 2: Translate Statistics to Model
 
-Use the translation table below to choose PhysiCell parameters. Work top-to-bottom — population dynamics first, spatial organization second.
+Use the translation table below as a set of hypothetical guidelines to choose PhysiCell parameters. Work top-to-bottom. In spatial recapitulation of a simulation or a trajectory, it is important to match the spatial organization at each point in time and then sanity check with the population dynamics.  
 
 ### Translation Table
 
