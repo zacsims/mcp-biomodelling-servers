@@ -1,8 +1,3 @@
 {
-  "mcpServers": {
-    "spatialtissuepy": {
-      "command": "/Users/simsz/MCP/mcp-biomodelling-servers/PhysiCell/.venv/bin/spatialtissuepy-mcp",
-      "args": ["--data-dir", "/Users/simsz/Documents/SpatialTissue"]
-    }
-  }
+  "mcpServers": {}
 }
