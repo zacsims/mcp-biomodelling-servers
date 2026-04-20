@@ -26,6 +26,7 @@ MaBoSS/                # MaBoSS MCP server (Boolean / stochastic models)
 NeKo/                  # NeKo MCP server
 PhysiCell/             # PhysiCell settings / sessions MCP server
 LiteratureValidation/  # Literature validation MCP server (PaperQA2)
+.claude/agents/        # Claude Code subagents built on top of the MCP servers
 README.md
 ```
 Consult the README within each tool folder for: purpose, required Python packages, and any model/data file expectations. Installation instructions for the modelling tools themselves live *there* (or in the upstream project links above) — they are intentionally not duplicated here.
@@ -104,6 +105,25 @@ After saving, reload / restart VS Code so the MCP client reconnects.
 Activation / usage guidance in VS Code: https://code.visualstudio.com/docs/copilot/chat/mcp-servers
 
 You should then see the servers’ tools listed in the Copilot Chat “/tools” (or similar) UI. Invoke them by name with required parameters.
+
+---
+## Claude Code Agents
+
+In addition to the raw MCP servers, this repo ships a set of **Claude Code subagents** that compose the MCP tools into focused, task-specific assistants for agentic PhysiCell model construction, validation, calibration, UQ, and spatial analysis.
+
+See [`.claude/agents/README.md`](.claude/agents/README.md) for the full roster, workflow, and configuration notes.
+
+Quick roster:
+
+| Agent | Role |
+|---|---|
+| `model-constructor` | Builds a PhysiCell ABM end-to-end from a biological scenario with literature-backed justifications. |
+| `literature-rule-validator` | Audits rules against literature; classifies evidentiary strength. |
+| `spatial-analysis` | Analyzes spatial organization (imaging data or sim output). |
+| `parameter-calibration` | ABC / Bayesian calibration against experimental data. |
+| `uq` | Sensitivity analysis and uncertainty quantification. |
+
+These are Claude-Code–specific; other MCP clients (VS Code Copilot Chat, etc.) do not consume `.claude/agents/` and should continue to use the MCP servers directly.
 
 ---
 ## Adding Another Server
