@@ -125,6 +125,86 @@ Quick roster:
 
 These are Claude-Code–specific; other MCP clients (VS Code Copilot Chat, etc.) do not consume `.claude/agents/` and should continue to use the MCP servers directly.
 
+### Agentic Install
+
+Rather than working through the install manually, you can have Claude Code drive the entire setup. Paste one of the prompts below into a Claude Code session opened at the root of this repo — it uses Bash, `uv`, and `claude mcp add` directly.
+
+**Prerequisites Claude cannot do for you:**
+- Install [Claude Code](https://docs.claude.com/claude-code) itself.
+- Get an [Edison Scientific API key](https://platform.edisonscientific.com/profile) for LiteratureValidation. Put it in your shell profile (`~/.zshrc` or `~/.bashrc`) so Claude Code inherits it:
+  ```bash
+  export EDISON_PLATFORM_API_KEY="your-key"
+  ```
+
+#### One-shot prompt — install everything
+
+```
+Install the full bio-modelling MCP stack for this repo. Work from the repo root.
+
+1. Verify `uv` is installed. If not, install it via
+   `curl -LsSf https://astral.sh/uv/install.sh | sh` and source the profile.
+2. If $HOME/PhysiCell does not exist, clone https://github.com/MathCancer/PhysiCell.git
+   to $HOME/PhysiCell and run `make` there. Report any build errors verbatim
+   — do not silently continue on failure.
+3. Register the PhysiCell MCP server at user scope:
+     claude mcp add PhysiCell -s user -- uv run \
+       --project $(pwd)/PhysiCell python $(pwd)/PhysiCell/server.py
+4. For LiteratureValidation: confirm $EDISON_PLATFORM_API_KEY is set (fail loudly
+   if not). Run `uv sync` inside ./LiteratureValidation, then register:
+     claude mcp add LiteratureValidation -s user \
+       -e EDISON_PLATFORM_API_KEY=$EDISON_PLATFORM_API_KEY \
+       -- uv run --project $(pwd)/LiteratureValidation \
+       python $(pwd)/LiteratureValidation/server.py
+5. Install and register spatialtissuepy:
+     uv tool install "spatialtissuepy[mcp,viz] @ git+https://github.com/emcramer/spatialtissuepy"
+     claude mcp add spatialtissuepy -s user -- \
+       spatialtissuepy-mcp --data-dir $HOME/tissue_data
+6. Run `claude mcp list` and report which servers are ✓ Connected.
+7. Tell me to restart Claude Code, then run `/agents` to see the five subagents
+   shipped in .claude/agents/.
+
+Stop and report immediately if any step fails. Do not retry failing commands
+in a loop; diagnose the root cause.
+```
+
+#### Piecewise prompts — install one server at a time
+
+Use these if the one-shot run hits a snag and you want to troubleshoot a single server.
+
+**PhysiCell** (assumes `uv` is installed):
+```
+Compile PhysiCell (clone https://github.com/MathCancer/PhysiCell.git to
+$HOME/PhysiCell if missing, then run `make` in that directory). Then register
+the PhysiCell MCP:
+  claude mcp add PhysiCell -s user -- uv run \
+    --project $(pwd)/PhysiCell python $(pwd)/PhysiCell/server.py
+Verify with `claude mcp list`.
+```
+
+**LiteratureValidation** (requires `EDISON_PLATFORM_API_KEY` exported in the parent shell):
+```
+Run `uv sync` inside ./LiteratureValidation. Then register the MCP server,
+passing the Edison API key as an environment variable:
+  claude mcp add LiteratureValidation -s user \
+    -e EDISON_PLATFORM_API_KEY=$EDISON_PLATFORM_API_KEY \
+    -- uv run --project $(pwd)/LiteratureValidation \
+    python $(pwd)/LiteratureValidation/server.py
+Fail loudly if $EDISON_PLATFORM_API_KEY is not set. Verify with `claude mcp list`.
+```
+
+**spatialtissuepy**:
+```
+Install the spatialtissuepy tool (from GitHub) and register its MCP server:
+  uv tool install "spatialtissuepy[mcp,viz] @ git+https://github.com/emcramer/spatialtissuepy"
+  claude mcp add spatialtissuepy -s user -- \
+    spatialtissuepy-mcp --data-dir $HOME/tissue_data
+Verify with `claude mcp list`.
+```
+
+#### After install
+
+Restart Claude Code, then run `/agents` — you should see `model-constructor`, `literature-rule-validator`, `spatial-analysis`, `parameter-calibration`, and `uq`. Kick the tires with something like *"Build a PhysiCell model of breast cancer cells in a hypoxic 3D environment with immune infiltration"* — Claude Code should dispatch to `model-constructor`.
+
 ---
 ## Adding Another Server
 1. Create a new folder with `server.py` and a README describing the underlying modelling tool and dependencies.

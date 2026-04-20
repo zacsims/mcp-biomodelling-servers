@@ -78,7 +78,7 @@ Each agent's `tools:` frontmatter is explicit and minimal for its job. The valid
 1. **Claude Code installed** — these are Claude Code subagent files. Other MCP-aware clients (e.g. VS Code Copilot Chat) do not consume `.claude/agents/`.
 2. **All three MCP servers configured in Claude Code**:
    - `physicell` — see [`PhysiCell/README.md`](../../PhysiCell/README.md)
-   - `LiteratureValidation` — see [`LiteratureValidation/README.md`](../../LiteratureValidation/README.md) (requires `ANTHROPIC_API_KEY`)
+   - `LiteratureValidation` — see [`LiteratureValidation/README.md`](../../LiteratureValidation/README.md) (requires `EDISON_PLATFORM_API_KEY` from [Edison Scientific](https://platform.edisonscientific.com/profile))
    - `spatialtissuepy` — the companion server referenced in `PhysiCell/README.md`
 3. **Conda environment** with dependencies for all three servers, same interpreter path.
 
@@ -96,7 +96,7 @@ A minimal Claude Code MCP config (`~/.claude.json` or project `.mcp.json`):
       "type": "stdio",
       "command": "/path/to/envs/mcp_modelling/bin/python",
       "args": ["/abs/path/to/mcp-biomodelling-servers/LiteratureValidation/server.py"],
-      "env": { "ANTHROPIC_API_KEY": "sk-ant-..." }
+      "env": { "EDISON_PLATFORM_API_KEY": "your-edison-key" }
     },
     "spatialtissuepy": {
       "type": "stdio",
