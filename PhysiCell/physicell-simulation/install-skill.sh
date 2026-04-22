@@ -25,10 +25,19 @@ fi
 
 echo "Installing physicell-simulation skill..."
 
-# 1. Copy skill to marketplace directory
+# 1. Copy skill to marketplace directory with plugin manifest
 echo "  Copying skill to marketplace..."
 rm -rf "$MARKETPLACE_DIR/physicell-simulation"
 cp -r "$SKILL_DIR" "$MARKETPLACE_DIR/physicell-simulation"
+mkdir -p "$MARKETPLACE_DIR/physicell-simulation/.claude-plugin"
+cat > "$MARKETPLACE_DIR/physicell-simulation/.claude-plugin/plugin.json" << 'MANIFEST'
+{
+  "name": "physicell-simulation",
+  "version": "1.0.0",
+  "description": "Build, configure, and run PhysiCell multicellular simulations. Prevents common configuration mistakes.",
+  "skills": ["."]
+}
+MANIFEST
 
 # 2. Create cache directory with plugin manifest
 echo "  Creating plugin cache..."
@@ -55,12 +64,12 @@ with open('$MARKETPLACE_JSON', 'r') as f:
     data = json.load(f)
 data['plugins'].append({
     'name': 'physicell-simulation',
-    'source': './',
+    'source': './physicell-simulation',
     'description': 'Build, configure, and run PhysiCell multicellular simulations.',
     'category': 'life-sciences',
     'tags': ['simulation', 'multicellular', 'physicell', 'biology', 'modeling'],
     'strict': False,
-    'skills': ['./physicell-simulation']
+    'skills': ['.']
 })
 with open('$MARKETPLACE_JSON', 'w') as f:
     json.dump(data, f, indent=2)
