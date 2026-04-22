@@ -17,3 +17,16 @@ dependencies = [
 bo = ["torch", "botorch", "gpytorch"]
 abc = ["pyabc"]
 all = ["torch", "botorch", "gpytorch", "pyabc"]
+
+# TEMPORARY source override: pull physicell-settings from the zacsims fork's
+# fix/load-xml-lossy-parsers branch while https://github.com/marcorusc/PhysiCell_Settings/pull/6
+# is pending review. The branch adds parsers for cell_interactions,
+# cell_transformations, cell_integrity, and initial_parameter_distributions,
+# which load_xml used to silently drop -- breaking any round-trip workflow
+# that depends on those sections (e.g. calibration loops that load a prior
+# config, tweak one parameter, and re-export).
+#
+# Revert to PyPI resolution (delete this block) once the upstream PR is
+# merged and released.
+[tool.uv.sources]
+physicell-settings = { git = "https://github.com/zacsims/PhysiCell_Settings.git", branch = "fix/load-xml-lossy-parsers" }
