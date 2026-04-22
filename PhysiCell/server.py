@@ -2141,44 +2141,18 @@ def add_single_cell_rule(
 
     # Add rule to configuration
     try:
-        # Add to CellRulesModule (for in-memory tracking)
-        session.config.cell_rules.rules.append({
-            "cell_type": cell_type.strip(),
-            "signal": signal.strip(),
-            "direction": direction,
-            "behavior": behavior.strip(),
-            "min_signal": saturation_value,
-            "max_signal": saturation_value,
-            "hill_power": hill_power,
-            "half_max": half_max
-        })
-
-        # Add to CellRulesCSV (for CSV export)
-        rules = session.config.cell_rules_csv
-        rules.add_rule(
+        session.config.cell_rules.add_rule(
             cell_type=cell_type.strip(),
             signal=signal.strip(),
             direction=direction,
             behavior=behavior.strip(),
-            base_value=saturation_value,
+            saturation_value=saturation_value,
             half_max=half_max,
             hill_power=hill_power,
-            apply_to_dead=0
+            apply_to_dead=0,
         )
-        
-    except (ImportError, AttributeError):
-        # Fall back to legacy CSV API only
-        rules = session.config.cell_rules_csv
-        rules.add_rule(
-            cell_type=cell_type.strip(),
-            signal=signal.strip(),
-            direction=direction,
-            behavior=behavior.strip(),
-            base_value=saturation_value,
-            half_max=half_max,
-            hill_power=hill_power,
-            apply_to_dead=0
-        )
+    except Exception as e:
+        return f"Error adding cell rule: {e}"
     
     # Update session counters
     session.rules_count += 1
@@ -2688,8 +2662,7 @@ def export_cell_rules_csv(
         return "**Error:** No simulation configured. Create domain and add components first."
     
     try:
-        # Get the CSV rules module (where add_single_cell_rule stores rules)
-        csv_rules = session.config.cell_rules_csv
+        csv_rules = session.config.cell_rules
         rule_count = len(csv_rules.rules)
 
         if rule_count == 0:
@@ -2812,11 +2785,7 @@ def get_rule_justifications() -> str:
         return "**Error:** No simulation configured."
 
     # Get current rules for cross-reference
-    try:
-        rules_api = session.config.cell_rules_csv
-        current_rules = rules_api.get_rules()
-    except Exception:
-        current_rules = []
+    current_rules = session.config.cell_rules.rules
 
     report = "## Rule Justification Report\n\n"
     report += f"**Rules with justifications:** {len(session.rule_validations)}\n"
