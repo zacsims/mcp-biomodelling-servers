@@ -634,12 +634,15 @@ The repository includes a `physicell-simulation` AgentSkill that guides LLMs thr
 bash /path/to/mcp-biomodelling-servers/PhysiCell/physicell-simulation/install-skill.sh
 ```
 
-This script copies the skill to the `life-sciences` Claude Code plugin marketplace, registers it in the plugin cache, and enables it. Requires the `life-sciences` marketplace to be present at `~/.claude/plugins/marketplaces/life-sciences/`.
+This copies the skill to `~/.claude/skills/physicell-simulation/` as a standard Claude Code user skill. No plugin or marketplace registration required — Claude Code picks up user skills from `~/.claude/skills/` automatically.
 
-**What it does:**
-1. Copies skill files to `~/.claude/plugins/marketplaces/life-sciences/physicell-simulation/`
-2. Creates an install cache at `~/.claude/plugins/cache/life-sciences/physicell-simulation/1.0.0/`
-3. Registers the skill in `marketplace.json`, `installed_plugins.json`, and `settings.json`
+**Manual install (equivalent):**
+
+```bash
+mkdir -p ~/.claude/skills/physicell-simulation
+cp -r PhysiCell/physicell-simulation/{SKILL.md,references,scripts} \
+      ~/.claude/skills/physicell-simulation/
+```
 
 **Verify:** Start a new Claude Code session and run `/skills`. You should see `physicell-simulation` listed.
 
