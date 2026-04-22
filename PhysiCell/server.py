@@ -913,6 +913,62 @@ def _expand_cell_type_interactions(session) -> None:
         mechanics["cell_adhesion_affinities"] = affinities
 
 
+def _normalize_label_for_comparison(name: str) -> str:
+    """Collapse whitespace / underscores / dashes / case for fuzzy matching.
+
+    Used to detect near-duplicate cell-type labels that differ only in
+    separator style (e.g. ``"motile tumor"`` vs ``motile_tumor``), which
+    downstream string-matching against simulation output treats as
+    distinct populations and silently buckets to zero.
+    """
+    return name.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def _validate_cell_type_name(name: str, existing_types: List[str]) -> List[str]:
+    """Return human-readable warnings for a proposed cell-type name.
+
+    Returns an empty list if the name passes all checks. Warnings are
+    non-blocking -- the cell type is still added -- but surface common
+    silent-failure pitfalls at the point they are introduced rather than
+    after several downstream iterations.
+    """
+    warnings: List[str] = []
+
+    # Whitespace is legal in PhysiCell XML but a frequent source of
+    # cross-artefact label mismatches (e.g. the session uses a space while
+    # the rules CSV or analysis fingerprint uses an underscore).
+    if any(ch.isspace() for ch in name):
+        warnings.append(
+            f"Cell type name '{name}' contains whitespace. PhysiCell accepts "
+            "this, but downstream artefacts that match cell types by string "
+            "(simulation CSV output, rule lookups, analysis fingerprints) "
+            "are whitespace-sensitive. Keep the label byte-identical across "
+            "your build, rules, initial conditions, and any target data you "
+            "compare against -- or switch to snake_case everywhere."
+        )
+
+    # Fuzzy-duplicate detection. Catches the exact class of bug where a
+    # recap defines 'motile_tumor' while the target uses 'motile tumor'
+    # and every downstream per-type metric silently returns zero.
+    normalized = _normalize_label_for_comparison(name)
+    for existing in existing_types:
+        if existing == name:
+            continue
+        if _normalize_label_for_comparison(existing) == normalized:
+            warnings.append(
+                f"Cell type name '{name}' collides with existing type "
+                f"'{existing}' once whitespace / underscores / dashes are "
+                "ignored. If these are meant to refer to the same "
+                "population, use one spelling consistently. If they are "
+                "genuinely distinct, pick obviously different names -- a "
+                "build where both exist will silently bucket per-type "
+                "output to zero in anything that string-matches labels."
+            )
+            break
+
+    return warnings
+
+
 @mcp.tool()
 def add_single_cell_type(
     cell_type_name: Annotated[str, Field(description="Name for this cell type (e.g., 'cancer_cell', 'immune_cell', 'fibroblast').")],
@@ -938,7 +994,13 @@ def add_single_cell_type(
         return "Error: Cell type name cannot be empty"
     
     cell_type_name = cell_type_name.strip()
-    
+
+    # Surface label-format pitfalls at the point the name is introduced
+    # rather than after several downstream iterations (silent bucket-to-zero
+    # when labels drift between the build, rules, and analysis artefacts).
+    existing_types = list(session.config.cell_types.cell_types.keys())
+    label_warnings = _validate_cell_type_name(cell_type_name, existing_types)
+
     # Add cell type to configuration
     session.config.cell_types.add_cell_type(cell_type_name, template='default')
     session.config.cell_types.set_cycle_model(cell_type_name, cycle_model)
@@ -949,15 +1011,96 @@ def add_single_cell_type(
     # Update session counters
     session.cell_types_count += 1
     session.mark_step_complete(WorkflowStep.CELL_TYPES_ADDED)
-    
+
     # Format result
     result = f"**Cell type added:** {cell_type_name}\n"
     result += f"- Cycle model: {cycle_model}\n"
     result += f"- Progress: {session.get_progress_percentage():.0f}%\n"
+    if label_warnings:
+        result += "\n**⚠️ Label warnings:**\n"
+        for w in label_warnings:
+            result += f"- {w}\n"
     result += f"**Next step:** Use `add_single_cell_rule()` to create cell behavior rules.\n"
     result += f"First, use `list_all_available_signals()` and `list_all_available_behaviors()` to see options."
-    
+
     return result
+
+
+@mcp.tool()
+def preflight_cell_type_labels(
+    expected_labels: Annotated[List[str], Field(description="List of cell-type labels that must exist exactly in the current session (e.g., the unique cell-type values from a target simulation or an experimental dataset you are matching against).")],
+    session_id: Optional[str] = Field(default=None, description="Session to check. Omit to use the active session."),
+) -> str:
+    """Confirm session cell-type names match an expected label set byte-exactly.
+
+    Use this before Phase 2 model construction when you are recapitulating
+    an existing simulation or matching an experimental dataset: pass the
+    unique cell_type labels from the target and the tool flags missing,
+    extra, or fuzzy-collision (whitespace / underscore / dash / case)
+    mismatches. Fuzzy collisions are the common silent-failure mode --
+    e.g. target uses ``"motile tumor"`` while the recap has
+    ``motile_tumor``, and every per-type fingerprint metric buckets to zero.
+
+    Returns:
+        str: A pass/fail report. Non-zero missing, extra, or fuzzy matches
+            indicate the build should be corrected before proceeding.
+    """
+    session = get_current_session(session_id)
+    if not session or not session.config:
+        return "Error: No active session. Create simulation domain first using create_simulation_domain()."
+
+    current = list(session.config.cell_types.cell_types.keys())
+    expected = list(expected_labels)
+
+    current_set = set(current)
+    expected_set = set(expected)
+
+    missing = expected_set - current_set
+    extra = current_set - expected_set
+
+    # Build fuzzy-collision pairs between what is missing and what is extra.
+    fuzzy_pairs: List[tuple] = []
+    fuzzy_missing: set = set()
+    fuzzy_extra: set = set()
+    for m in missing:
+        m_norm = _normalize_label_for_comparison(m)
+        for e in extra:
+            if _normalize_label_for_comparison(e) == m_norm:
+                fuzzy_pairs.append((m, e))
+                fuzzy_missing.add(m)
+                fuzzy_extra.add(e)
+                break
+
+    missing_true = sorted(missing - fuzzy_missing)
+    extra_true = sorted(extra - fuzzy_extra)
+
+    if not missing and not extra:
+        return (
+            f"✓ All {len(expected)} cell-type labels match byte-exactly.\n"
+            f"Session: {sorted(current)}"
+        )
+
+    lines: List[str] = []
+    if fuzzy_pairs:
+        lines.append(
+            "⚠️ **Fuzzy collisions** -- same label modulo whitespace / "
+            "underscores / dashes / case. Rename the session's cell_def to "
+            "match the expected label byte-for-byte, or every per-type "
+            "downstream metric will bucket to zero:"
+        )
+        for expected_name, session_name in fuzzy_pairs:
+            lines.append(
+                f"  expected `{expected_name}` but session has `{session_name}`"
+            )
+    if missing_true:
+        lines.append(
+            f"**Missing in session** ({len(missing_true)}): {missing_true}"
+        )
+    if extra_true:
+        lines.append(
+            f"**Extra in session** ({len(extra_true)}): {extra_true}"
+        )
+    return "\n".join(lines)
 
 
 
