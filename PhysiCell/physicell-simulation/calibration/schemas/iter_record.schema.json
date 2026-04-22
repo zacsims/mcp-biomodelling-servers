@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://physicell-simulation/calibration/schemas/iter_record.schema.json",
+  "title": "CalibrationIterationRecord",
+  "description": "Structured per-iteration record for the autoregressive calibration loop. Written by the calibration agent at the end of every iteration. Consumed by the driver for window assembly, digest updates, and stopping-criteria checks.",
+  "type": "object",
+  "required": [
+    "iter",
+    "timestamp",
+    "model_id",
+    "schema_version",
+    "constraints_acknowledged",
+    "params_tried",
+    "tier1",
+    "tier2",
+    "registry_changes",
+    "diff_from_prev",
+    "flags",
+    "notes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "iter": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero-based iteration index. Matches the iter_<n>/ folder."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp when the record was written."
+    },
+    "model_id": {
+      "type": "string",
+      "description": "Echo of manifest.model_id for cross-checking."
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "iter_record.v1"
+    },
+    "constraints_acknowledged": {
+      "type": "object",
+      "description": "Required self-attestation that the blind constraint was respected. The driver validates this block and fails the iteration if it is missing, malformed, or contradicted by the tool-call audit.",
+      "required": [
+        "blind_constraint_version",
+        "rule",
+        "allowed_target_paths",
+        "forbidden_target_paths",
+        "files_read_this_iter",
+        "self_attestation"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "blind_constraint_version": {
+          "type": "string",
+          "const": "v1"
+        },
+        "rule": {
+          "type": "string",
+          "const": "May read ONLY the target simulation's output folder. MUST NOT read target settings.xml, rules.csv, custom.cpp, cells.csv, or any file in the target project source tree."
+        },
+        "allowed_target_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Absolute-path globs under which reads are permitted. Echoed from manifest.target_output_folder."
+        },
+        "forbidden_target_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Absolute-path globs under which reads are forbidden. Echoed from the driver's derived forbidden list."
+        },
+        "files_read_this_iter": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Every file path the agent accessed during this iteration (target or artifacts). The driver cross-checks this list against the tool-call audit."
+        },
+        "self_attestation": {
+          "type": "string",
+          "const": "I did not read any file in forbidden_target_paths this iteration."
+        }
+      }
+    },
+    "params_tried": {
+      "type": "object",
+      "description": "Flat name -> value map of the active parameter set used for this iteration's recap run. Mirrors registry_iter_<n>.json values but flattened for quick window diffs.",
+      "additionalProperties": {
+        "type": ["number", "string", "boolean", "null"]
+      }
+    },
+    "tier1": {
+      "type": "object",
+      "required": ["pass_count", "fail_count", "failures"],
+      "additionalProperties": false,
+      "properties": {
+        "pass_count": { "type": "integer", "minimum": 0 },
+        "fail_count": { "type": "integer", "minimum": 0 },
+        "failures": {
+          "type": "array",
+          "description": "Every failing (metric, timestep) cell with its err value and tolerance.",
+          "items": {
+            "type": "object",
+            "required": ["metric", "timestep", "err", "tolerance"],
+            "additionalProperties": false,
+            "properties": {
+              "metric": { "type": "string" },
+              "timestep": { "type": ["integer", "number", "string"] },
+              "err": { "type": "number" },
+              "tolerance": { "type": "number" },
+              "kind": {
+                "type": "string",
+                "enum": ["scalar", "directional", "vector", "categorical"]
+              },
+              "sign_match": { "type": ["boolean", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "tier2": {
+      "type": "object",
+      "required": ["pass_count", "fail_count", "failures"],
+      "additionalProperties": false,
+      "properties": {
+        "pass_count": { "type": "integer", "minimum": 0 },
+        "fail_count": { "type": "integer", "minimum": 0 },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["metric", "timestep", "err", "tolerance"],
+            "additionalProperties": false,
+            "properties": {
+              "metric": { "type": "string" },
+              "timestep": { "type": ["integer", "number", "string"] },
+              "err": { "type": "number" },
+              "tolerance": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "registry_changes": {
+      "type": "array",
+      "description": "Changes applied to the parameter registry this iteration. Mirror entries the driver will also see in registry.jsonl.",
+      "items": {
+        "type": "object",
+        "required": ["change_type", "parameter", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "change_type": {
+            "type": "string",
+            "enum": ["add", "modify", "remove", "split"]
+          },
+          "parameter": { "type": "string" },
+          "old_value": {},
+          "new_value": {},
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "diff_from_prev": {
+      "type": "string",
+      "description": "One-paragraph summary of what changed versus the previous iteration and how it affected the scorecard."
+    },
+    "flags": {
+      "type": "array",
+      "description": "Short machine-readable flags the driver keys off: converged, oscillating, over_correction, stalled, near_lower_bound:<param>, near_upper_bound:<param>, non_biological_output, etc.",
+      "items": { "type": "string" }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 1200,
+      "description": "Free-form qualitative note, at most a few sentences. Intended for the recent-window readers."
+    }
+  }
+}

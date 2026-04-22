@@ -6,7 +6,18 @@ Reverse-engineer a PhysiCell simulation from spatial statistics alone, without a
 
 - A completed PhysiCell simulation output folder (the "target")
 - Both MCP servers connected: PhysiCell MCP (`mcp__PhysiCell__`) and spatialtissuepy MCP (`mcp__spatialtissuepy__`)
-- **Blind constraint**: the agent sees ONLY the output folder path — no XML config, no rules CSV, no parameter files
+- **Blind constraint**: the agent sees ONLY the output folder path — no XML config, no rules CSV, no parameter files. See "Enforcing the blind constraint" below for the three enforcement tiers used in unattended calibration.
+- Optional but recommended for long runs: the autoregressive calibration driver at `../calibration/calibration_driver.py` (see Phase 5).
+
+## Enforcing the blind constraint
+
+For single-session interactive work, stating the rule to the agent is usually enough. For unattended autoregressive calibration across many `claude -p` invocations, three tiers run together:
+
+1. **Prompt reiteration** — every iteration's prompt begins with the blind-constraint block naming the allowed output folder and the forbidden target-project paths. Fresh agent, fresh reminder. Template: `../calibration/prompts/iteration_prompt_template.md`.
+2. **Mechanical hook** — a PreToolUse hook (`../calibration/hooks/forbid_target_source_paths.py`) registered in the session's `.claude/settings.json` rejects any Read / Edit / Write / Grep / Glob / Bash / NotebookEdit call whose path argument resolves under the target project root but outside the permitted output folder. The hook reads `manifest.json` via the `CALIBRATION_MANIFEST` env var the driver sets before spawning.
+3. **Driver audit** — after each iteration, the driver validates `iter_record.json` against `../calibration/schemas/iter_record.schema.json` and fails the iteration if the required `constraints_acknowledged` block is missing, malformed, or lists any file under the forbidden paths.
+
+A violation detected at any tier fails the iteration loudly rather than silently continuing.
 
 ## How to read this workflow
 
@@ -343,6 +354,7 @@ Each iteration writes to its own `iter_<n>/` folder:
 - `delta_iter_<n>.csv` — same shape as the scorecard; entries are `err` values.
 - `delta_report_iter_<n>.md` — human-readable summary highlighting the failing cells of the grid and, for each, suggesting the most plausible registry knob (informed by the Translation Table hypotheses).
 - `registry_iter_<n>.json` — snapshot of the active parameter set.
+- `iter_record.json` — terse, schema-validated machine-readable record used by the autoregressive driver for window assembly, digest updates, and stopping-criteria checks. Schema: `../calibration/schemas/iter_record.schema.json`. MUST include the `constraints_acknowledged` block re-stating the blind constraint and listing every file read during the iteration.
 
 ---
 
@@ -364,6 +376,39 @@ Stop when either condition holds:
 
 - Every metric in both tiers passes its tolerance, **or**
 - 2 consecutive iterations produce no improvement *and* no new parameters are being registered.
+
+### Autoregressive driver (alternative to agent-on-the-fly)
+
+For long unattended runs where a single session's accumulating context becomes a liability, use `../calibration/calibration_driver.py`. Each iteration is a fresh `claude -p` invocation; state flows between iterations through files.
+
+Each iteration prompt contains:
+
+1. The blind-constraint block (verbatim, first — see "Enforcing the blind constraint" above).
+2. Manifest + panel spec (stable).
+3. A compressed `digest.md` covering iterations older than the recent window.
+4. The last **N** iterations' `iter_record.json` + `delta_report_iter_<n>.md` (recent window, verbatim). Default N=3.
+5. The current registry snapshot and previous delta CSV pointer.
+
+After each iteration, the driver:
+
+- Validates `iter_record.json` against the schema and audits `constraints_acknowledged`.
+- Incrementally updates `digest.md` when a record falls off the window (one-record fold via a Haiku-tier summarization call).
+- Rebuilds `digest.md` from an archive sample every `--digest-refresh-every` iterations (default 10) to correct accumulated summarization drift.
+- Evaluates stopping criteria deterministically from the scorecards (not the agent's self-report).
+
+CLI:
+
+```bash
+python ../calibration/calibration_driver.py \
+    --model-dir artifacts/<session_id>/<model_id> \
+    --max-iters 50 \
+    --tier1-tolerance 0.10 --tier2-tolerance 0.20 \
+    [--per-metric-tolerance ripleys_h_tumor_r100=0.05 ...] \
+    [--window-size 3] [--digest-refresh-every 10] [--stall-patience 2] \
+    [--dry-run]
+```
+
+The driver requires Phase 0–3 to be complete — manifest, panel spec, target fingerprint, and `iter_0/registry_iter_0.json` must already exist. It will not run otherwise. `--dry-run` assembles and writes each iteration's prompt to disk without spawning `claude -p`, for inspection before a full unattended run.
 
 ---
 
@@ -387,6 +432,8 @@ artifacts/<session_id>/<model_id>/
     panel_spec_v1.json
     [panel_spec_v2.json ...]
     registry.jsonl                 # single rolling change log (what/when/why)
+    digest.md                      # autoregressive driver only — bounded compressed history
+    driver.log                     # autoregressive driver only — one line per iter event
     target/
         target_fingerprint.csv
         target_exploration/...     # present only if user named a relevant feature
@@ -395,6 +442,7 @@ artifacts/<session_id>/<model_id>/
         recap_fingerprint_iter_0.csv
         delta_iter_0.csv
         delta_report_iter_0.md
+        iter_record.json           # schema-validated, includes constraints_acknowledged
     iter_1/
         ...
     final_report.md
