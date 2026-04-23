@@ -15,31 +15,44 @@ tumor,oxygen,decreases,necrosis,0,3.75,8,0
 
 ## Hill Function Mathematics
 
-### The Core Equation
+### The Core Equation (from PhysiCell source, authoritative)
 
-The behavior interpolates between the **XML default** (behavior at zero signal) and the **saturation_value** (behavior at maximum signal effect):
-
-```
-                                                signal^n
-behavior = XML_default + (saturation_value - XML_default) × ─────────────────
-                                                half_max^n + signal^n
-```
-
-For `direction = "decreases"`, the Hill term is inverted:
+PhysiCell uses **one** Hill formula regardless of direction. From `PhysiCell/core/PhysiCell_rules.cpp:348-354`:
 
 ```
-                                                half_max^n
-behavior = saturation_value + (XML_default - saturation_value) × ─────────────────
-                                                  half_max^n + signal^n
+Hill(s, half, n) = s^n / (s^n + half^n)    # 0 at s=0, 1 at s=∞
+
+behavior(signal) = XML_default + (saturation_value - XML_default) × Hill(signal, half_max, hill_power)
 ```
 
-Both formulas produce the **same endpoints**:
+The `direction` keyword does **not** change this formula. It just tells the CSV parser where to read the endpoints. From `PhysiCell_rules.cpp:1762-1773`:
+
+| direction | XML default maps to | saturation_value (CSV col 5) maps to |
+|---|---|---|
+| `increases` | min of the Hill curve (low-signal end) | max of the Hill curve (high-signal end) |
+| `decreases` | max of the Hill curve (low-signal end) | min of the Hill curve (high-signal end) |
+
+In **both** cases:
 
 | | At signal ≈ 0 | At signal → ∞ |
 |---|---|---|
-| **behavior =** | XML default | saturation_value |
+| **behavior =** | XML_default | saturation_value |
 
-The direction only affects the **shape** of the curve (sigmoid vs inverted sigmoid).
+The only difference: for `decreases` you expect `XML_default > saturation_value` (behavior falls as signal rises); for `increases` you expect `XML_default < saturation_value` (behavior rises as signal rises). Nothing stops you from writing inconsistent values — PhysiCell won't complain, you'll just get a rule that doesn't do what its direction word implies.
+
+### Mental model (how to avoid getting it wrong)
+
+Ignore the `direction` keyword when you're reasoning about what a rule does. Ask two questions:
+
+1. **What value do I want the behavior to have when the signal is ABSENT (signal = 0)?** → put it in **XML default** (via `configure_cell_parameters`, `set_cycle_transition_rate`, `set_cell_transformation_rate`, etc.).
+2. **What value do I want the behavior to have when the signal is SATURATING (signal → ∞)?** → put it in **saturation_value** (the CSV col 5 / `add_single_cell_rule(saturation_value=...)` argument).
+
+Then pick the direction keyword that matches:
+
+- `XML_default < saturation_value` → `increases`
+- `XML_default > saturation_value` → `decreases`
+
+This order of operations prevents the most common mistake (see "Common wrong encoding" below).
 
 Where:
 - **XML_default** = the behavior's value set via setter tools (e.g., `configure_cell_parameters(necrosis_rate=0.00277)`)
@@ -265,3 +278,91 @@ add_single_cell_rule(
     ..., saturation_value=0.01, ...  # apoptosis increases to 0.01 at high drug
 )
 ```
+
+### Example 5: Hypoxia induces a phenotype switch (XML default carries the firing rate)
+
+**Goal**: Low oxygen transforms tumor cells to a motile post-hypoxic phenotype. At low O₂, transform at 0.001/min; at normoxia, transform rate → 0.
+
+This is the opposite pattern from Examples 1–3: the *active* rate lives in the XML default, and `saturation_value` is zero (the "off" value at high signal).
+
+```python
+# Step 1: Put the firing rate in the XML default (the transformation_rate for tumor → motile_tumor)
+set_cell_transformation_rate(
+    source_cell_type="tumor",
+    target_cell_type="motile tumor",
+    rate=0.001,
+)
+# → XML default transformation_rate = 0.001 /min (this is the hypoxic rate)
+
+# Step 2: Add rule — oxygen DECREASES transformation
+# XML_default > saturation_value, so direction = "decreases"
+add_single_cell_rule(
+    cell_type="tumor",
+    signal="oxygen",
+    direction="decreases",
+    behavior="transform to motile tumor",
+    saturation_value=0,   # normoxic rate = 0 (behavior suppressed at high O₂)
+    half_max=10.0,        # mmHg — HIF-stabilization threshold
+    hill_power=4,
+)
+# At low O₂:  behavior = 0.001     (XML default — the hypoxic transform rate fires)
+# At high O₂: behavior → 0         (saturation_value — no transform at normoxia)  ✓
+```
+
+Same pattern applies to hypoxia-induced necrosis, hypoxia-induced apoptosis, hypoxia-induced secretion, etc. — whenever the signal drives the behavior UP from zero, the behavior's **firing value goes in the XML default** and `direction = decreases`.
+
+### Example 6: BROKEN — hypoxia rule with the firing rate in the wrong place
+
+**Goal**: Same as Example 5. **BUG**: put the rate in `saturation_value` instead of XML default.
+
+This is the single most common rule bug outside of "from 0 towards 0". It looks biologically correct, but encodes the **opposite** behavior.
+
+```python
+# Step 1: XML default left at 0 (transformation_rate unset)
+# Step 2: Put the rate in saturation_value
+add_single_cell_rule(
+    cell_type="tumor",
+    signal="oxygen",
+    direction="decreases",       # user thought: "oxygen decreases as transformation increases → decreases"
+    behavior="transform to motile tumor",
+    saturation_value=0.001,      # "hypoxic rate" — BUT this is the high-O₂ asymptote, not the low-O₂ one
+    half_max=10.0,
+    hill_power=4,
+)
+# At low O₂:  behavior = 0        (XML default = 0 — no transformation at hypoxia!)
+# At high O₂: behavior = 0.001    (saturation_value — transform fires at normoxia)  ✗
+```
+
+Calibrator runs a UQ sweep over `saturation_value`, sees all particles produce zero motile cells at hypoxia, and concludes "the calibration is broken." In fact the rule mechanism is just encoded **backwards**: the user confused "saturation" in the word sense with "the biologically active rate," but `saturation_value` always means "behavior when signal saturates" — i.e. the **high-signal endpoint**.
+
+**Tell-tale signs of this mistake:**
+
+- ABC posterior for the rate hugs the lower prior bound — sampler is trying to drive a normoxic rate to zero.
+- `detailed_rules.txt` shows `from 0 towards X` for a rule the user described as "hypoxia-induced."
+- The intended hypoxic effect never fires; the mirror effect fires at normoxia.
+
+**Fix**: Swap the rate from `saturation_value` into XML default (via `set_cell_transformation_rate` / `configure_cell_parameters` / etc.), and set `saturation_value = 0`. Keep `direction = "decreases"`. See Example 5.
+
+## Where the calibrated / UQ knob lives
+
+When doing UQ or ABC calibration on a rule, you have to decide which parameter to sweep. The knob always lives at the **firing end** of the rule — never the off end:
+
+| Rule type | Firing end | Put the UQ knob in |
+|---|---|---|
+| Low-signal-activated (`direction=decreases`, e.g., hypoxia-induced) | XML default | `configure_cell_parameters` / `set_cycle_transition_rate` / `set_cell_transformation_rate` value — substitute via XML xpath |
+| High-signal-activated (`direction=increases`, e.g., chemokine-induced) | saturation_value | `add_single_cell_rule(saturation_value=...)` — substitute via CSV col 5 |
+
+Concrete: if calibrating a hypoxia-induced transform rate over `[1e-4, 1e-2]`, the UQ parameter should be the **XML `<transformation_rate>`** not the CSV `saturation_value`. Sweeping the wrong one gives a rule whose firing magnitude does not respond to the prior.
+
+**Known infrastructure pitfall** (uq_physicell as of 2026-04): the XPath setter in `uq_physicell.pc_model._set_xml_element_value` corrupts terminal selectors of the form `[@name='X']` by writing to the `name` attribute instead of the element's text content. Verify with a dry-run substitution + XML diff before launching a calibration run.
+
+## Source reference
+
+The formulas above are taken from `PhysiCell/core/PhysiCell_rules.cpp` on the upstream repo:
+
+- `PhysiCell_rules.cpp:115-131` — `multivariate_Hill_response_function` (the Hill term; returns 0 for empty signal vector).
+- `PhysiCell_rules.cpp:348-354` — `Hypothesis_Rule::evaluate` (the core `output = base + (max-base)*HU + (min-U)*DU` formula).
+- `PhysiCell_rules.cpp:1762-1773` — `parse_csv_rule_v3` (the v2/v3 CSV → struct mapping; determines which of `min_value` / `max_value` takes CSV col 5 vs XML default, per direction).
+- `PhysiCell_rules.cpp:1630-1639` — `parse_csv_rule_v1` (same mapping in the v1 CSV parser).
+
+If a rule is behaving unexpectedly, read the actual `detailed_rules.txt` written by PhysiCell in the run's output directory: it records "from X towards Y" values that correspond directly to `(XML_default, saturation_value)` for each rule. A mismatch vs your intent in that file is definitive evidence of an encoding error.
