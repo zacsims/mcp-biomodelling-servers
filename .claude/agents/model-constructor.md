@@ -64,3 +64,7 @@ Summarize at the end:
 - Path to exported XML
 
 Flag the obvious handoffs: `literature-rule-validator` for an independent rule audit, `parameter-calibration` if experimental data is available, `uq` before calibration if the parameter set is large, `spatial-analysis` once simulations run.
+
+## Handoff note on literature-rule-validator
+
+`literature-rule-validator` runs slow — upwards of an hour per invocation — because `search_literature` queries can take minutes each and the agent issues several per rule. This is normal, not a stall. If you hand off an audit request to literature-rule-validator, do not assume failure until at least 90 minutes have passed with zero output. Do not proceed with downstream work that depends on the audit (e.g., store_rule_justification refinements, rule-direction sanity checks) until the agent has actually produced its deliverables. If another task is blocked by the audit and it hasn't landed yet, wait — the cost of premature fallback is replacing real citations with speculative priors, which defeats the point of consulting the validator in the first place.

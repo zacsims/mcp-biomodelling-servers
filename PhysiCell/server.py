@@ -2701,6 +2701,224 @@ def export_cell_rules_csv(
         return f"Error exporting cell rules CSV: {str(e)}"
 
 # ============================================================================
+# RULE-SEMANTICS PREVIEW / VALIDATION TOOLS
+# ============================================================================
+
+def _hill_response(signal: float, base: float, saturation: float,
+                   half_max: float, hill_power: float) -> float:
+    """Compute the PhysiCell rule response for a single signal value.
+
+    From PhysiCell_rules.cpp:348-354. The formula is identical for
+    'increases' and 'decreases' directions — the direction keyword only
+    governs which side of the curve is interpreted as the asymptote. At
+    signal=0 the behavior equals the XML default (base); at signal→∞ it
+    equals the rule's saturation_value.
+    """
+    if half_max <= 0 or hill_power <= 0:
+        return float("nan")
+    s = max(signal, 0.0)
+    sh = s ** hill_power
+    kh = half_max ** hill_power
+    hill = sh / (sh + kh) if (sh + kh) > 0 else 0.0
+    return base + (saturation - base) * hill
+
+
+@mcp.tool()
+def preview_rule_response(
+    cell_type: Annotated[str, Field(description="Name of an existing cell type in the current session.")],
+    signal: Annotated[str, Field(description="Signal name (e.g., 'oxygen', 'pressure'). Used only for reporting — the response formula does not depend on the signal's identity.")],
+    direction: Annotated[str, Field(description="'increases' or 'decreases'. Used only to flag potentially inconsistent endpoints (if base vs saturation ordering contradicts the keyword).")],
+    behavior: Annotated[str, Field(description="Behavior name (e.g., 'cycle entry', 'necrosis', 'transform to motile tumor'). Used to look up the XML default for this behavior in the current cell_type.")],
+    saturation_value: Annotated[float, Field(description="The rule's saturation_value (CSV col 5). Behavior value at signal → ∞.")],
+    half_max: Annotated[float, Field(description="Signal level at which response reaches its midpoint.")],
+    hill_power: Annotated[float, Field(default=4.0, description="Hill coefficient (steepness).")],
+    signal_values: Annotated[List[float], Field(description="List of signal values at which to evaluate the rule. Include 0 and a saturating value (~10×half_max) to see both endpoints.")],
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Preview the behavior value that a proposed (or existing) rule will produce at specified signal levels.
+
+    Uses the PhysiCell Hill-function formula
+    ``output = XML_default + (saturation_value - XML_default) * Hill(signal, half_max, hill_power)``
+    and the current cell-type configuration's XML default for ``behavior``.
+
+    Useful as a dry-run sanity check before committing to an encoding choice. If the
+    reported 'firing end' (whichever endpoint has the larger absolute value) does not
+    match the biology you intend, the rule is encoded backwards — see
+    ``physicell-simulation/references/rules-and-hill-functions.md`` for the correct
+    encoding pattern.
+
+    Returns:
+        str: Markdown table of signal → behavior, plus a summary classifying the rule's
+        firing end and flagging direction/endpoint inconsistencies or 'from 0 towards 0'.
+    """
+    session = get_current_session(session_id)
+    if not session or not session.config:
+        return "Error: No simulation configured."
+
+    if direction not in ("increases", "decreases"):
+        return "Error: direction must be 'increases' or 'decreases'."
+    if half_max <= 0:
+        return "Error: half_max must be positive."
+    if hill_power <= 0:
+        return "Error: hill_power must be positive."
+    if not signal_values:
+        return "Error: signal_values must not be empty."
+
+    base = _get_behavior_default_from_config(session, cell_type, behavior)
+    if base is None:
+        return (
+            f"Error: could not resolve XML default for behavior '{behavior}' in cell type "
+            f"'{cell_type}'. Verify the behavior name with list_all_available_behaviors() "
+            f"and the cell type exists in the current session."
+        )
+
+    rows = [(s, _hill_response(s, base, saturation_value, half_max, hill_power))
+            for s in signal_values]
+
+    low_val = rows[0][1]
+    high_val = rows[-1][1]
+    firing_end = "low-signal" if abs(low_val) > abs(high_val) else "high-signal"
+    if abs(low_val - high_val) < 1e-15:
+        firing_end = "NONE (rule has no effect — base == saturation)"
+
+    expected_firing = "high-signal" if direction == "increases" else "low-signal"
+    inconsistency = ""
+    if firing_end != "NONE" and firing_end != expected_firing:
+        inconsistency = (
+            f"\n\n**DIRECTION INCONSISTENT.** Direction='{direction}' implies firing at "
+            f"{expected_firing} end, but endpoints put the active value at the {firing_end} end. "
+            f"Either swap which parameter (XML default vs saturation_value) holds the firing rate, "
+            f"or change the direction keyword. See skill reference: rules-and-hill-functions.md."
+        )
+
+    zero_zero = ""
+    if base == 0 and saturation_value == 0:
+        zero_zero = (
+            "\n\n**'FROM 0 TOWARDS 0' — rule does nothing.** Both endpoints are 0, so the rule "
+            "evaluates to 0 for all signal levels. Set a nonzero XML default (via "
+            "configure_cell_parameters / set_cycle_transition_rate / set_cell_transformation_rate "
+            "/ set_substrate_interaction) or a nonzero saturation_value."
+        )
+
+    out = [
+        f"## Preview: {cell_type} | {signal} {direction} {behavior}",
+        f"- XML default (behavior at signal=0): **{base:.6g}**",
+        f"- saturation_value (behavior at signal→∞): **{saturation_value:.6g}**",
+        f"- half_max: {half_max}, hill_power: {hill_power}",
+        "",
+        "| signal | behavior |",
+        "|---|---|",
+    ]
+    for s, v in rows:
+        out.append(f"| {s:.6g} | {v:.6g} |")
+    out.append("")
+    out.append(f"**Firing end:** {firing_end}")
+    out.append(f"**Expected firing end (from direction keyword):** {expected_firing}")
+    if inconsistency:
+        out.append(inconsistency)
+    if zero_zero:
+        out.append(zero_zero)
+
+    return "\n".join(out)
+
+
+@mcp.tool()
+def validate_rules(
+    session_id: Optional[str] = Field(default=None, description="Session to use. Omit to use the active session."),
+) -> str:
+    """Validate every rule currently loaded in the session by computing its behavior at
+    low (≈0), half-max, and saturating (~10×half_max) signal values, and flag any rule
+    whose firing end contradicts its direction keyword or that reduces to 'from 0 towards 0'.
+
+    This is a dry-run sanity check that does NOT run PhysiCell. It uses the same
+    Hill formula PhysiCell's rule evaluator uses, with the current session's XML
+    defaults looked up per rule. Use this before exporting the model or launching
+    a UQ/ABC sweep — encoding errors here silently produce rules that fire at the
+    wrong signal level.
+
+    Returns:
+        str: Markdown table of rules with per-rule diagnostics and a summary count of
+        issues.
+    """
+    session = get_current_session(session_id)
+    if not session or not session.config:
+        return "Error: No simulation configured."
+
+    try:
+        rules = session.config.cell_rules.rules
+    except Exception:
+        return "Error: could not access cell_rules.rules on the current session."
+
+    if not rules:
+        return "No rules defined in the current session."
+
+    header = [
+        "## Rule validation",
+        "",
+        "| # | cell_type | signal | dir | behavior | base | sat | @0 | @half | @sat×10 | firing end | status |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    issues: List[str] = []
+    ok_count = 0
+    inconsistent_count = 0
+    zero_zero_count = 0
+
+    for i, r in enumerate(rules, 1):
+        ct = r.get("cell_type", "")
+        sig = r.get("signal", "")
+        direction = r.get("direction", "")
+        beh = r.get("behavior", "")
+        sat = float(r.get("saturation_value", 0.0) or 0.0)
+        half = float(r.get("half_max", 0.5) or 0.5)
+        n = float(r.get("hill_power", 4.0) or 4.0)
+
+        base = _get_behavior_default_from_config(session, ct, beh)
+        if base is None:
+            header.append(
+                f"| {i} | {ct} | {sig} | {direction} | {beh} | ?? | {sat:.4g} | ?? | ?? | ?? | ?? | ⚠ can't resolve XML default |"
+            )
+            issues.append(f"{i}: XML default for behavior '{beh}' in '{ct}' not resolvable.")
+            continue
+
+        v0 = _hill_response(0.0, base, sat, half, n)
+        vhalf = _hill_response(half, base, sat, half, n)
+        vhi = _hill_response(half * 10.0, base, sat, half, n)
+
+        if abs(v0 - vhi) < 1e-15:
+            firing_end = "NONE"
+            status = "⚠ from 0 towards 0 (or base == sat)"
+            zero_zero_count += 1
+        else:
+            firing_end = "low" if abs(v0) > abs(vhi) else "high"
+            expected = "high" if direction == "increases" else "low"
+            if firing_end == expected:
+                status = "✓ OK"
+                ok_count += 1
+            else:
+                status = f"✗ direction says {expected}, firing at {firing_end}"
+                inconsistent_count += 1
+
+        header.append(
+            f"| {i} | {ct} | {sig} | {direction} | {beh} | {base:.4g} | {sat:.4g} | "
+            f"{v0:.4g} | {vhalf:.4g} | {vhi:.4g} | {firing_end} | {status} |"
+        )
+
+    header.append("")
+    header.append(f"**Total rules:** {len(rules)}  |  **OK:** {ok_count}  "
+                  f"|  **Direction inconsistent:** {inconsistent_count}  "
+                  f"|  **From 0 towards 0:** {zero_zero_count}")
+
+    if inconsistent_count or zero_zero_count:
+        header.append("")
+        header.append("See `~/.claude/skills/physicell-simulation/references/rules-and-hill-functions.md` "
+                      "for the correct encoding pattern. For each inconsistent rule, either swap which "
+                      "parameter holds the firing rate (XML default vs saturation_value) or change the "
+                      "direction keyword.")
+
+    return "\n".join(header)
+
+
+# ============================================================================
 # RULE JUSTIFICATION TOOLS
 # ============================================================================
 
@@ -5925,10 +6143,86 @@ def run_abc_calibration(
     return result
 
 
+def _abc_pyabc_diagnostics(db_path: str, prior_bounds: Optional[Dict] = None) -> Optional[str]:
+    """Read a pyABC sqlite database and return a Markdown diagnostics block.
+
+    Surfaces per-population acceptance rate, epsilon history, and optionally
+    flags parameters whose posterior median hugs a prior bound. Fails
+    gracefully (returns None) if the db can't be read — the caller should
+    fall back to the baseline status output.
+    """
+    try:
+        import sqlite3
+    except Exception:
+        return None
+    p = Path(db_path)
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        cur = con.cursor()
+
+        # Per-population: count of accepted particles, min/median/max distance, epsilon
+        # pyABC schema: populations(t, epsilon, ...), particles(t, m, w, ...), samples(t)
+        rows = []
+        try:
+            cur.execute("SELECT t, epsilon FROM populations ORDER BY t")
+            for t, eps in cur.fetchall():
+                # accepted = distinct particles in this population
+                cur.execute("SELECT COUNT(*) FROM particles WHERE t=?", (t,))
+                accepted = cur.fetchone()[0]
+                # total samples this population (if table exists)
+                total = None
+                try:
+                    cur.execute("SELECT COUNT(*) FROM samples WHERE t=?", (t,))
+                    total = cur.fetchone()[0]
+                except sqlite3.OperationalError:
+                    total = None
+                acc_rate = (100.0 * accepted / total) if (total and total > 0) else None
+                rows.append((t, eps, accepted, total, acc_rate))
+        except sqlite3.OperationalError:
+            return None
+
+        con.close()
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    out = ["", "### ABC-SMC per-population diagnostics", "",
+           "| Pop | ε | accepted | sampled | acceptance |",
+           "|---|---|---|---|---|"]
+    for t, eps, acc, tot, rate in rows:
+        eps_s = f"{eps:.4g}" if eps is not None else "?"
+        tot_s = str(tot) if tot is not None else "?"
+        rate_s = f"{rate:.2f}%" if rate is not None else "?"
+        out.append(f"| {t} | {eps_s} | {acc} | {tot_s} | {rate_s} |")
+
+    # Warnings
+    warns = []
+    if any(r[4] is not None and r[4] < 1.0 for r in rows):
+        warns.append("Acceptance rate < 1% observed — widen ε or check prior ranges / summary stats.")
+    if len(rows) >= 2 and rows[-1][1] is not None and rows[-2][1] is not None:
+        if abs(rows[-1][1] - rows[-2][1]) / max(rows[-2][1], 1e-12) < 0.05:
+            warns.append("Epsilon plateau between last two populations — posterior has largely converged "
+                         "or ε is bottoming out on noise floor.")
+    if warns:
+        out.append("")
+        out.append("**Flags:** " + " | ".join(warns))
+
+    return "\n".join(out)
+
+
 @mcp.tool()
 def get_calibration_status(run_id: Optional[str] = None) -> str:
     """
     Check the status of a running or completed calibration job.
+
+    For ABC runs, also reports per-population acceptance rate and epsilon history
+    parsed from the pyABC database, plus diagnostic flags (low acceptance, epsilon
+    plateau). Helps catch degenerate calibrations early without reading raw logs.
 
     Args:
         run_id: Calibration run ID. Uses latest if omitted.
@@ -5972,6 +6266,22 @@ def get_calibration_status(run_id: Optional[str] = None) -> str:
         result += "\nUse `get_calibration_results()` to view the results."
     elif run_info["status"] == "failed":
         result += f"**Error:** {run_info.get('error', 'Unknown')}\n"
+
+    # ABC diagnostics from the pyABC db, if reachable
+    if run_info["type"] == "abc":
+        db_path = run_info.get("db_path") or run_info.get("calibration_db_path")
+        if not db_path:
+            # Try to fetch from the active session's uq_context
+            try:
+                s = get_current_session()
+                if s and s.uq_context and getattr(s.uq_context, "calibration_db_path", None):
+                    db_path = s.uq_context.calibration_db_path
+            except Exception:
+                db_path = None
+        if db_path:
+            diag = _abc_pyabc_diagnostics(db_path)
+            if diag:
+                result += "\n" + diag
 
     return result
 
