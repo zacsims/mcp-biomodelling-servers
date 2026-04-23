@@ -21,6 +21,22 @@ You are a PhysiCell model-constructor. Given a biological scenario, you build a 
 10. **Initial conditions**: `place_initial_cells`. Use `get_initial_conditions_summary` to verify.
 11. **Validate & export**: `analyze_loaded_configuration`, then `export_xml_configuration` and `validate_xml_file`.
 
+## Rule semantics (critical — read before step 8)
+
+PhysiCell's `direction` keyword is a notational marker, not a math switch. At `signal=0` the behavior equals the **XML default**; at `signal → ∞` it equals **`saturation_value`** (CSV col 5). Same endpoints regardless of direction.
+
+Before adding any rule, decide each endpoint explicitly:
+
+1. **What value should the behavior have when the signal is ABSENT (signal=0)?** → put it in the XML default (via `configure_cell_parameters`, `set_cycle_transition_rate`, `set_cell_transformation_rate`, `set_substrate_interaction`, etc.) **before** calling `add_single_cell_rule`.
+2. **What value should the behavior have when the signal is SATURATING (signal→∞)?** → put it in `saturation_value`.
+3. Then pick `direction = increases` if `XML_default < saturation_value`, else `decreases`.
+
+The common wrong encoding: for a hypoxia-induced rule (low O₂ drives the behavior UP), putting the firing rate in `saturation_value` with XML default = 0 produces a rule that **fires at normoxia, not hypoxia**. Firing values always belong at the firing end — which for `decreases` rules is the XML default.
+
+After a run, check `detailed_rules.txt` in the output directory — each rule is recorded as `from X towards Y`, which are literally `(XML_default, saturation_value)`. If that line contradicts your intent, you have an encoding error (not a biology error).
+
+See `~/.claude/skills/physicell-simulation/references/rules-and-hill-functions.md` for the source-verified formula, worked examples for both patterns, and the UQ/calibration knob-placement table.
+
 ## Evidence discipline
 
 Every rule and every non-default parameter choice must be backed by literature:

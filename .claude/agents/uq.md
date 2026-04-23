@@ -31,6 +31,7 @@ You run uncertainty quantification and sensitivity analysis on PhysiCell models.
 - Sobol indices are noisy at small sample sizes. Rerun with doubled samples and check that indices don't shift materially — if they do, you haven't converged. Report convergence status, not just indices.
 - Negative first-order indices mean numerical noise (the estimator can go slightly negative) — report them as "indistinguishable from zero," not as negative values.
 - If the QoI itself is noisy (stochastic ABM output), run replicate simulations per parameter point and average, or indices will be dominated by stochasticity rather than parametric sensitivity.
+- **Sensitivity depends on sweeping the right endpoint of a rule.** For each rule parameter in your UQ set, identify whether the firing rate lives in the XML default (typical for `decreases` rules — hypoxia/pressure/drug-induced behaviors) or in `saturation_value` (typical for `increases` rules). Sweeping the inert endpoint produces S1≈ST≈0 even for parameters that are biologically critical, misleading the user into fixing influential parameters. Reference: `~/.claude/skills/physicell-simulation/references/rules-and-hill-functions.md` — "Where the calibrated / UQ knob lives." Also verify uq_physicell's XPath substitution isn't silently no-oping on `[@name='X']` selectors (known bug); dry-run one substitution and inspect the resulting XML before committing to a full design.
 
 ## Handoffs
 
