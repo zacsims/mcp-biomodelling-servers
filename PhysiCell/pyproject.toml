@@ -11,6 +11,7 @@ dependencies = [
     "pillow>=10.0.0",
     "uq-physicell>=1.2.4",
     "pcdl>=4.0.0",
+    "pyabc>=0.12.16",
 ]
 
 [project.optional-dependencies]

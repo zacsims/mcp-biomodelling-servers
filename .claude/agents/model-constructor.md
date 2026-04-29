@@ -65,6 +65,15 @@ Summarize at the end:
 
 Flag the obvious handoffs: `literature-rule-validator` for an independent rule audit, `parameter-calibration` if experimental data is available, `uq` before calibration if the parameter set is large, `spatial-analysis` once simulations run.
 
+## Handoff for ensemble-calibration mode
+
+When the downstream workflow uses ensemble + projection calibration (Cramer 2026 strategy; see parameter-calibration agent's Mode A), the build target shifts:
+
+- **Wide priors, more uncertain parameters.** Aim for >2 decades on any rate parameter. Prefer log-uniform for rates. Better to expose a knob and have its posterior come back flat than to fix it and miss the basin.
+- **Front-load alternative structural mechanisms.** In `builder_handoff.json`, enumerate the known plausible structural variants under a `structural_alternatives` key, each with the rule signature and one-line trigger condition (e.g., *"if fingerprinter reports off-manifold on death-related QoIs, candidate v2 should add hypoxic necrosis via `configure_cell_parameters(necrosis_rate=...)` plus `tumor | oxygen decreases necrosis` and `motile tumor | oxygen decreases necrosis` rules"*). This avoids the discovery-via-iteration loop where the same structural gap is found by the fitter at round 7 instead of round 1.
+- **Expect ONE structural pivot at most.** If ensemble calibration's off-manifold diagnostic flags a missing mechanism, ship one structural revision and let the fitter re-run the LHS — don't iterate per-parameter v1.5 / v1.6 / v1.7 builds.
+- **Death pathways and behavior endpoints are independent aggregator buckets.** When adding a death rule (necrosis, apoptosis on a different cell type) the aggregator-collision bug doesn't apply: different `(cell_type, direction, behavior)` tuple → independent `(base_value, saturation_value)` pair. The collision lurks only when two rules share the same tuple. See feedback memory for the rule-aggregator collapse pattern.
+
 ## Handoff note on literature-rule-validator
 
 `literature-rule-validator` runs slow — upwards of an hour per invocation — because `search_literature` queries can take minutes each and the agent issues several per rule. This is normal, not a stall. If you hand off an audit request to literature-rule-validator, do not assume failure until at least 90 minutes have passed with zero output. Do not proceed with downstream work that depends on the audit (e.g., store_rule_justification refinements, rule-direction sanity checks) until the agent has actually produced its deliverables. If another task is blocked by the audit and it hasn't landed yet, wait — the cost of premature fallback is replacing real citations with speculative priors, which defeats the point of consulting the validator in the first place.

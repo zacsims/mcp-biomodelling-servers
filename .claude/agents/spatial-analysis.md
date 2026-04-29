@@ -37,3 +37,32 @@ Pick analyses that answer the user's question — don't run everything:
 - Generate only plots the user needs. Save them with `viz_save_figure` and cite paths in the report.
 - For ML handoff or cross-sample comparison, end with `summary_compute` / `summary_to_dict` / `summary_to_array` so the user gets a feature vector, not just plots.
 - Report the values and what they mean, not just "here's the plot."
+
+## Trajectory-embedding workflow (preferred for blind-recap and ensemble calibration)
+
+When the goal is to characterize a target simulation's dynamics for downstream parameter-matching (rather than just describing one snapshot), use a trajectory-embedding pipeline rather than scalar QoI reduction. Method follows Cramer et al. 2026 (bioRxiv 10.64898/2026.03.26.714521): preserve the full temporal shape via time-delay embedding, then let the fitter project the target onto the LHS-cloud embedding.
+
+Pipeline:
+
+1. **Spatial-statistics time series at every saved frame** — for each timestep, build a Delaunay graph (`network_build_delaunay_graph`) on cell positions and compute:
+   - cell-type proportions (`data_get_cell_counts`)
+   - degree centrality per type (`network_degree_centrality`)
+   - clustering coefficient (`network_average_clustering`, `network_clustering_coefficient`)
+   - pairwise cell-cell interaction frequencies (`statistics_colocalization_quotient`)
+   - death-pathway counts: live / apoptotic / necrotic per cell type, read from `cells.mat` phase column (live <100, 100=apoptotic, 101=necrotic)
+2. **Within-timestep normalization** — group features by timestep, apply Yeo-Johnson power transform, z-score within each timestep, then re-add the original timestep means so temporal trends survive.
+3. **Time-delay embedding** — slide a window of W=50 consecutive timesteps (stride 1) and concatenate into one feature vector per window. Each window becomes a point in a high-dimensional phase space; topology of the underlying dynamical system is preserved (Takens' theorem).
+4. **Outputs to workspace**:
+   - `target_trajectory_embedded.npz` — array of shape (n_windows, W·n_features) for the target
+   - `project_candidate.py` — module exposing `embed_candidate(output_path) -> ndarray` using exactly the same Delaunay + normalization + windowing pipeline
+   - `mahalanobis_diagnostic.py` — given target windows + LHS-cloud windows, returns per-window Mahalanobis distance to flag windows >3σ from cloud center (off-manifold signal)
+   - `target_summary.md` — human-readable narrative still useful for context
+
+Downstream the fitter populates the LHS cloud, applies `embed_candidate` to every replicate, projects the target via k=1 cosine nearest-neighbor for the MAP, and uses Mahalanobis distance to flag off-manifold QoIs that signal missing structural mechanisms (e.g., a missing necrosis pathway will surface as persistent Mahalanobis >3σ on death-related features).
+
+Use this pipeline when:
+- The user asks for blind-recapitulation, ensemble calibration, or model-fitting to a target trajectory
+- Iterative scalar-QoI calibration has plateaued and you suspect a structural gap
+- A scalar-QoI scoring function saturates a key dynamic feature (peak time, oscillation phase) at penalty = 1.0 — a signal that the scalar projection is throwing away the shape information
+
+Don't use it for one-snapshot spatial characterization — that's what the question→tool map above is for.

@@ -9,4 +9,7 @@ dependencies = [
     "physicell-settings>=0.4.5",
     "cairosvg>=2.7.0",
     "pillow>=10.0.0",
+    "torch>=2.11.0",
+    "botorch>=0.16.1",
+    "gpytorch>=1.15.2",
 ]

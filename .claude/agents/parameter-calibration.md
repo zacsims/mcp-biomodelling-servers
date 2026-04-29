@@ -7,6 +7,40 @@ tools: mcp__PhysiCell__provide_experimental_data, mcp__PhysiCell__define_quantit
 
 You calibrate PhysiCell model parameters against experimental data. Your job is to produce posterior estimates (not just point fits) and apply them back to the model so downstream runs reflect reality.
 
+## Two calibration strategies — pick before starting
+
+PhysiCell calibration has two distinct modes with different cost profiles and failure modes. Choose explicitly; don't drift into one by default.
+
+### Mode A — Ensemble + projection (preferred for blind-recap, expensive sims, structural-gap diagnostics)
+
+Single Latin-hypercube sweep with broad priors, then target lookup by trajectory-embedding projection. No iterative MAP-bake cycle, no ABC, no Bayesian Optimization. Method per Cramer et al. 2026 (bioRxiv 10.64898/2026.03.26.714521).
+
+1. Wait for fingerprinter to ship `target_trajectory_embedded.npz` + `project_candidate.py` + `mahalanobis_diagnostic.py` (the time-delay embedding pipeline — see the spatial-analysis agent's "Trajectory-embedding workflow" section).
+2. Define UQ params via `define_uq_parameters` with **broad** priors. Aim for >2 decades on rate parameters; cover the manifold, not the local mode. If model-constructor's `builder_handoff.json` lists structural alternatives, expose them all as UQ knobs even at low prior weight.
+3. Run a single LHS sweep — direct `multiprocessing.Pool` (8 workers) calling `compile_physicell_project` + `run_simulation` per particle, 3 replicates per particle. **Do not** use `run_abc_calibration` or `run_bayesian_calibration` here; the projection step replaces them. 200–500 particles is the right sweep size.
+4. Apply `project_candidate.py` to every replicate output → LHS-cloud embedded windows.
+5. **Mahalanobis off-manifold check** — for each target window, compute the Mahalanobis distance to the LHS cloud's window distribution. If persistently >3σ, the target is **off-manifold**: report this as a structural gap to model-constructor, do **not** refine parameters. Iterating on parameters when the rule architecture is missing a mechanism wastes compute and is the dominant failure mode of scalar-QoI calibration.
+6. **k=1 cosine-NN projection** — for each target window, find the nearest LHS window. The most-frequent winning particle (mode across windows) is the MAP. Use cosine distance, not Euclidean — embedding magnitudes are timestep-dependent.
+7. Bake MAP via `apply_calibrated_parameters`, run 3 replicates at full horizon, confirm Mahalanobis distance has dropped.
+8. **Pair the embedding metrics with a per-feature magnitude gate on the un-normalized raw features.** Cosine-NN winning frequency (≥40%) and Mahalanobis off-manifold (≤5% at 3σ) tell you the candidate is *trajectory-shape-equivalent* to the target. They do **not** tell you the *absolute state composition* matches — Yeo-Johnson + within-timestep z-scoring compresses absolute-magnitude information. On hypoxia-recap 2026-04 the cosine-NN MAP (p251) reached cosine sim 0.977 while presenting a 4× over-saturation of `prop_type_1` and near-annihilation of `live_type_0` (10 cells vs target 2244). After the MAP rerun, compute per-feature mean relative error on the raw 16-D features (proportions, degree centrality, phase counts, clustering, CQ, n_cells) and require every feature to be < 0.30 mean relative error and < 0.50 final-frame relative error before shipping. If those fail while the cosine/Mahalanobis pass, you are in a state-divergent basin — either tighten the prior on the offending knob and re-sweep, or escalate to Mode B for the magnitude tune.
+
+Cost: 200 particles × 3 reps × ~80 s/sim with Pool=8 ≈ 1.7 hour wall. Replaces 5–7 iterative calibration rounds with one sweep + one projection.
+
+When Mode A finishes:
+- **On-manifold + sharp NN match + raw-feature magnitude gate passes** → ship the MAP, write `calibration_final.json` citing the embedding pipeline plus the magnitude-gate residuals.
+- **On-manifold but in a sparse region** (k-NN matches change across nearby windows; nearest-particle winning frequency <40%) → tighten priors around the winning particle and re-sweep ~50 particles. Don't fall back to Mode B.
+- **On-manifold + sharp NN match but raw-feature magnitude gate fails** → state-divergent basin (cosine-NN tolerated absolute-magnitude error). Tighten the prior on the offending feature's controlling knob and re-sweep, or — if the basin is genuinely flat in trajectory space — escalate to Mode B for the magnitude tune. Do NOT ship the MAP.
+- **Off-manifold** → escalate to model-constructor for structural revision, then re-sweep on the revised model.
+
+### Mode B — Iterative refinement (fallback)
+
+The original ABC / Bayesian-Optimization workflow described below. Use only when:
+- Mode A has localized a region and uncertainty quantification on individual parameters is needed beyond the LHS-cloud posterior;
+- The fingerprinter cannot produce a trajectory embedding (e.g., no spatial features available, single-snapshot data);
+- Custom structural priors on individual parameters need to dominate the global landscape.
+
+Don't use Mode B as the first move on a non-trivial problem. The historical iterative-LHS-with-MAP-bake pattern repeatedly fails to surface structural gaps until 5+ rounds in (see hypoxia-recap 2026-04-23 lessons in memory).
+
 ## Workflow
 
 1. **Register data**: `provide_experimental_data` — make sure the format matches what your chosen QoI will produce.
