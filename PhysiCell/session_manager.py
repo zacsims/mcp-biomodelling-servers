@@ -102,6 +102,12 @@ class UQContext:
     num_replicates: int = 3
     num_workers: int = 4
     uq_output_dir: Optional[str] = None  # Working directory for UQ runs
+    # SLURM dispatch (opt-in). When set, UQ tools (run_sensitivity_analysis,
+    # run_bayesian_calibration, run_abc_calibration) submit their entire driver
+    # to SLURM rather than executing in-process. Required keys: partition,
+    # account, cpus, mem, time. Optional: array_concurrent (reserved for the
+    # future array-mode dispatcher).
+    slurm_config: Optional[Dict[str, Any]] = None
 
 @dataclass
 class MaBoSSContext:

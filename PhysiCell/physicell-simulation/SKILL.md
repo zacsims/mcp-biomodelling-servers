@@ -62,6 +62,42 @@ create_session
   → generate_simulation_gif           (spatial animation)
 ```
 
+## 1.5 Local vs SLURM execution
+
+The MCP server supports two execution backends. **Local is the default and remains the right choice for laptops, single-machine workstations, and one-off simulations.** SLURM is opt-in and unlocks HPC clusters for larger workloads.
+
+Pick a backend by workload:
+
+| Workload | Backend | Tool to call |
+|---|---|---|
+| 1 simulation, expected to finish in <2 h | Local | `run_simulation` (default) |
+| Running on a cluster head node, even for one sim | SLURM | `submit_simulation_slurm` |
+| 2–9 independent simulations | SLURM (loop) | `submit_simulation_slurm` per sim |
+| ≥10 simulations, parameter sweeps, replicate batches | SLURM array | `submit_simulation_array_slurm` |
+| Any single simulation expected to take >2 h | SLURM | `submit_simulation_slurm` |
+| UQ with `num_samples × num_replicates ≥ 50` | SLURM | `configure_uq_slurm` once, then UQ tool |
+| Calibration (BO or ABC) on a cluster | SLURM | `configure_uq_slurm` once, then UQ tool |
+
+Quick references:
+
+- **Local:** `run_simulation('myproject')` — runs as a `subprocess.Popen` on the host the MCP server is running on. Fast to iterate, requires no cluster knowledge. **Do not use this on a cluster head node — it consumes shared CPU/memory.**
+- **Single SLURM job:** `submit_simulation_slurm('myproject', cpus=16, mem='32G', time_limit='12:00:00')` — submits via `sbatch`, returns immediately with a SLURM job ID, tracked by the same `simulation_id` system as local sims.
+- **SLURM array (sweeps/replicates):** `submit_simulation_array_slurm('myproject', configs=[...], array_concurrent=32)` — submits one array job whose elements share resource limits but each get their own output folder. The 32 concurrency cap matches the documented ABC sampler ceiling.
+- **UQ on SLURM:** Call `configure_uq_slurm(cpus=16, mem='64G', time_limit='1-00:00:00')` once on the active session, then run `run_sensitivity_analysis(...)` / `run_bayesian_calibration(...)` / `run_abc_calibration(...)` as usual. The UQ driver runs in a SLURM job; the head node stays idle.
+
+Backend control via environment:
+
+- `PHYSICELL_BACKEND=slurm` makes `run_simulation` itself default to SLURM (uses conservative defaults — for explicit resources, prefer `submit_simulation_slurm`).
+- Unset / `local` keeps the default behavior.
+
+Recovery and observability:
+
+- `list_slurm_jobs()` queries `squeue`/`sacct` and reconciles in-flight jobs after an MCP server restart. Use this if you re-attach to a session and `list_simulations` is missing jobs you submitted earlier.
+- `get_simulation_status(sim_id)` works identically for local and SLURM sims — it dispatches to the right backend automatically.
+- All submissions persist to `~/.physicell-mcp/jobs.jsonl` (append-only) and reconcile on startup.
+
+See `references/slurm-integration.md` for cluster-specific defaults, the `ARCH=native` rebuild gotcha, and laptop / non-HPC operation.
+
 ## 2. Hill Function Rules
 
 ### How rules work

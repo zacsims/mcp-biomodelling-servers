@@ -129,7 +129,11 @@ Must include: `method`, `map_parameters`, `posterior_summary` (median, p05, p95,
 
 5. **Truncate for calibration.** Re-extract target QoIs at an earlier horizon (e.g., `target_fingerprint_t2000.json`) and score at the truncated horizon. This cuts per-particle sim time and still discriminates the dominant QoIs.
 
-6. **Two-stage ABC.** Stage 1: 50 Latin-hypercube particles at truncated horizon, 8 parallel workers, rejection-ABC (not pyABC SMC — see pitfalls). Stage 2: top-20 by stage-1 distance re-run at full horizon with joint distance. Best joint particle = MAP.
+6. **Two-stage ABC.**
+   - **Stage 1:** 50 Latin-hypercube particles at truncated horizon, rejection-ABC (not pyABC SMC — see pitfalls).
+     - **≤32 particles:** keep local 8-worker execution (no SLURM needed).
+     - **>32 particles** *or* running on a cluster head node: call `configure_uq_slurm(cpus=16, mem='64G', time_limit='12:00:00', array_concurrent=32)` first, then `run_abc_calibration(...)`. The 32-task concurrency cap honors the documented ABC sampler ceiling and avoids the segfault cascade in pitfall 2.
+   - **Stage 2:** top-20 by stage-1 distance re-run at full horizon with joint distance. Always SLURM-dispatch on a cluster (`configure_uq_slurm(time_limit='1-00:00:00')` since full-horizon runs are long). Best joint particle = MAP.
 
 7. **Apply + re-export.** Builder bakes MAP into `candidate_vN.xml`. Fingerprinter scores at both horizons. If acceptable (< 0.50 per score_spec bands), ship. Otherwise iterate: widen priors, add rules (e.g., hypoxic-apoptosis to contain runaway proliferation), or add spatial QoIs to the distance.
 
@@ -150,6 +154,8 @@ Must include: `method`, `map_parameters`, `posterior_summary` (median, p05, p95,
 6. **Substrate fields may not be persisted in output.** If `has_substrate=false` in the target's MultiCellDS export, you have position-based QoIs only — no O₂ field to read directly. Infer the substrate operating point from spatial cell-type patterns (motile cells at rim → low O₂ at rim).
 
 7. **Output folder may be named `output_001/` not `output/`.** Don't assume. List the target's directory structure before loading.
+
+8. **Local UQ saturates one node silently on a cluster.** `run_sensitivity_analysis`, `run_bayesian_calibration`, and `run_abc_calibration` default to in-process `concurrent.futures` workers — fine on a laptop, but on a cluster head node this hammers shared CPU/memory and gets you yelled at by ops. For any blind-recap stage with `num_samples × num_replicates > 50`, call `configure_uq_slurm(...)` on the active session before launching the UQ tool. See `physicell-simulation/SKILL.md §1.5` and `physicell-simulation/references/slurm-integration.md` for thresholds and resource defaults.
 
 ## Acceptance criteria
 

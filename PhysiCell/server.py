@@ -76,6 +76,14 @@ from session_manager import (
     get_current_session, ensure_session, analyze_and_update_session_from_config
 )
 
+# Execution backends (local subprocess vs. SLURM). LocalBackend keeps the
+# original Popen behavior; SlurmBackend dispatches via sbatch. Selection per
+# call falls back to PHYSICELL_BACKEND env var, then to "local".
+from backends import (
+    get_backend, slurm_available, jobs_db_path, persist_job, load_persisted_jobs,
+    Resources as BackendResources, JobStatus as BackendJobStatus,
+)
+
 # Lazy-load UQ-PhysiCell modules to avoid slow startup (VTK/ome_types take ~4s)
 # Availability flags are resolved on first access via _ensure_uq_imports()
 _uq_imports_checked = False
@@ -184,11 +192,21 @@ MCP_OUTPUT_DIR = Path(os.environ.get("MCP_OUTPUT_DIR", Path.home() / "PhysiCell_
 
 @dataclass
 class SimulationRun:
-    """Tracks a running or completed PhysiCell simulation."""
+    """Tracks a running or completed PhysiCell simulation.
+
+    The `handle` field is the backend-agnostic identity ("local:<pid>" or
+    "slurm:<jobid>" / "slurm:<jobid>_<task>" for array elements). The backend
+    name is stored separately so `get_simulation_status` etc. can dispatch
+    polling/cancel correctly. `process` is retained for legacy callers that
+    inspect the Popen directly; new code paths should rely on `handle`.
+    """
     simulation_id: str
     project_name: str
     process: Optional[subprocess.Popen] = None
     pid: Optional[int] = None
+    backend: str = "local"            # "local" or "slurm"
+    handle: str = ""                   # "local:<pid>" or "slurm:<jobid>"
+    array_group_id: Optional[str] = None  # set for elements of an array submission
     status: str = "pending"  # pending, running, completed, failed, stopped
     output_folder: str = ""
     config_file: str = ""
@@ -3770,8 +3788,75 @@ def compile_physicell_project(project_name: str, clean_first: bool = False) -> s
     except Exception as e:
         return f"Error compiling project: {str(e)}"
 
+def _prepare_run(project_name: str, config_file: Optional[str] = None) -> dict:
+    """Shared setup for local and SLURM simulation submissions.
+
+    Loads the named project (so the right Makefile is in place), resolves the
+    executable name, allocates a unique output folder, and patches the XML so
+    PhysiCell writes there. Returns a dict with the values run_simulation /
+    submit_simulation_slurm need to invoke a backend.
+
+    Raises ValueError on configuration errors (project missing, executable
+    missing). Returns dict with keys: project_dir, exec_name, executable_path,
+    config_path, output_folder, log_file, cmd.
+    """
+    project_dir = USER_PROJECTS_DIR / project_name
+    if not project_dir.exists():
+        raise ValueError(f"Project '{project_name}' not found at {project_dir}")
+
+    config_path = config_file or "config/PhysiCell_settings.xml"
+
+    os.chdir(PHYSICELL_ROOT)
+
+    # Load the project (writes Makefile + config into PHYSICELL_ROOT)
+    load_proc = subprocess.run(
+        f"make load PROJ={project_name}",
+        shell=True, capture_output=True, text=True, timeout=30,
+    )
+    if load_proc.returncode != 0:
+        raise ValueError(f"Error loading project:\n{load_proc.stderr}")
+
+    exec_name = "project"
+    try:
+        makefile_path = PHYSICELL_ROOT / "Makefile"
+        with open(makefile_path) as f:
+            for line in f:
+                if line.startswith("PROGRAM_NAME"):
+                    exec_name = line.split("=")[1].strip()
+                    break
+    except Exception:
+        pass
+
+    executable = PHYSICELL_ROOT / exec_name
+    if not executable.exists():
+        raise ValueError(
+            f"Executable '{exec_name}' not found. Run compile_physicell_project() first."
+        )
+
+    output_folder = _next_output_dir(project_name)
+    loaded_config = PHYSICELL_ROOT / "config" / "PhysiCell_settings.xml"
+    _patch_xml_output_folder(loaded_config, output_folder)
+
+    log_file = output_folder / "simulation.log"
+    cmd = f"./{exec_name} {config_path}"
+
+    return {
+        "project_dir": str(PHYSICELL_ROOT),
+        "exec_name": exec_name,
+        "executable_path": str(executable),
+        "config_path": config_path,
+        "output_folder": output_folder,
+        "log_file": log_file,
+        "cmd": cmd,
+    }
+
+
 @mcp.tool()
-def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
+def run_simulation(
+    project_name: str,
+    config_file: Optional[str] = None,
+    backend: Optional[str] = None,
+) -> str:
     """
     Run a PhysiCell simulation as a background process.
 
@@ -3783,116 +3868,526 @@ def run_simulation(project_name: str, config_file: Optional[str] = None) -> str:
     Args:
         project_name: Name of the project to run
         config_file: Custom config file path relative to project (default: config/PhysiCell_settings.xml)
+        backend: Override the execution backend ("local" or "slurm"). When
+            unset, defaults to the PHYSICELL_BACKEND environment variable, or
+            "local". For multi-simulation workloads on a cluster, prefer the
+            dedicated SLURM tools (`submit_simulation_slurm`,
+            `submit_simulation_array_slurm`) which expose resource arguments.
 
     Returns:
         str: Simulation ID and status information
     """
     global running_simulations
 
-    # Check if project exists
+    try:
+        prep = _prepare_run(project_name, config_file)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    simulation_id = str(uuid.uuid4())[:8]
+
+    try:
+        be = get_backend(backend)
+    except Exception as e:
+        return f"Error initializing backend {backend!r}: {e}"
+
+    # For run_simulation we use modest defaults; the cluster-specific tools
+    # expose explicit resource arguments. For the SLURM backend we pick a
+    # conservative time so that misuse doesn't burn long allocations.
+    resources = BackendResources(
+        cpus=int(os.environ.get("PHYSICELL_DEFAULT_CPUS", "8")),
+        mem=os.environ.get("PHYSICELL_DEFAULT_MEM", "16G"),
+        time=os.environ.get("PHYSICELL_DEFAULT_TIME", "4:00:00"),
+    )
+
+    try:
+        handle = be.submit(
+            cmd=prep["cmd"],
+            cwd=Path(prep["project_dir"]),
+            log=prep["log_file"],
+            resources=resources,
+            job_name=f"physicell-{project_name[:20]}",
+        )
+    except Exception as e:
+        return f"Error submitting via {be.name} backend: {e}"
+
+    # Recover the Popen for legacy callers that still inspect sim.process.
+    process = None
+    pid = None
+    if be.name == "local" and handle.startswith("local:"):
+        try:
+            pid = int(handle.split(":", 1)[1])
+            from backends import _local_procs
+            process = _local_procs.get(pid)
+        except Exception:
+            pass
+
+    sim_run = SimulationRun(
+        simulation_id=simulation_id,
+        project_name=project_name,
+        process=process,
+        pid=pid,
+        backend=be.name,
+        handle=handle,
+        status="running",
+        output_folder=str(prep["output_folder"]),
+        config_file=prep["config_path"],
+        started_at=time.time(),
+        log_file=str(prep["log_file"]),
+    )
+
+    with simulations_lock:
+        running_simulations[simulation_id] = sim_run
+
+    persist_job({
+        "simulation_id": simulation_id,
+        "project_name": project_name,
+        "backend": be.name,
+        "handle": handle,
+        "output_folder": str(prep["output_folder"]),
+        "config_file": prep["config_path"],
+        "log_file": str(prep["log_file"]),
+        "submitted_at": time.time(),
+    })
+
+    result = f"**Simulation started!**\n\n"
+    result += f"**Simulation ID:** {simulation_id}\n"
+    result += f"**Project:** {project_name}\n"
+    result += f"**Backend:** {be.name}\n"
+    result += f"**Handle:** {handle}\n"
+    result += f"**Config:** {prep['config_path']}\n"
+    result += f"**Output folder:** {prep['output_folder']}\n\n"
+    result += f"**Next steps:**\n"
+    result += f"- Poll `get_simulation_status('{simulation_id}')` every 60 seconds until complete\n"
+    result += f"- Use `list_simulations()` to see all running simulations\n"
+    result += f"- Use `stop_simulation('{simulation_id}')` to stop if needed"
+
+    return result
+
+
+@mcp.tool()
+def submit_simulation_slurm(
+    project_name: str,
+    config_file: Optional[str] = None,
+    partition: str = "batch",
+    account: str = "ChangLab",
+    cpus: int = 16,
+    mem: str = "32G",
+    time_limit: str = "12:00:00",
+) -> str:
+    """
+    Submit a single PhysiCell simulation as a SLURM job.
+
+    Use this on an HPC cluster (e.g. OHSU ARC) when you need more resources
+    than the local machine, or when running on a head node where local
+    Popen execution is not allowed. For 10+ simulations, prefer
+    `submit_simulation_array_slurm`. For UQ sweeps, prefer
+    `configure_uq_slurm` + the relevant UQ tool.
+
+    PREREQUISITE: Call `compile_physicell_project()` first; the executable
+    must already exist in PHYSICELL_ROOT. The bundled sbatch template will
+    rebuild on first run on a compute node (ARCH=native guard) but a fresh
+    project must be loaded first.
+
+    Args:
+        project_name: Name of the user_project to run.
+        config_file: Config path relative to project (default config/PhysiCell_settings.xml).
+        partition: SLURM partition (cluster default 'batch').
+        account: SLURM account for billing (cluster default 'ChangLab').
+        cpus: cpus-per-task (also sets OMP_NUM_THREADS).
+        mem: Memory request, SLURM-formatted (e.g. '16G', '64G').
+        time_limit: Wall time limit (HH:MM:SS or D-HH:MM:SS).
+
+    Returns:
+        str: Simulation ID, SLURM job ID, and next-step instructions.
+    """
+    global running_simulations
+
+    if not slurm_available():
+        return (
+            "Error: SLURM is not available on this host (`sbatch` not on PATH).\n"
+            "Run on a cluster login/head node, or use `run_simulation` for local execution."
+        )
+
+    try:
+        prep = _prepare_run(project_name, config_file)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    simulation_id = str(uuid.uuid4())[:8]
+
+    try:
+        be = get_backend("slurm")
+    except Exception as e:
+        return f"Error initializing SLURM backend: {e}"
+
+    resources = BackendResources(
+        partition=partition,
+        account=account,
+        cpus=cpus,
+        mem=mem,
+        time=time_limit,
+    )
+
+    try:
+        handle = be.submit(
+            cmd=prep["cmd"],
+            cwd=Path(prep["project_dir"]),
+            log=prep["log_file"],
+            resources=resources,
+            job_name=f"physicell-{project_name[:20]}",
+        )
+    except Exception as e:
+        return f"Error submitting SLURM job: {e}"
+
+    sim_run = SimulationRun(
+        simulation_id=simulation_id,
+        project_name=project_name,
+        process=None,
+        pid=None,
+        backend="slurm",
+        handle=handle,
+        status="pending",
+        output_folder=str(prep["output_folder"]),
+        config_file=prep["config_path"],
+        started_at=time.time(),
+        log_file=str(prep["log_file"]),
+    )
+    with simulations_lock:
+        running_simulations[simulation_id] = sim_run
+
+    persist_job({
+        "simulation_id": simulation_id,
+        "project_name": project_name,
+        "backend": "slurm",
+        "handle": handle,
+        "output_folder": str(prep["output_folder"]),
+        "config_file": prep["config_path"],
+        "log_file": str(prep["log_file"]),
+        "submitted_at": time.time(),
+        "resources": {
+            "partition": partition, "account": account,
+            "cpus": cpus, "mem": mem, "time": time_limit,
+        },
+    })
+
+    job_id = handle.split(":", 1)[1]
+    result = "**SLURM simulation submitted!**\n\n"
+    result += f"**Simulation ID:** {simulation_id}\n"
+    result += f"**SLURM job:** {job_id}\n"
+    result += f"**Project:** {project_name}\n"
+    result += f"**Partition:** {partition}, account={account}, cpus={cpus}, mem={mem}, time={time_limit}\n"
+    result += f"**Output folder:** {prep['output_folder']}\n"
+    result += f"**Log:** {prep['log_file']}\n\n"
+    result += "**Next steps:**\n"
+    result += f"- `squeue -u $USER` to watch the job\n"
+    result += f"- `get_simulation_status('{simulation_id}')` (rate-limited to 1/min)\n"
+    result += f"- `stop_simulation('{simulation_id}')` runs `scancel {job_id}`"
+    return result
+
+
+@mcp.tool()
+def submit_simulation_array_slurm(
+    project_name: str,
+    configs: List[str],
+    partition: str = "batch",
+    account: str = "ChangLab",
+    cpus: int = 8,
+    mem: str = "16G",
+    time_limit: str = "12:00:00",
+    array_concurrent: int = 32,
+) -> str:
+    """
+    Submit N PhysiCell simulations as a single SLURM array job.
+
+    USE THIS for parameter sweeps, replicate batches, or any workload of
+    ≥10 simulations sharing the same project. Each array element runs an
+    independent simulation with its own config file from `configs`. Each
+    element gets its own simulation_id (returned in the response) and its
+    own output folder.
+
+    PREREQUISITE: Call `compile_physicell_project()` first.
+
+    Args:
+        project_name: Name of the user_project (one project, many configs).
+        configs: List of config paths relative to the project. Length = N.
+                 Each entry typically points at a config file with different
+                 parameter values; for replicates of the same config you can
+                 pass the same path repeatedly (separate output folders are
+                 still allocated per element).
+        partition: SLURM partition (default 'batch').
+        account: SLURM account (default 'ChangLab').
+        cpus: cpus-per-task per array element (also OMP_NUM_THREADS).
+        mem: Memory per array element.
+        time_limit: Wall time per array element.
+        array_concurrent: Max array tasks running simultaneously (default 32).
+            Cap this to honor cluster fairshare and avoid overrunning the
+            scheduler. For pyABC-like workloads, 32 is the documented safe
+            ceiling.
+
+    Returns:
+        str: Array job ID + per-element simulation IDs.
+    """
+    global running_simulations
+
+    if not slurm_available():
+        return "Error: SLURM is not available on this host (`sbatch` not on PATH)."
+    if not configs:
+        return "Error: configs is empty — pass at least one config path."
+
+    # Validate that the project exists once; per-config validation happens at
+    # job runtime via the sbatch template.
     project_dir = USER_PROJECTS_DIR / project_name
     if not project_dir.exists():
         return f"Error: Project '{project_name}' not found at {project_dir}"
 
-    # Determine config file path
-    if config_file:
-        config_path = config_file
-    else:
-        config_path = "config/PhysiCell_settings.xml"
+    # Each element needs its own output folder. We allocate them up-front and
+    # bake (project_dir, config_path, output_folder) into the manifest.
+    array_group_id = str(uuid.uuid4())[:8]
+    manifest_dir = MCP_OUTPUT_DIR / "slurm_arrays" / array_group_id
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_dir / "manifest.tsv"
+    log_dir = manifest_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
 
-    # Generate simulation ID
-    simulation_id = str(uuid.uuid4())[:8]
+    sim_ids: list[str] = []
+    output_folders: list[Path] = []
+    manifest_lines: list[str] = []
+    for idx, cfg in enumerate(configs):
+        sid = str(uuid.uuid4())[:8]
+        sim_ids.append(sid)
+        out = _next_output_dir(f"{project_name}_array_{array_group_id}_{idx}")
+        output_folders.append(out)
+        # Per-task env: tell the sbatch template where to write outputs via
+        # an env var the executable can pick up if needed; PhysiCell itself
+        # doesn't read this env, so for true output isolation each config
+        # should already declare its own <folder>. We still record it.
+        env_str = f"PHYSICELL_OUTPUT_DIR={out};SIMULATION_ID={sid}"
+        # tabs separate fields; we forbid tabs in paths to keep parsing simple.
+        manifest_lines.append(f"{project_dir}\t{cfg}\t{env_str}")
+
+    manifest_path.write_text("\n".join(manifest_lines) + "\n")
 
     try:
-        # Change to PhysiCell root directory
-        os.chdir(PHYSICELL_ROOT)
-
-        # First load the project
-        load_cmd = f"make load PROJ={project_name}"
-        load_process = subprocess.run(
-            load_cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-
-        if load_process.returncode != 0:
-            return f"Error loading project:\n{load_process.stderr}"
-
-        # Find executable name
-        exec_name = "project"
-        try:
-            makefile_path = PHYSICELL_ROOT / "Makefile"
-            with open(makefile_path, 'r') as f:
-                for line in f:
-                    if line.startswith("PROGRAM_NAME"):
-                        exec_name = line.split("=")[1].strip()
-                        break
-        except:
-            pass
-
-        executable = PHYSICELL_ROOT / exec_name
-        if not executable.exists():
-            return f"Error: Executable '{exec_name}' not found. Run compile_physicell_project() first."
-
-        # Set up a unique output directory for this run
-        output_folder = _next_output_dir(project_name)
-
-        # Patch the loaded XML config so PhysiCell writes to this directory
-        loaded_config = PHYSICELL_ROOT / "config" / "PhysiCell_settings.xml"
-        _patch_xml_output_folder(loaded_config, output_folder)
-
-        # Start the simulation process
-        # Redirect stdout/stderr to a log file instead of PIPE to prevent
-        # the process from blocking when the pipe buffer fills up.
-        # PhysiCell prints a lot during initialization (one line per cell),
-        # and with many cells the 64KB pipe buffer fills instantly.
-        log_file = output_folder / "simulation.log"
-        log_handle = open(log_file, 'w')
-        cmd = f"./{exec_name} {config_path}"
-        process = subprocess.Popen(
-            cmd,
-            shell=True,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(PHYSICELL_ROOT)
-        )
-
-        # Close the Python file handle — the subprocess has inherited the fd
-        log_handle.close()
-
-        # Track the simulation
-        sim_run = SimulationRun(
-            simulation_id=simulation_id,
-            project_name=project_name,
-            process=process,
-            pid=process.pid,
-            status="running",
-            output_folder=str(output_folder),
-            config_file=config_path,
-            started_at=time.time(),
-            log_file=str(log_file)
-        )
-
-        with simulations_lock:
-            running_simulations[simulation_id] = sim_run
-
-        result = f"**Simulation started!**\n\n"
-        result += f"**Simulation ID:** {simulation_id}\n"
-        result += f"**Project:** {project_name}\n"
-        result += f"**Config:** {config_path}\n"
-        result += f"**PID:** {process.pid}\n"
-        result += f"**Output folder:** {output_folder}\n\n"
-        result += f"**Next steps:**\n"
-        result += f"- Poll `get_simulation_status('{simulation_id}')` every 60 seconds until complete\n"
-        result += f"- Use `list_simulations()` to see all running simulations\n"
-        result += f"- Use `stop_simulation('{simulation_id}')` to stop if needed"
-
-        return result
-
+        be = get_backend("slurm")
     except Exception as e:
-        return f"Error starting simulation: {str(e)}"
+        return f"Error initializing SLURM backend: {e}"
+
+    resources = BackendResources(
+        partition=partition,
+        account=account,
+        cpus=cpus,
+        mem=mem,
+        time=time_limit,
+        array_concurrent=array_concurrent,
+    )
+
+    try:
+        array_handle, n_tasks = be.submit_array(
+            manifest=manifest_path,
+            cwd=Path(project_dir),
+            log_dir=log_dir,
+            resources=resources,
+            job_name=f"physicell-array-{project_name[:16]}",
+        )
+    except Exception as e:
+        return f"Error submitting array job: {e}"
+
+    array_job_id = array_handle.split(":", 1)[1]
+
+    # Register one SimulationRun per array element. The handle for element K is
+    # "slurm:<jobid>_<K>", which both squeue and sacct understand.
+    submit_ts = time.time()
+    with simulations_lock:
+        for idx, sid in enumerate(sim_ids):
+            elem_handle = f"slurm:{array_job_id}_{idx}"
+            sim = SimulationRun(
+                simulation_id=sid,
+                project_name=project_name,
+                backend="slurm",
+                handle=elem_handle,
+                array_group_id=array_group_id,
+                status="pending",
+                output_folder=str(output_folders[idx]),
+                config_file=configs[idx],
+                started_at=submit_ts,
+                log_file=str(log_dir / f"slurm-{array_job_id}_{idx}.out"),
+            )
+            running_simulations[sid] = sim
+            persist_job({
+                "simulation_id": sid,
+                "project_name": project_name,
+                "backend": "slurm",
+                "handle": elem_handle,
+                "array_group_id": array_group_id,
+                "output_folder": str(output_folders[idx]),
+                "config_file": configs[idx],
+                "log_file": str(log_dir / f"slurm-{array_job_id}_{idx}.out"),
+                "submitted_at": submit_ts,
+            })
+
+    result = f"**SLURM array submitted: {n_tasks} elements**\n\n"
+    result += f"**Array job ID:** {array_job_id}\n"
+    result += f"**Array group:** {array_group_id}\n"
+    result += f"**Concurrency cap:** {array_concurrent}\n"
+    result += f"**Resources/element:** partition={partition}, cpus={cpus}, mem={mem}, time={time_limit}\n"
+    result += f"**Manifest:** {manifest_path}\n"
+    result += f"**Logs:** {log_dir}\n\n"
+    result += f"**Simulation IDs (n={len(sim_ids)}):**\n"
+    for idx, sid in enumerate(sim_ids[:10]):
+        result += f"- [{idx}] {sid} → {output_folders[idx]}\n"
+    if len(sim_ids) > 10:
+        result += f"- ... ({len(sim_ids) - 10} more)\n"
+    result += "\n**Next steps:**\n"
+    result += f"- `squeue -u $USER` shows the array as `{array_job_id}_[0-{n_tasks-1}]`\n"
+    result += f"- `tail -f {log_dir}/slurm-{array_job_id}_*.out` to watch all elements\n"
+    result += f"- `list_slurm_jobs()` to refresh tracking after restarts"
+    return result
+
+
+@mcp.tool()
+def list_slurm_jobs(state: str = "active") -> str:
+    """
+    List SLURM jobs known to the MCP server, refreshing status from squeue/sacct.
+
+    Use this after a server restart to recover in-flight jobs, or to get a
+    cluster-aware view of what's running. Local-backend simulations are
+    excluded (use `list_simulations()` for those).
+
+    Args:
+        state: Filter — 'active' (pending/running, default), 'all', or
+               'terminal' (completed/failed/stopped).
+
+    Returns:
+        str: Markdown table of SLURM-backed simulations.
+    """
+    if not slurm_available():
+        return "Error: SLURM is not available on this host."
+
+    # Reconcile in case the server was restarted since last call.
+    recovered = _reconcile_persisted_jobs()
+
+    try:
+        be = get_backend("slurm")
+    except Exception as e:
+        return f"Error initializing SLURM backend: {e}"
+
+    rows: list[tuple[str, SimulationRun, BackendJobStatus]] = []
+    with simulations_lock:
+        for sid, sim in running_simulations.items():
+            if sim.backend != "slurm" or not sim.handle:
+                continue
+            try:
+                js = be.poll(sim.handle)
+            except Exception as e:
+                js = BackendJobStatus(state="unknown", raw=str(e))
+            # Update sim record while we're here.
+            if js.state in ("completed", "failed", "stopped") and sim.status not in (
+                "completed", "failed", "stopped"
+            ):
+                sim.status = js.state
+                sim.completed_at = sim.completed_at or time.time()
+                sim.return_code = js.return_code
+            elif js.state in ("running", "pending"):
+                sim.status = js.state
+            rows.append((sid, sim, js))
+
+    if state == "active":
+        rows = [r for r in rows if r[2].state in ("running", "pending")]
+    elif state == "terminal":
+        rows = [r for r in rows if r[2].state in ("completed", "failed", "stopped")]
+    # 'all' keeps everything.
+
+    if not rows:
+        msg = f"No SLURM jobs in state='{state}'."
+        if recovered:
+            msg += f" (Recovered {recovered} record(s) from disk.)"
+        return msg
+
+    out = [f"## SLURM-backed simulations ({len(rows)})"]
+    if recovered:
+        out.append(f"_Recovered {recovered} record(s) from `~/.physicell-mcp/jobs.jsonl`._")
+    out.append("")
+    out.append("| Sim ID | Project | Handle | SLURM state | Submitted |")
+    out.append("|---|---|---|---|---|")
+    for sid, sim, js in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(sim.started_at))
+        out.append(f"| {sid} | {sim.project_name} | {sim.handle} | {js.state} ({js.raw[:30]}) | {ts} |")
+    out.append("")
+    out.append("Use `get_simulation_status(sim_id)` for output-file counts and log tails.")
+    return "\n".join(out)
+
+
+def _reconcile_persisted_jobs() -> int:
+    """Restore in-flight SLURM jobs from `~/.physicell-mcp/jobs.jsonl` after a
+    server restart. Local-backend jobs are skipped (PIDs are stale).
+
+    Returns the count of recovered jobs.
+    """
+    if not slurm_available():
+        return 0
+    try:
+        records = load_persisted_jobs()
+    except Exception:
+        return 0
+    if not records:
+        return 0
+
+    # Dedup by simulation_id, keeping the latest entry.
+    by_id: dict[str, dict] = {}
+    for rec in records:
+        sid = rec.get("simulation_id")
+        if sid:
+            by_id[sid] = rec
+
+    try:
+        be = get_backend("slurm")
+    except Exception:
+        return 0
+
+    recovered = 0
+    with simulations_lock:
+        for sid, rec in by_id.items():
+            if sid in running_simulations:
+                continue
+            if rec.get("backend") != "slurm":
+                continue
+            handle = rec.get("handle", "")
+            if not handle.startswith("slurm:"):
+                continue
+            try:
+                js = be.poll(handle)
+            except Exception:
+                continue
+            # Only re-track jobs SLURM still knows about and haven't reached
+            # a terminal state we'd want to bury.
+            if js.state == "unknown":
+                continue
+            sim = SimulationRun(
+                simulation_id=sid,
+                project_name=rec.get("project_name", "unknown"),
+                backend="slurm",
+                handle=handle,
+                status=js.state,
+                output_folder=rec.get("output_folder", ""),
+                config_file=rec.get("config_file", ""),
+                started_at=rec.get("submitted_at", time.time()),
+                log_file=rec.get("log_file", ""),
+            )
+            running_simulations[sid] = sim
+            recovered += 1
+    return recovered
+
+
+# Perform startup reconciliation in a daemon thread so we don't slow MCP boot.
+def _startup_reconcile_async():
+    try:
+        _reconcile_persisted_jobs()
+    except Exception:
+        pass
+
+threading.Thread(target=_startup_reconcile_async, daemon=True).start()
+
 
 _last_status_check: dict[str, float] = {}  # simulation_id -> last check timestamp
 
@@ -3931,8 +4426,35 @@ def get_simulation_status(simulation_id: str) -> str:
             )
         _last_status_check[simulation_id] = now
 
-    # Check if process is still running
-    if sim.process:
+    # Check if job is still running. Prefer the backend-agnostic handle when
+    # set; fall back to the legacy Popen path for sims started before the
+    # refactor lands at runtime.
+    if sim.handle:
+        try:
+            be = get_backend(sim.backend or "local")
+            js = be.poll(sim.handle)
+        except Exception as e:
+            js = None
+            sim.error_message = f"poll error: {e}"
+        if js is not None and js.state != "unknown":
+            new_status = js.state
+            if new_status == "running":
+                sim.status = "running"
+            elif new_status == "completed":
+                sim.status = "completed"
+                sim.completed_at = sim.completed_at or time.time()
+                sim.return_code = js.return_code if js.return_code is not None else 0
+            elif new_status == "failed":
+                sim.status = "failed"
+                sim.completed_at = sim.completed_at or time.time()
+                sim.return_code = js.return_code
+            elif new_status == "stopped":
+                sim.status = "stopped"
+                sim.completed_at = sim.completed_at or time.time()
+            elif new_status == "pending":
+                sim.status = "pending"
+    elif sim.process:
+        # Legacy path: pre-refactor SimulationRun without a handle.
         return_code = sim.process.poll()
         if return_code is None:
             sim.status = "running"
@@ -4010,8 +4532,25 @@ def list_simulations() -> str:
         result += "|---|---|---|---|---|\n"
 
         for sim_id, sim in running_simulations.items():
-            # Update status if process exists
-            if sim.process:
+            # Refresh status via backend (handle-aware) or legacy Popen path.
+            if sim.handle:
+                try:
+                    be = get_backend(sim.backend or "local")
+                    js = be.poll(sim.handle)
+                    if js.state != "unknown":
+                        if js.state == "completed":
+                            sim.status = "completed"
+                        elif js.state == "failed":
+                            sim.status = "failed"
+                        elif js.state == "stopped":
+                            sim.status = "stopped"
+                        elif js.state == "running":
+                            sim.status = "running"
+                        elif js.state == "pending":
+                            sim.status = "pending"
+                except Exception:
+                    pass
+            elif sim.process:
                 return_code = sim.process.poll()
                 if return_code is None:
                     sim.status = "running"
@@ -4054,17 +4593,32 @@ def stop_simulation(simulation_id: str) -> str:
 
         sim = running_simulations[simulation_id]
 
-    if sim.status != "running":
+    if sim.status not in ("running", "pending"):
         return f"Simulation '{simulation_id}' is not running (status: {sim.status})"
+
+    # Prefer backend-handle path; fall back to legacy Popen for old sim records.
+    if sim.handle:
+        try:
+            be = get_backend(sim.backend or "local")
+            be.cancel(sim.handle)
+            sim.status = "stopped"
+            sim.completed_at = time.time()
+            return (
+                f"**Simulation stopped**\n\n"
+                f"**ID:** {simulation_id}\n"
+                f"**Project:** {sim.project_name}\n"
+                f"**Backend:** {sim.backend}\n"
+                f"**Handle:** {sim.handle}"
+            )
+        except Exception as e:
+            return f"Error cancelling via {sim.backend} backend: {e}"
 
     if sim.process:
         try:
-            # Try graceful termination first
             sim.process.terminate()
             try:
                 sim.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                # Force kill if it doesn't stop
                 sim.process.kill()
                 sim.process.wait()
 
@@ -5255,6 +5809,175 @@ def setup_uq_analysis(project_name: Optional[str] = None,
 
 
 @mcp.tool()
+def configure_uq_slurm(
+    partition: str = "batch",
+    account: str = "ChangLab",
+    cpus: int = 16,
+    mem: str = "64G",
+    time_limit: str = "1-00:00:00",
+    array_concurrent: int = 32,
+) -> str:
+    """
+    Configure UQ tools (`run_sensitivity_analysis`, `run_bayesian_calibration`,
+    `run_abc_calibration`) to dispatch to SLURM instead of running in-process.
+
+    Use this on a cluster head node before kicking off a UQ sweep — it routes
+    the entire UQ driver into a single SLURM job with `cpus` worker slots,
+    keeping the head node responsive and giving you a real walltime budget.
+
+    For local execution (the default), do not call this; UQ tools will use the
+    in-process worker pool sized by `setup_uq_analysis(num_workers=...)`.
+
+    Args:
+        partition: SLURM partition (cluster default 'batch'). For runs longer
+            than the batch partition's wall limit, use 'gpu' or 'a100' on
+            OHSU ARC (14d cap) or your local long-running queue.
+        account: SLURM account.
+        cpus: cpus-per-task; the UQ driver uses this as its worker pool size,
+            so set it to roughly the number of concurrent simulations you want.
+        mem: memory request (PhysiCell sweeps tend to be memory-light, but
+            UQ db writes + replicate buffers add up; 64G is a safe default).
+        time_limit: SLURM walltime (HH:MM:SS or D-HH:MM:SS). Be generous —
+            a sweep that overruns its limit gets killed and the DB may be
+            mid-write.
+        array_concurrent: Stored on the context for future array-mode
+            dispatchers; currently informational only.
+
+    Returns:
+        str: Confirmation + the next-step UQ tool to run.
+    """
+    session = get_current_session()
+    if not session:
+        return "**Error:** No active session. `create_session()` first."
+    if not session.uq_context:
+        return "**Error:** No UQ context. Run `setup_uq_analysis()` first."
+    if not slurm_available():
+        return (
+            "**Warning:** `sbatch` is not on PATH on this host, so UQ tools "
+            "will fail to dispatch when invoked. Configuration saved anyway "
+            "for portability; only call from a SLURM-aware machine."
+        )
+
+    session.uq_context.slurm_config = {
+        "partition": partition,
+        "account": account,
+        "cpus": cpus,
+        "mem": mem,
+        "time": time_limit,
+        "array_concurrent": array_concurrent,
+    }
+
+    result = "## UQ → SLURM dispatch enabled\n\n"
+    result += f"**Partition:** {partition}, account={account}\n"
+    result += f"**Resources:** cpus={cpus}, mem={mem}, time={time_limit}\n"
+    result += f"**Array concurrency cap:** {array_concurrent} (reserved for future array-mode)\n\n"
+    result += "**Next step:** Call `run_sensitivity_analysis(...)`, "
+    result += "`run_bayesian_calibration(...)`, or `run_abc_calibration(...)` as usual. "
+    result += "Each will submit a SLURM job that hosts the UQ driver instead of running locally.\n\n"
+    result += "To revert to local in-process execution, call this tool with no arguments after "
+    result += "`session.uq_context.slurm_config = None` (or restart the session).\n"
+    return result
+
+
+def _dispatch_uq_to_slurm(
+    context,
+    uq_ctx: UQContext,
+    run_id: str,
+    runner_label: str,
+    runner_import: str = "from uq_physicell.model_analysis import run_simulations as _run",
+) -> tuple[bool, str]:
+    """Submit a uq-physicell driver context to SLURM as a single job.
+
+    Builds a small driver script + pickled context in the UQ output directory,
+    then submits a one-shot sbatch job that invokes the UQ runner on it. The
+    `runner_import` argument is an importable Python statement that defines a
+    name `_run` callable as `_run(context)`. Defaults to `run_simulations` for
+    the sensitivity-analysis use case; calibration tools pass their own.
+
+    Returns (dispatched, message). When dispatched=True the caller MUST NOT
+    spawn the local thread; the message is a user-facing summary to append to
+    the tool's return string.
+    """
+    cfg = uq_ctx.slurm_config
+    if not cfg:
+        return False, ""
+
+    if not slurm_available():
+        with uq_runs_lock:
+            uq_runs[run_id]["status"] = "failed"
+            uq_runs[run_id]["error"] = "slurm_config set but sbatch not on PATH"
+        return True, (
+            "\n\n**SLURM dispatch failed:** `sbatch` is not available on this host. "
+            "Run on a cluster login node, or clear the UQ slurm_config to fall back to local."
+        )
+
+    import pickle as _pickle
+
+    uq_dir = Path(uq_ctx.uq_output_dir or ".")
+    uq_dir.mkdir(parents=True, exist_ok=True)
+    driver_path = uq_dir / f"slurm_driver_{run_id}.py"
+    log_path = uq_dir / f"slurm_driver_{run_id}.log"
+    pickle_path = uq_dir / f"slurm_context_{run_id}.pkl"
+
+    try:
+        with open(pickle_path, "wb") as f:
+            _pickle.dump(context, f)
+    except Exception as e:
+        with uq_runs_lock:
+            uq_runs[run_id]["status"] = "failed"
+            uq_runs[run_id]["error"] = f"context pickle failed: {e}"
+        return True, f"\n\n**SLURM dispatch failed:** could not pickle context: {e}"
+
+    driver_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pickle, sys, traceback\n"
+        f"{runner_import}\n"
+        f"with open({repr(str(pickle_path))}, 'rb') as f:\n"
+        "    context = pickle.load(f)\n"
+        "try:\n"
+        "    _run(context)\n"
+        "except Exception:\n"
+        "    traceback.print_exc()\n"
+        "    sys.exit(1)\n"
+    )
+
+    sbatch_cmd = [
+        "sbatch", "--parsable",
+        f"--job-name=physicell-uq-{run_id}",
+        f"--partition={cfg['partition']}",
+        f"--account={cfg['account']}",
+        "--nodes=1", "--ntasks=1",
+        f"--cpus-per-task={cfg['cpus']}",
+        f"--mem={cfg['mem']}",
+        f"--time={cfg['time']}",
+        f"--output={log_path}",
+        f"--error={log_path}",
+        f"--wrap=python {driver_path}",
+    ]
+    proc = subprocess.run(sbatch_cmd, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip()
+        with uq_runs_lock:
+            uq_runs[run_id]["status"] = "failed"
+            uq_runs[run_id]["error"] = err
+        return True, f"\n\n**SLURM dispatch failed:** {err}"
+
+    job_id = proc.stdout.strip().split(";", 1)[0]
+    with uq_runs_lock:
+        uq_runs[run_id]["slurm_job_id"] = job_id
+        uq_runs[run_id]["slurm_log"] = str(log_path)
+        uq_runs[run_id]["status"] = "running_slurm"
+
+    return True, (
+        f"\n\n**Dispatched to SLURM:** {runner_label} running as job `{job_id}`\n"
+        f"- Log: `{log_path}`\n"
+        f"- Driver: `{driver_path}`\n"
+        f"- `squeue -j {job_id}` to monitor; `scancel {job_id}` to cancel\n"
+        f"- This UQ run is no longer using head-node CPU/memory."
+    )
+
+
+@mcp.tool()
 def get_uq_parameter_suggestions() -> str:
     """
     Analyze the current model configuration and suggest parameters that can be
@@ -5579,54 +6302,92 @@ def run_sensitivity_analysis(method: str = "Sobol",
 
     run_id = f"sa_{uuid.uuid4().hex[:8]}"
 
-    # Run SA in a background thread
-    def _run_sa():
-        try:
-            with uq_runs_lock:
-                uq_runs[run_id] = {
-                    "type": "sensitivity_analysis",
-                    "status": "running",
-                    "method": method,
-                    "num_samples": num_samples,
-                    "db_path": sa_db_path,
-                    "started_at": time.time(),
-                    "error": None,
-                }
+    # Initialize the registry up-front so the SLURM dispatcher (if used) can
+    # update it directly. The local thread will overwrite "status" later.
+    with uq_runs_lock:
+        uq_runs[run_id] = {
+            "type": "sensitivity_analysis",
+            "status": "pending",
+            "method": method,
+            "num_samples": num_samples,
+            "db_path": sa_db_path,
+            "started_at": time.time(),
+            "error": None,
+        }
 
-            context = ModelAnalysisContext(
+    # If SLURM dispatch is configured, build the context here and submit it
+    # rather than spinning up a local thread that would burn head-node CPU.
+    slurm_note = ""
+    if uq_ctx.slurm_config:
+        try:
+            ctx = ModelAnalysisContext(
                 db_path=sa_db_path,
                 model_config=model_config,
                 sampler=method,
                 params_info=params_info,
                 qois_info=uq_ctx.qoi_definitions,
                 parallel_method=parallel_method,
-                num_workers=num_workers,
+                num_workers=uq_ctx.slurm_config["cpus"],
             )
-
             if is_local:
                 from uq_physicell.model_analysis import run_local_sampler
-                context.dic_samples = run_local_sampler(context.params_dict, method)
+                ctx.dic_samples = run_local_sampler(ctx.params_dict, method)
             else:
                 from uq_physicell.model_analysis import run_global_sampler
-                context.dic_samples = run_global_sampler(context.params_dict, method, N=num_samples)
-
-            uq_run_simulations(context)
-
-            with uq_runs_lock:
-                uq_runs[run_id]["status"] = "completed"
-                uq_runs[run_id]["completed_at"] = time.time()
-                uq_runs[run_id]["num_simulations"] = len(context.dic_samples)
-
-            uq_ctx.sa_results = {"run_id": run_id, "db_path": sa_db_path}
-            session.mark_step_complete(WorkflowStep.SENSITIVITY_ANALYSIS_COMPLETE)
-
+                ctx.dic_samples = run_global_sampler(ctx.params_dict, method, N=num_samples)
+            dispatched, slurm_note = _dispatch_uq_to_slurm(
+                ctx, uq_ctx, run_id, "sensitivity analysis"
+            )
         except Exception as e:
             with uq_runs_lock:
                 uq_runs[run_id]["status"] = "failed"
                 uq_runs[run_id]["error"] = str(e)
+            dispatched = True  # we tried; don't fall back to local
+            slurm_note = f"\n\n**SLURM dispatch failed (context build):** {e}"
+    else:
+        dispatched = False
 
-    thread = threading.Thread(target=_run_sa, daemon=True)
-    thread.start()
+    if not dispatched:
+        # Run SA in a background thread (local mode, original behavior).
+        def _run_sa():
+            try:
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "running"
+
+                context = ModelAnalysisContext(
+                    db_path=sa_db_path,
+                    model_config=model_config,
+                    sampler=method,
+                    params_info=params_info,
+                    qois_info=uq_ctx.qoi_definitions,
+                    parallel_method=parallel_method,
+                    num_workers=num_workers,
+                )
+
+                if is_local:
+                    from uq_physicell.model_analysis import run_local_sampler
+                    context.dic_samples = run_local_sampler(context.params_dict, method)
+                else:
+                    from uq_physicell.model_analysis import run_global_sampler
+                    context.dic_samples = run_global_sampler(context.params_dict, method, N=num_samples)
+
+                uq_run_simulations(context)
+
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "completed"
+                    uq_runs[run_id]["completed_at"] = time.time()
+                    uq_runs[run_id]["num_simulations"] = len(context.dic_samples)
+
+                uq_ctx.sa_results = {"run_id": run_id, "db_path": sa_db_path}
+                session.mark_step_complete(WorkflowStep.SENSITIVITY_ANALYSIS_COMPLETE)
+
+            except Exception as e:
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "failed"
+                    uq_runs[run_id]["error"] = str(e)
+
+        thread = threading.Thread(target=_run_sa, daemon=True)
+        thread.start()
 
     total_sims = num_samples * uq_ctx.num_replicates * (len(uq_ctx.parameters) + 1) if is_local else num_samples * uq_ctx.num_replicates
     result = "## Sensitivity Analysis Started\n\n"
@@ -5634,9 +6395,13 @@ def run_sensitivity_analysis(method: str = "Sobol",
     result += f"**Method:** {method}\n"
     result += f"**Samples:** {num_samples}\n"
     result += f"**Est. simulations:** ~{total_sims}\n"
-    result += f"**Workers:** {num_workers}\n"
+    backend_label = "SLURM" if uq_ctx.slurm_config else "local (in-process)"
+    result += f"**Backend:** {backend_label}\n"
+    result += f"**Workers:** {uq_ctx.slurm_config['cpus'] if uq_ctx.slurm_config else num_workers}\n"
     result += f"**Database:** {sa_db_path}\n\n"
     result += "The analysis is running in the background. Use `get_sensitivity_results(run_id)` to check progress and results."
+    if slurm_note:
+        result += slurm_note
     return result
 
 
@@ -5897,21 +6662,22 @@ def run_bayesian_calibration(
 
     run_id = f"bo_{uuid.uuid4().hex[:8]}"
 
-    # Run calibration in background thread
-    def _run_bo():
-        try:
-            with uq_runs_lock:
-                uq_runs[run_id] = {
-                    "type": "bayesian_optimization",
-                    "status": "running",
-                    "db_path": cal_db_path,
-                    "started_at": time.time(),
-                    "num_iterations": num_iterations,
-                    "num_initial_samples": num_initial_samples,
-                    "error": None,
-                }
+    with uq_runs_lock:
+        uq_runs[run_id] = {
+            "type": "bayesian_optimization",
+            "status": "pending",
+            "db_path": cal_db_path,
+            "started_at": time.time(),
+            "num_iterations": num_iterations,
+            "num_initial_samples": num_initial_samples,
+            "error": None,
+        }
 
-            calib_context = BOCalibrationContext(
+    slurm_note = ""
+    dispatched = False
+    if uq_ctx.slurm_config:
+        try:
+            calib_context_slurm = BOCalibrationContext(
                 db_path=cal_db_path,
                 obsData=uq_ctx.experimental_data_path,
                 obsData_columns=uq_ctx.experimental_data_columns,
@@ -5921,23 +6687,52 @@ def run_bayesian_calibration(
                 search_space=search_space,
                 bo_options=bo_options,
             )
-
-            uq_run_bo(calib_context)
-
-            with uq_runs_lock:
-                uq_runs[run_id]["status"] = "completed"
-                uq_runs[run_id]["completed_at"] = time.time()
-
-            uq_ctx.calibration_results = {"run_id": run_id, "db_path": cal_db_path}
-            session.mark_step_complete(WorkflowStep.CALIBRATION_COMPLETE)
-
+            dispatched, slurm_note = _dispatch_uq_to_slurm(
+                calib_context_slurm, uq_ctx, run_id,
+                "Bayesian-optimization calibration",
+                runner_import="from uq_physicell.bo import run_bayesian_optimization as _run",
+            )
         except Exception as e:
             with uq_runs_lock:
                 uq_runs[run_id]["status"] = "failed"
                 uq_runs[run_id]["error"] = str(e)
+            dispatched = True
+            slurm_note = f"\n\n**SLURM dispatch failed (context build):** {e}"
 
-    thread = threading.Thread(target=_run_bo, daemon=True)
-    thread.start()
+    if not dispatched:
+        # Run calibration in background thread (local mode).
+        def _run_bo():
+            try:
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "running"
+
+                calib_context = BOCalibrationContext(
+                    db_path=cal_db_path,
+                    obsData=uq_ctx.experimental_data_path,
+                    obsData_columns=uq_ctx.experimental_data_columns,
+                    model_config=model_config,
+                    qoi_functions=uq_ctx.qoi_definitions,
+                    distance_functions=distance_functions,
+                    search_space=search_space,
+                    bo_options=bo_options,
+                )
+
+                uq_run_bo(calib_context)
+
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "completed"
+                    uq_runs[run_id]["completed_at"] = time.time()
+
+                uq_ctx.calibration_results = {"run_id": run_id, "db_path": cal_db_path}
+                session.mark_step_complete(WorkflowStep.CALIBRATION_COMPLETE)
+
+            except Exception as e:
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "failed"
+                    uq_runs[run_id]["error"] = str(e)
+
+        thread = threading.Thread(target=_run_bo, daemon=True)
+        thread.start()
 
     total_sims = (num_initial_samples + num_iterations) * uq_ctx.num_replicates
     result = "## Bayesian Optimization Calibration Started\n\n"
@@ -5954,8 +6749,12 @@ def run_bayesian_calibration(
     for name, space in search_space.items():
         result += f"| {name} | {space['lower_bound']} | {space['upper_bound']} |\n"
 
+    backend_label = "SLURM" if uq_ctx.slurm_config else "local (in-process)"
+    result += f"\n**Backend:** {backend_label}\n"
     result += "\nCalibration is running in the background. Use `get_calibration_status()` to monitor progress "
     result += "and `get_calibration_results()` when complete."
+    if slurm_note:
+        result += slurm_note
     return result
 
 
@@ -6074,21 +6873,22 @@ def run_abc_calibration(
 
     run_id = f"abc_{uuid.uuid4().hex[:8]}"
 
-    # Run in background
-    def _run_abc():
-        try:
-            with uq_runs_lock:
-                uq_runs[run_id] = {
-                    "type": "abc",
-                    "status": "running",
-                    "db_path": cal_db_path,
-                    "started_at": time.time(),
-                    "max_populations": max_populations,
-                    "max_simulations": max_simulations,
-                    "error": None,
-                }
+    with uq_runs_lock:
+        uq_runs[run_id] = {
+            "type": "abc",
+            "status": "pending",
+            "db_path": cal_db_path,
+            "started_at": time.time(),
+            "max_populations": max_populations,
+            "max_simulations": max_simulations,
+            "error": None,
+        }
 
-            calib_context = ABCCalibrationContext(
+    slurm_note = ""
+    dispatched = False
+    if uq_ctx.slurm_config:
+        try:
+            calib_context_slurm = ABCCalibrationContext(
                 db_path=cal_db_path,
                 obsData=uq_ctx.experimental_data_path,
                 obsData_columns=uq_ctx.experimental_data_columns,
@@ -6098,25 +6898,54 @@ def run_abc_calibration(
                 prior=prior,
                 abc_options=abc_options,
             )
-
-            history = uq_run_abc(calib_context)
-
-            with uq_runs_lock:
-                uq_runs[run_id]["status"] = "completed"
-                uq_runs[run_id]["completed_at"] = time.time()
-                uq_runs[run_id]["n_populations"] = history.n_populations
-                uq_runs[run_id]["total_simulations"] = history.total_nr_simulations
-
-            uq_ctx.calibration_results = {"run_id": run_id, "db_path": cal_db_path}
-            session.mark_step_complete(WorkflowStep.CALIBRATION_COMPLETE)
-
+            dispatched, slurm_note = _dispatch_uq_to_slurm(
+                calib_context_slurm, uq_ctx, run_id,
+                "ABC-SMC calibration",
+                runner_import="from uq_physicell.abc import run_abc_calibration as _run",
+            )
         except Exception as e:
             with uq_runs_lock:
                 uq_runs[run_id]["status"] = "failed"
                 uq_runs[run_id]["error"] = str(e)
+            dispatched = True
+            slurm_note = f"\n\n**SLURM dispatch failed (context build):** {e}"
 
-    thread = threading.Thread(target=_run_abc, daemon=True)
-    thread.start()
+    if not dispatched:
+        # Run in background (local mode).
+        def _run_abc():
+            try:
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "running"
+
+                calib_context = ABCCalibrationContext(
+                    db_path=cal_db_path,
+                    obsData=uq_ctx.experimental_data_path,
+                    obsData_columns=uq_ctx.experimental_data_columns,
+                    model_config=model_config,
+                    qoi_functions=uq_ctx.qoi_definitions,
+                    distance_functions=distance_functions,
+                    prior=prior,
+                    abc_options=abc_options,
+                )
+
+                history = uq_run_abc(calib_context)
+
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "completed"
+                    uq_runs[run_id]["completed_at"] = time.time()
+                    uq_runs[run_id]["n_populations"] = history.n_populations
+                    uq_runs[run_id]["total_simulations"] = history.total_nr_simulations
+
+                uq_ctx.calibration_results = {"run_id": run_id, "db_path": cal_db_path}
+                session.mark_step_complete(WorkflowStep.CALIBRATION_COMPLETE)
+
+            except Exception as e:
+                with uq_runs_lock:
+                    uq_runs[run_id]["status"] = "failed"
+                    uq_runs[run_id]["error"] = str(e)
+
+        thread = threading.Thread(target=_run_abc, daemon=True)
+        thread.start()
 
     result = "## ABC-SMC Calibration Started\n\n"
     result += f"**Run ID:** `{run_id}`\n"
@@ -6139,7 +6968,11 @@ def run_abc_calibration(
         for name, val in fixed_params.items():
             result += f"- {name} = {val}\n"
 
+    backend_label = "SLURM" if uq_ctx.slurm_config else "local (in-process)"
+    result += f"\n**Backend:** {backend_label}\n"
     result += "\nCalibration is running in the background. Use `get_calibration_status()` to monitor."
+    if slurm_note:
+        result += slurm_note
     return result
 
 

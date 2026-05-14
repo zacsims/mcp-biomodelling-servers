@@ -231,6 +231,54 @@ get_uq_summary()      # comprehensive status of all UQ work
 list_uq_runs()        # all SA and calibration runs
 ```
 
+## Scaling with SLURM
+
+For laptops and single-host setups, the in-process worker pool sized by `setup_uq_analysis(num_workers=...)` is the right answer — no cluster, no extra steps. **Skip this section** unless you're on an HPC.
+
+When `num_samples × num_replicates ≥ 50`, or when you're running on a cluster head node where local execution is not allowed, dispatch the entire UQ driver to SLURM:
+
+```python
+configure_uq_slurm(
+    partition="batch",
+    account="ChangLab",
+    cpus=16,
+    mem="64G",
+    time_limit="1-00:00:00",
+    array_concurrent=32,
+)
+
+# All of these now submit to SLURM rather than running on the head node:
+run_sensitivity_analysis(method="morris", num_samples=200)
+run_bayesian_calibration(num_initial_samples=20, num_iterations=80)
+run_abc_calibration(max_simulations=500)
+```
+
+`configure_uq_slurm` is a once-per-session call that sets `session.uq_context.slurm_config`. Each subsequent UQ tool detects this and submits a one-shot sbatch job that runs the UQ driver with `cpus_per_task` worker slots. The head node stays idle; the UQ run continues even if you log out (within the SLURM time limit).
+
+Worked example — sensitivity analysis on a 200-sample Morris design:
+
+```python
+setup_uq_analysis(num_replicates=3, num_workers=16)  # num_workers ignored when SLURM dispatch is on
+define_uq_parameters([...])                           # 5 parameters
+define_quantities_of_interest([...])                  # 4 QoIs
+configure_uq_slurm(cpus=16, mem="64G", time_limit="12:00:00")
+run_sensitivity_analysis(method="morris", num_samples=200)
+# → submits job ~12345; ~200 × 3 = 600 sims using 16 workers in-job
+# → poll get_sensitivity_results(); job persists across MCP restarts
+```
+
+For very long calibrations:
+
+- `partition="gpu"` or `partition="a100"` (14 d wall limit on OHSU ARC) for runs longer than the `batch` partition allows.
+- Set `time_limit="3-00:00:00"` (3 days) or more — overruns get killed and the SQLite db may be mid-write.
+- Keep `array_concurrent ≤ 32` for ABC — pyABC's multicore sampler is unreliable above that ceiling on this filesystem.
+
+Cross-references:
+
+- `physicell-simulation/SKILL.md §1.5` — backend decision table.
+- `physicell-simulation/references/slurm-integration.md` — cluster defaults, recovery after restart, the `ARCH=native` rebuild gotcha.
+- `blind-recap/SKILL.md` Stage 1/2 ABC guidance — the canonical worked example for SLURM-dispatched calibration.
+
 ## Tips
 
 1. **Start with SA**: Run sensitivity analysis first to identify which parameters matter. Only calibrate the important ones.
@@ -238,3 +286,4 @@ list_uq_runs()        # all SA and calibration runs
 3. **Keep parameter bounds reasonable**: Unrealistically wide bounds make optimization harder.
 4. **Check convergence**: ABC-SMC should show decreasing epsilon across populations.
 5. **Validate results**: After calibration, run the model with best-fit parameters and compare to data visually.
+6. **Use SLURM for sweeps ≥50 sims** on clusters: see "Scaling with SLURM" above.
