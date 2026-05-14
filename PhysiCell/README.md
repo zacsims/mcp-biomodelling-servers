@@ -735,6 +735,39 @@ claude mcp list
 
 The server exposes ~97 tools across data loading, spatial statistics (Ripley's H, colocalization), network/topology analysis, LDA, and visualization. See its repo for the full tool list.
 
+#### Companion Server: tmelandscape
+
+The [tmelandscape MCP server](https://github.com/emcramer/tmelandscape) builds tumor-microenvironment (TME) state landscapes from PhysiCell simulation ensembles. It implements the trajectory-landscape pipeline from Cramer et al. (2026) — Latin Hypercube parameter sweeps, SpatialTissuePy summarisation into a chunked Zarr store, time-delay (Takens) embedding with FNN/MI optimisation, and hierarchical clustering of TME states. It pairs naturally with this server's `submit_simulation_array_slurm` for the simulation step (the one piece of the pipeline tmelandscape leaves out).
+
+**Install (isolated tool install via `uv`):**
+
+```bash
+uv tool install "tmelandscape[mcp] @ git+https://github.com/emcramer/tmelandscape"
+```
+
+**Register with Claude Code:**
+
+```bash
+claude mcp add tmelandscape -s user -- tmelandscape-mcp
+```
+
+**Verify:**
+
+```bash
+claude mcp list
+# tmelandscape: ... - ✓ Connected
+```
+
+**Typical pipeline** (using all three servers together):
+
+```
+PhysiCell:        submit_simulation_array_slurm(...)          ← run the LHS sweep
+SpatialTissuePy:  data_load_csv() → statistics_ripleys_h()    ← per-sim spatial stats
+tmelandscape:     ingest → embed → cluster                    ← landscape construction
+```
+
+The project is pre-alpha (v0.0.1) and its API is not yet stable, but the methodology is the same one this server already adopted for the default calibration strategy (see commit `cf82dd0`). See the [tmelandscape preprint](https://doi.org/10.48550/arXiv.2603.18333) for the underlying pipeline and the [tumor-immune trajectory paper](https://doi.org/10.64898/2026.03.26.714521) for the clinical application.
+
 #### Install the AgentSkill (Recommended)
 
 The repository includes a `physicell-simulation` AgentSkill that guides LLMs through correct simulation setup and prevents common mistakes (like the "from 0 towards 0" rule bug). To install it:
