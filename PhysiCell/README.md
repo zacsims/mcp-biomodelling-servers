@@ -102,8 +102,13 @@ PhysiCell:  add_physiboss_model() → link genes to behaviors → simulate
 - `export_cell_rules_csv()` - Write cell rules CSV (Hill function parameters)
 - `create_physicell_project()` - Package config into a PhysiCell project
 - `compile_physicell_project()` - Compile the C++ simulation executable
-- `run_simulation()` - Launch simulation as background process
-- `get_simulation_status()` - Poll progress (every 60s until complete)
+- `run_simulation()` - Launch simulation as background process (local, default)
+- `submit_simulation_slurm()` - Launch as a SLURM job on an HPC cluster (single sim)
+- `submit_simulation_array_slurm()` - Launch a SLURM array job (parameter sweeps / replicates)
+- `list_slurm_jobs()` - Reconcile SLURM-backed runs with `squeue`/`sacct` (recovery after server restart)
+- `configure_uq_slurm()` - Route UQ tools (SA, BO, ABC) through a SLURM driver job
+- `get_simulation_status()` - Poll progress (every 60s until complete; works for both local and SLURM)
+- `stop_simulation()` - Cancel a running simulation (`kill` for local, `scancel` for SLURM)
 - `generate_simulation_gif()` - Create visualization from output
 
 #### PhysiBoSS Multiscale Integration
@@ -394,6 +399,112 @@ Time,Tumor Count,Dead Cells
 ```
 
 Column names are mapped to QoIs via `provide_experimental_data()`.
+
+### HPC / SLURM Dispatch
+
+The server supports two execution backends, selected per-call:
+
+- **Local** (default): `subprocess.Popen` on the host running the MCP server. Best for laptops, single-host workstations, and quick iteration.
+- **SLURM**: dispatches via `sbatch`, tracks via `squeue`/`sacct`, cancels via `scancel`. Best for HPC clusters — required when running on a head/login node, or when a single run exceeds practical local resources.
+
+Local stays the default. None of the SLURM tools are needed for laptop / single-host operation; everything works exactly as before if you never call them.
+
+#### When to use which backend
+
+| Workload | Backend | Tool |
+|---|---|---|
+| 1 simulation, <2 h, on a workstation | Local | `run_simulation` (default) |
+| Any simulation from a cluster head node | SLURM | `submit_simulation_slurm` |
+| 2–9 simulations | SLURM (loop) | `submit_simulation_slurm` per sim |
+| ≥10 simulations, parameter sweeps, replicates | SLURM array | `submit_simulation_array_slurm` |
+| Single simulation >2 h | SLURM | `submit_simulation_slurm` |
+| UQ with `samples × replicates ≥ 50` | SLURM | `configure_uq_slurm` once, then UQ tool |
+| BO / ABC calibration on a cluster | SLURM | `configure_uq_slurm` once, then `run_*_calibration` |
+
+#### SLURM tool reference
+
+- **`submit_simulation_slurm(project_name, cpus, mem, time_limit, partition, account)`** — submit one PhysiCell run via `sbatch --parsable`. Returns a `simulation_id` (yours) and a SLURM job ID. Tracked the same way as local sims; `get_simulation_status` / `stop_simulation` work transparently.
+- **`submit_simulation_array_slurm(project_name, configs=[...], array_concurrent=32)`** — submit N configs as one SLURM array job. Each element gets its own output folder and `simulation_id`. The `array_concurrent` cap defaults to 32 to honor the documented pyABC sampler ceiling and avoid filesystem-contention segfaults.
+- **`list_slurm_jobs(state='active')`** — queries SLURM and re-registers any in-flight jobs into the in-memory tracker. Run this after restarting the MCP server to recover jobs you submitted earlier.
+- **`configure_uq_slurm(cpus, mem, time_limit, array_concurrent)`** — once-per-session config. After this, `run_sensitivity_analysis`, `run_bayesian_calibration`, and `run_abc_calibration` submit their drivers to SLURM so the UQ work runs on a compute node instead of the head.
+
+#### How dispatch works
+
+```
+User calls submit_simulation_slurm("hypoxia_recap", cpus=16, time_limit="6:00:00")
+        │
+        ▼
+_prepare_run()    ← `make load`, resolve executable, allocate output folder, patch XML
+        │
+        ▼
+SlurmBackend.submit()
+        │
+        ▼
+sbatch --parsable
+       --partition=batch --account=ChangLab
+       --cpus-per-task=16 --mem=32G --time=6:00:00
+       --export=ALL,PROJECT_DIR=...,PHYSICELL_EXEC=./project,PHYSICELL_CONFIG=...,OMP_NUM_THREADS=16
+       scripts/physicell.sbatch
+        │
+        ▼
+returns "12345"  →  handle = "slurm:12345"
+        │
+        ▼
+register SimulationRun(handle="slurm:12345", backend="slurm", ...)
+append record to ~/.physicell-mcp/jobs.jsonl       ← survives MCP restart
+```
+
+The bundled `scripts/physicell.sbatch` is a universal launcher that handles single-job and array-job modes from the same template. On the compute node it loads `gcc/14.2.0` (if available), sets OpenMP env vars, performs an `ARCH=native` rebuild guard (so a login-node binary doesn't SIGILL on a different compute-node CPU family), and runs `srun --cpu-bind=cores ./project <config>`.
+
+#### Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PHYSICELL_BACKEND` | `local` | Set to `slurm` to make `run_simulation` itself dispatch via SLURM (useful when running Claude inside an `srun --pty bash` allocation). |
+| `PHYSICELL_MCP_HOME` | `~/.physicell-mcp` | Where the persistent job log (`jobs.jsonl`) lives. |
+| `PHYSICELL_DEFAULT_CPUS` / `_MEM` / `_TIME` | `8` / `16G` / `4:00:00` | Conservative resource defaults for SLURM-dispatched `run_simulation` calls. Override per-call with `submit_simulation_slurm`. |
+
+The SLURM tools' resource arguments (`partition`, `account`, `cpus`, `mem`, `time_limit`) default to OHSU ARC values (`batch` / `ChangLab`). Override per call for other clusters.
+
+#### Example: parameter sweep
+
+```python
+submit_simulation_array_slurm(
+    "hypoxia_recap_v4",
+    configs=[f"config/scan_o2_{x}.xml" for x in (10, 15, 20, 25, 30)],
+    cpus=8, mem="16G", time_limit="4:00:00",
+    array_concurrent=16,
+)
+# → one array job, 5 elements, 5 distinct simulation_ids, 5 output folders
+# → tail -f .../slurm-<JOBID>_*.out for combined progress
+```
+
+#### Example: cluster-side calibration
+
+```python
+configure_uq_slurm(cpus=16, mem="64G", time_limit="1-00:00:00", array_concurrent=32)
+run_abc_calibration(max_simulations=500)
+# → ABC driver runs in a SLURM job, not on the head node
+# → 500+ PhysiCell sims dispatched from inside that job
+```
+
+#### Recovery, observability, cancellation
+
+- `~/.physicell-mcp/jobs.jsonl` is append-only; the server reconciles SLURM-backed records on startup against `squeue`/`sacct`. Local PIDs are skipped (stale across restarts).
+- `get_simulation_status(sim_id)` is backend-agnostic — it inspects the `SimulationRun.handle` field (`local:<pid>` or `slurm:<jobid>`) and dispatches to the right poller.
+- `stop_simulation(sim_id)` calls `terminate()`/`kill()` for local sims and `scancel` for SLURM sims (including array elements via `<jobid>_<task>`).
+
+#### Smoke tests
+
+A self-contained pytest suite covers the backend layer:
+
+```bash
+uv run --with pytest pytest test_backends.py -v
+```
+
+15 tests covering LocalBackend lifecycle, real SlurmBackend submission (when `sbatch` is on PATH; otherwise skipped), persistence roundtrips, and backend resolution.
+
+See `physicell-simulation/references/slurm-integration.md` for the full reference (cluster defaults, recovery flows, the `ARCH=native` rebuild gotcha, and explicit guidance for local-only operation).
 
 ### Advanced PhysiBoSS Integration
 
